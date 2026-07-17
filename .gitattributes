@@ -1,0 +1,2 @@
+gen/*.cfg linguist-generated=true
+gen/*.cnf linguist-generated=true

@@ -1,0 +1,9 @@
+Compiling Typed APIs into Context-Free Languages
+
+In this talk, we will present a technique for embedding a statically typed programming library into an ordinary context-free grammar (CFG). Given such a library and a reference compiler, the method we describe constructs a CFG denoting the language of well-typed expressions. This CFG models types as nonterminals, typing judgments as productions, and invocations, member accesses, and identifiers as terminals. The resulting grammar generates well-typed call chains over the target library and may be consumed by standard parsing, enumeration, synthesis, or language-modeling tools.
+
+Our construction is effectively a resource-bounded monomorphization. We instantiate candidate productions with monomorphic type signatures over a finite set of ground types, and using the reference compiler as a typing oracle, check each candidate production for type safety. The resource bounds can be user-defined parameters, e.g., function arity, type parameter nesting depth, subtyping depth, and the number of ground types. We then enumerate all combinatorial possibilities within this bounded envelope, yielding a CFG whose construction is fixed-parameter tractable within the selected region.
+
+The generated language will be a sound under-approximation of the well-typed expressions and complete relative to the ground-type universe and structural bounds. It is incomplete precisely where the chosen bounds truncate the type universe; under a sufficiently representative ground universe and practical resource limits, the grammar captures most well-typed expressions of interest. This approach allows us to treat type safety as CFL recognition and provides a compact representation for sampling, fuzzing, and constrained decoding, while preserving the essential structure of the host type system.
+
+This project builds on prior work by Considine '25 (see: https://arxiv.org/pdf/2512.01036)
