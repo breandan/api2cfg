@@ -5,6 +5,8 @@ import java.lang.reflect.Modifier
 import java.net.URI
 import java.nio.file.Files
 import java.nio.file.FileSystems
+import java.security.MessageDigest
+import java.util.Base64
 import java.util.concurrent.ConcurrentHashMap
 import java.util.jar.JarFile
 import kotlin.reflect.KCallable
@@ -27,14 +29,20 @@ import kotlin.reflect.jvm.jvmErasure
 
 private const val TRACK_NULLABILITY_ANNOTATIONS = false
 private const val INCLUDE_NULLABLE_TYPES = false
+private const val PARAMETERIZED_NAME_HASH_CHARS = 10
 
 fun main(args: Array<String>) {
   val commandLine = CommandLineArguments.parse(args)
   val options = GeneratorOptions(
     packageName = commandLine.packageName,
     normalizeChomskyNormalForm = commandLine.normalizeChomskyNormalForm,
+    emitParameterizedSignatures = commandLine.emitParameterizedSignatures,
   )
-  val outputFile = defaultOutputFile(commandLine.packageName, commandLine.normalizeChomskyNormalForm)
+  val outputFile = defaultOutputFile(
+    commandLine.packageName,
+    commandLine.normalizeChomskyNormalForm,
+    commandLine.emitParameterizedSignatures,
+  )
   outputFile.parentFile?.mkdirs()
   val grammar = CfgGenerator(options).generate()
   Files.writeString(outputFile.toPath(), "${grammar.text}\n")
@@ -43,32 +51,46 @@ fun main(args: Array<String>) {
   )
 }
 
-private fun defaultOutputFile(packageName: String, normalizeChomskyNormalForm: Boolean): File {
-  val extension = if (normalizeChomskyNormalForm) "cnf" else "cfg"
-  return File("gen", "${packageName.replace('.', '_')}.$extension")
+private fun defaultOutputFile(
+  packageName: String,
+  normalizeChomskyNormalForm: Boolean,
+  emitParameterizedSignatures: Boolean,
+): File {
+  val suffix = when {
+    normalizeChomskyNormalForm -> "cnf"
+    emitParameterizedSignatures -> "parameterized.cfg"
+    else -> "cfg"
+  }
+  return File("gen", "${packageName.replace('.', '_')}.$suffix")
 }
 
 private data class CommandLineArguments(
   val packageName: String,
   val normalizeChomskyNormalForm: Boolean,
+  val emitParameterizedSignatures: Boolean,
 ) {
   companion object {
     fun parse(args: Array<String>): CommandLineArguments {
       val positional = mutableListOf<String>()
       var normalizeChomskyNormalForm = false
+      var emitParameterizedSignatures = false
 
       for (arg in args) {
         when (arg) {
           "--cnf" -> normalizeChomskyNormalForm = true
+          "--parameterized" -> emitParameterizedSignatures = true
           else -> {
             require(!arg.startsWith("-")) { "Unknown flag: $arg" }
             positional += arg
           }
         }
       }
+      require(!(normalizeChomskyNormalForm && emitParameterizedSignatures)) {
+        "--cnf and --parameterized are mutually exclusive"
+      }
       require(positional.size == 1) { "Expected exactly one positional argument: <package>" }
 
-      return CommandLineArguments(positional.single(), normalizeChomskyNormalForm)
+      return CommandLineArguments(positional.single(), normalizeChomskyNormalForm, emitParameterizedSignatures)
     }
   }
 }
@@ -83,6 +105,7 @@ data class GeneratorOptions(
   val trackNullabilityAnnotations: Boolean = TRACK_NULLABILITY_ANNOTATIONS,
   val includeNullableTypes: Boolean = INCLUDE_NULLABLE_TYPES,
   val normalizeChomskyNormalForm: Boolean = false,
+  val emitParameterizedSignatures: Boolean = false,
   val targetLanguage: TargetLanguage = TargetLanguage.fromPackageName(packageName),
 )
 
@@ -144,6 +167,7 @@ class CfgGenerator(private val options: GeneratorOptions) {
   private val memberPropertiesByClass = ConcurrentHashMap<KClass<*>, List<KProperty1<out Any, *>>>()
   private val staticFunctionsByClass = ConcurrentHashMap<KClass<*>, List<KFunction<*>>>()
   private val receiverCandidateClassesByClass = ConcurrentHashMap<KClass<*>, List<KClass<*>>>()
+  private val parameterizedNameKeys = ConcurrentHashMap<String, String>()
 
   fun generate(): GeneratedGrammar {
     val scannedClasses = scanner.scan(options.packageName)
@@ -183,7 +207,7 @@ class CfgGenerator(private val options: GeneratorOptions) {
     addProductions(
       typeClasses.parallelFlatMap { typeClass ->
         constructorProductions(typeClass, groundTypes, typeArgumentTypes, subtypeIndex) +
-          memberProductions(typeClass, groundTypes, typeArgumentTypes, subtypeIndex)
+            memberProductions(typeClass, groundTypes, typeArgumentTypes, subtypeIndex)
       },
       productions,
       typeSlots,
@@ -200,27 +224,36 @@ class CfgGenerator(private val options: GeneratorOptions) {
       typeSlots,
     )
 
-    addProductions(groundSubtypeProductions(subtypeIndex, groundTypes), productions, typeSlots)
-    addProductions(erasedSubtypeProductions(subtypeIndex, groundTypes, typeSlots), productions, typeSlots)
+    if (options.emitParameterizedSignatures) {
+      addProductions(
+        parameterizedSubtypeProductions(typeClasses, typeArgumentTypes, subtypeIndex),
+        productions,
+        typeSlots,
+      )
+      addProductions(parameterizedErasedSubtypeProductions(subtypeIndex, typeSlots), productions, typeSlots)
+    } else {
+      addProductions(groundSubtypeProductions(subtypeIndex, groundTypes), productions, typeSlots)
+      addProductions(erasedSubtypeProductions(subtypeIndex, groundTypes, typeSlots), productions, typeSlots)
 
-    val erasedSlots = typeSlots.mapNotNullTo(mutableSetOf()) { type -> type.asErasedSlot() }
-    addProductions(
-      typeSlots.toList().parallelFlatMap { slot ->
-        groundTypes.mapNotNull { alternative ->
-          if (
-            alternative != slot &&
-            !(slot == options.topType() && alternative.hasErasedCover(erasedSlots)) &&
-            subtypeIndex.isSubtypeOf(alternative, slot, options.monomorphizationDepth + 4)
-          ) {
-            Production(slot, listOf(Symbol.Type(alternative)))
-          } else {
-            null
+      val erasedSlots = typeSlots.mapNotNullTo(mutableSetOf()) { type -> type.asErasedSlot() }
+      addProductions(
+        typeSlots.toList().parallelFlatMap { slot ->
+          groundTypes.mapNotNull { alternative ->
+            if (
+              alternative != slot &&
+              !(slot == options.topType() && alternative.hasErasedCover(erasedSlots)) &&
+              subtypeIndex.isSubtypeOf(alternative, slot, options.monomorphizationDepth + 4)
+            ) {
+              Production(slot, listOf(Symbol.Type(alternative)))
+            } else {
+              null
+            }
           }
-        }
-      },
-      productions,
-      typeSlots,
-    )
+        },
+        productions,
+        typeSlots,
+      )
+    }
     topTypeProductions(typeSlots, subtypeIndex).forEach { production ->
       if (productions.add(production)) {
         typeSlots += production.types()
@@ -230,7 +263,11 @@ class CfgGenerator(private val options: GeneratorOptions) {
     if (options.includeNullableTypes) {
       nullableLiteralProductions(productions.flatMap { it.types() }).forEach { productions += it }
     }
-    val bodyProductions = pruneUndefinedNonterminals(productions)
+    val bodyProductions = if (options.emitParameterizedSignatures) {
+      productions
+    } else {
+      pruneUndefinedNonterminals(productions)
+    }
     val allProductions = bodyProductions + startProductions(bodyProductions)
     val finalProductions = if (options.normalizeChomskyNormalForm) {
       toChomskyNormalForm(allProductions, StartType)
@@ -448,8 +485,8 @@ class CfgGenerator(private val options: GeneratorOptions) {
 
   private fun signatureTypeClasses(function: KFunction<*>): List<KClass<*>> =
     (function.parameters.map { it.type } + function.returnType)
-    .flatMap { it.erasedClasses() }
-    .filter { it.isAdmissibleTypeClass(options.packageName, options.targetLanguage) }
+      .flatMap { it.erasedClasses() }
+      .filter { it.isAdmissibleTypeClass(options.packageName, options.targetLanguage) }
 
   private fun closeRelevantTypeClasses(seedClasses: List<KClass<*>>): List<KClass<*>> {
     val byName = linkedMapOf<String, KClass<*>>()
@@ -536,15 +573,62 @@ class CfgGenerator(private val options: GeneratorOptions) {
     }
   }
 
+  private fun parameterizedSubtypeProductions(
+    typeClasses: List<KClass<*>>,
+    typeArgumentTypes: List<TypeExpr>,
+    subtypeIndex: SubtypeIndex,
+  ): List<Production> =
+    typeClasses.parallelFlatMap { typeClass ->
+      directSubtypeTemplates(typeClass).flatMap { template ->
+        val scope = listOf(
+          "subtype",
+          typeClass.qualifiedName ?: typeClass.typeName(options.targetLanguage),
+          template.supertype.render(),
+          template.subtype.render(),
+        ).joinToString("|")
+        parameterizedUnitProduction(
+          lhsPattern = template.supertype,
+          rhsPattern = template.subtype,
+          scope = scope,
+          typeArgumentTypes = typeArgumentTypes,
+          typeParameterBounds = typeParameterBounds(typeClass.typeParameters),
+          subtypeIndex = subtypeIndex,
+        )
+      }
+    }.distinct()
+
   private fun erasedSubtypeProductions(
     subtypeIndex: SubtypeIndex,
     groundTypes: Set<TypeExpr>,
     typeSlots: Set<TypeExpr>,
+  ): List<Production> =
+    erasedSubtypeProductions(
+      subtypeIndex = subtypeIndex,
+      parameterizedTypes = (groundTypes.asSequence() + typeSlots.asSequence())
+        .mapNotNull { type -> (type as? TypeExpr.Applied)?.takeIf { it.arguments.isNotEmpty() } }
+        .distinct()
+        .toList(),
+      typeSlots = typeSlots,
+    )
+
+  private fun parameterizedErasedSubtypeProductions(
+    subtypeIndex: SubtypeIndex,
+    typeSlots: Set<TypeExpr>,
+  ): List<Production> =
+    erasedSubtypeProductions(
+      subtypeIndex = subtypeIndex,
+      parameterizedTypes = typeSlots.asSequence()
+        .mapNotNull { type -> (type as? TypeExpr.Applied)?.takeIf { it.arguments.isNotEmpty() } }
+        .distinct()
+        .toList(),
+      typeSlots = typeSlots,
+    )
+
+  private fun erasedSubtypeProductions(
+    subtypeIndex: SubtypeIndex,
+    parameterizedTypes: List<TypeExpr.Applied>,
+    typeSlots: Set<TypeExpr>,
   ): List<Production> {
-    val parameterizedTypes = (groundTypes.asSequence() + typeSlots.asSequence())
-      .mapNotNull { type -> (type as? TypeExpr.Applied)?.takeIf { it.arguments.isNotEmpty() } }
-      .distinct()
-      .toList()
     val neededErasedTypes = typeSlots
       .mapNotNullTo(linkedSetOf()) { type -> type.asErasedSlot() }
 
@@ -797,10 +881,10 @@ class CfgGenerator(private val options: GeneratorOptions) {
 
   private fun hasPublicConstructorTerminal(typeClass: KClass<*>): Boolean =
     !Modifier.isAbstract(typeClass.java.modifiers) &&
-      typeClass.constructors.any { constructor ->
-        constructor.isPublicCallable() &&
-          constructor.parameters.all { parameter -> parameter.kind == KParameter.Kind.VALUE }
-      }
+        typeClass.constructors.any { constructor ->
+          constructor.isPublicCallable() &&
+              constructor.parameters.all { parameter -> parameter.kind == KParameter.Kind.VALUE }
+        }
 
   private fun directSubtypeTemplates(typeClass: KClass<*>): List<SubtypeTemplate> {
     val subtype = classType(typeClass)
@@ -848,6 +932,26 @@ class CfgGenerator(private val options: GeneratorOptions) {
         .filter { bound -> bound != options.nullableTopType() }
     }
 
+  private fun parameterizedUnitProduction(
+    lhsPattern: TypeExpr,
+    rhsPattern: TypeExpr,
+    scope: String,
+    typeArgumentTypes: List<TypeExpr>,
+    typeParameterBounds: Map<String, List<TypeExpr>>,
+    subtypeIndex: SubtypeIndex,
+  ): List<Production> {
+    val parameterized = parameterizePatterns(
+      scope = scope,
+      patterns = listOf(lhsPattern, rhsPattern),
+      typeArgumentTypes = typeArgumentTypes,
+      typeParameterBounds = typeParameterBounds,
+      subtypeIndex = subtypeIndex,
+    ) ?: return emptyList()
+
+    return listOf(Production(parameterized.patterns[0], listOf(Symbol.Type(parameterized.patterns[1])))) +
+        parameterized.domainProductions
+  }
+
   private fun monomorphizeCall(
     resultPattern: TypeExpr,
     receiverPattern: TypeExpr?,
@@ -860,6 +964,20 @@ class CfgGenerator(private val options: GeneratorOptions) {
     propertyAccess: Boolean = false,
     staticOwnerToken: String? = null,
   ): List<Production> {
+    if (options.emitParameterizedSignatures) {
+      return parameterizedCall(
+        resultPattern = resultPattern,
+        receiverPattern = receiverPattern,
+        name = name,
+        parameterPatterns = parameterPatterns,
+        typeArgumentTypes = typeArgumentTypes,
+        typeParameterBounds = typeParameterBounds,
+        subtypeIndex = subtypeIndex,
+        propertyAccess = propertyAccess,
+        staticOwnerToken = staticOwnerToken,
+      )
+    }
+
     val patterns = listOfNotNull(resultPattern, receiverPattern) + parameterPatterns
     val variables = patterns.flatMap { it.variables() }.distinct().sorted()
     if (variables.size > options.maxTypeVariablesPerCallable) return emptyList()
@@ -889,6 +1007,225 @@ class CfgGenerator(private val options: GeneratorOptions) {
       }
       .distinct()
       .toList()
+  }
+
+  private fun parameterizedCall(
+    resultPattern: TypeExpr,
+    receiverPattern: TypeExpr?,
+    name: String,
+    parameterPatterns: List<TypeExpr>,
+    typeArgumentTypes: List<TypeExpr>,
+    typeParameterBounds: Map<String, List<TypeExpr>>,
+    subtypeIndex: SubtypeIndex,
+    propertyAccess: Boolean = false,
+    staticOwnerToken: String? = null,
+  ): List<Production> {
+    val patterns = listOfNotNull(resultPattern, receiverPattern) + parameterPatterns
+    val parameterized = parameterizePatterns(
+      scope = parameterizedCallScope(
+        resultPattern,
+        receiverPattern,
+        name,
+        parameterPatterns,
+        typeParameterBounds,
+        propertyAccess,
+        staticOwnerToken,
+      ),
+      patterns = patterns,
+      typeArgumentTypes = typeArgumentTypes,
+      typeParameterBounds = typeParameterBounds,
+      subtypeIndex = subtypeIndex,
+    ) ?: return emptyList()
+
+    var patternIndex = 0
+    val resultType = parameterized.patterns[patternIndex++]
+    val receiverType = if (receiverPattern == null) null else parameterized.patterns[patternIndex++]
+    val parameterTypes = parameterized.patterns.drop(patternIndex)
+    val rhs = if (propertyAccess) {
+      checkNotNull(receiverType)
+      listOf(Symbol.Type(receiverType), Symbol.Token("."), Symbol.Token(name))
+    } else {
+      buildCallRhs(name, receiverType, parameterTypes, staticOwnerToken)
+    }
+
+    return listOf(Production(resultType, rhs)) + parameterized.domainProductions
+  }
+
+  private fun parameterizePatterns(
+    scope: String,
+    patterns: List<TypeExpr>,
+    typeArgumentTypes: List<TypeExpr>,
+    typeParameterBounds: Map<String, List<TypeExpr>>,
+    subtypeIndex: SubtypeIndex,
+  ): ParameterizedPatterns? {
+    val variables = patterns.flatMap { it.variables() }.distinct().sorted()
+    if (variables.size > options.maxTypeVariablesPerCallable) return null
+    if (variables.any { variable -> hasDependentBounds(variable, typeParameterBounds[variable].orEmpty()) }) {
+      return null
+    }
+
+    val maxDepthByVariable = maxCandidateDepthByVariable(patterns)
+    val replacements = variables.associateWith { variable ->
+      TypeExpr.Variable(
+        parameterizedTypeVariableName(
+          originalName = variable,
+          scope = scope,
+          bounds = typeParameterBounds[variable].orEmpty(),
+        ),
+      )
+    }
+    val domains = variables.associateWith { variable ->
+      val maxDepth = maxDepthByVariable[variable] ?: options.monomorphizationDepth
+      typeArgumentTypes
+        .filter { candidate -> candidate.depth() <= maxDepth }
+        .filter { candidate ->
+          variableCandidateSatisfiesBounds(
+            variable = variable,
+            candidate = candidate,
+            bounds = typeParameterBounds[variable].orEmpty(),
+            subtypeIndex = subtypeIndex,
+          )
+        }
+    }
+    if (domains.values.any { domain -> domain.isEmpty() }) return null
+
+    val domainProductions = variables.flatMap { variable ->
+      val domain = checkNotNull(domains[variable])
+      val parameterizedVariable = checkNotNull(replacements[variable])
+      val maxDepth = maxDepthByVariable[variable] ?: options.monomorphizationDepth
+      val domainType = TypeExpr.Applied(
+        parameterizedTypeDomainName(
+          variable = variable,
+          bounds = typeParameterBounds[variable].orEmpty(),
+          maxDepth = maxDepth,
+        ),
+      )
+      listOf(Production(parameterizedVariable, listOf(Symbol.Type(domainType)))) +
+          domain.map { type -> Production(domainType, listOf(Symbol.Type(type))) }
+    }
+
+    return ParameterizedPatterns(
+      patterns = patterns.map { pattern -> pattern.renameVariables(replacements) },
+      domainProductions = domainProductions,
+    )
+  }
+
+  private fun parameterizedCallScope(
+    resultPattern: TypeExpr,
+    receiverPattern: TypeExpr?,
+    name: String,
+    parameterPatterns: List<TypeExpr>,
+    typeParameterBounds: Map<String, List<TypeExpr>>,
+    propertyAccess: Boolean,
+    staticOwnerToken: String?,
+  ): String {
+    val renderedBounds = typeParameterBounds.entries
+      .sortedBy { it.key }
+      .joinToString(";") { (variable, bounds) ->
+        "$variable:${bounds.joinToString("&") { bound -> bound.render() }}"
+      }
+    return listOf(
+      "call",
+      if (propertyAccess) "property" else "function",
+      staticOwnerToken.orEmpty(),
+      name,
+      resultPattern.render(),
+      receiverPattern?.render().orEmpty(),
+      parameterPatterns.joinToString(",") { pattern -> pattern.render() },
+      renderedBounds,
+    ).joinToString("|")
+  }
+
+  private fun hasDependentBounds(variable: String, bounds: List<TypeExpr>): Boolean =
+    bounds.any { bound -> (bound.variables() - variable).isNotEmpty() }
+
+  private fun variableCandidateSatisfiesBounds(
+    variable: String,
+    candidate: TypeExpr,
+    bounds: List<TypeExpr>,
+    subtypeIndex: SubtypeIndex,
+  ): Boolean {
+    val substitution = mapOf(variable to candidate)
+    return bounds.all { boundPattern ->
+      val bound = boundPattern.substitute(substitution) ?: return@all false
+      bound == options.nullableTopType() || subtypeIndex.isSubtypeOf(candidate, bound, options.monomorphizationDepth + 4)
+    }
+  }
+
+  private fun maxCandidateDepthByVariable(patterns: List<TypeExpr>): Map<String, Int> {
+    val maxDepthByVariable = mutableMapOf<String, Int>()
+
+    fun visit(type: TypeExpr, nestingDepth: Int) {
+      when (type) {
+        is TypeExpr.Variable -> {
+          val maxDepth = options.monomorphizationDepth - nestingDepth
+          maxDepthByVariable[type.name] = minOf(maxDepthByVariable[type.name] ?: maxDepth, maxDepth)
+        }
+
+        is TypeExpr.Applied -> type.arguments.forEach { argument -> visit(argument, nestingDepth + 1) }
+      }
+    }
+
+    patterns.forEach { pattern -> visit(pattern, 0) }
+    return maxDepthByVariable
+  }
+
+  private fun parameterizedTypeVariableName(
+    originalName: String,
+    scope: String,
+    bounds: List<TypeExpr>,
+  ): String {
+    val readableBounds = readableBoundSuffix(originalName, bounds)
+    val readable = listOfNotNull(originalName, readableBounds)
+      .joinToString("_")
+      .sanitizedNonterminalPart()
+      .take(96)
+    val key = "type-parameter|$scope|$originalName|${boundKey(originalName, bounds)}"
+    return parameterizedSymbolName("__TP", readable, key)
+  }
+
+  private fun parameterizedTypeDomainName(
+    variable: String,
+    bounds: List<TypeExpr>,
+    maxDepth: Int,
+  ): String {
+    val readableBounds = readableBoundSuffix(variable, bounds)
+    val readable = listOfNotNull("depth", maxDepth.toString(), readableBounds)
+      .joinToString("_")
+      .sanitizedNonterminalPart()
+      .take(96)
+    val key = "type-parameter-domain|depth=$maxDepth|bounds=${boundKey(variable, bounds)}"
+    return parameterizedSymbolName("__TP_DOMAIN", readable, key)
+  }
+
+  private fun readableBoundSuffix(variable: String, bounds: List<TypeExpr>): String? {
+    val meaningfulBounds = meaningfulBounds(bounds)
+    if (meaningfulBounds.isEmpty()) return null
+    return "bound_${meaningfulBounds.joinToString("_and_") { bound -> normalizedBound(variable, bound).readableTypePart() }}"
+  }
+
+  private fun boundKey(variable: String, bounds: List<TypeExpr>): String {
+    val meaningfulBounds = meaningfulBounds(bounds)
+    if (meaningfulBounds.isEmpty()) return "top"
+    return meaningfulBounds.joinToString("&") { bound -> normalizedBound(variable, bound).render() }
+  }
+
+  private fun meaningfulBounds(bounds: List<TypeExpr>): List<TypeExpr> =
+    bounds.filterNot { bound -> bound == options.topType() || bound == options.nullableTopType() }
+
+  private fun normalizedBound(variable: String, bound: TypeExpr): TypeExpr =
+    bound.renameVariables(mapOf(variable to TypeExpr.Variable("SELF")))
+
+  private fun parameterizedSymbolName(prefix: String, readable: String, key: String): String {
+    val hash = key.sha256Base64Url()
+    var hashLength = PARAMETERIZED_NAME_HASH_CHARS
+    while (hashLength <= hash.length) {
+      val candidate = "${prefix}_${readable}_${hash.take(hashLength)}"
+      val existingKey = parameterizedNameKeys.putIfAbsent(candidate, key)
+      if (existingKey == null || existingKey == key) return candidate
+      hashLength++
+    }
+    error("Unable to assign collision-free parameterized symbol for $key")
   }
 
   private fun substitutionSatisfiesBounds(
@@ -1018,6 +1355,11 @@ private data class MemberCallableShape(
   val parameterPatterns: List<TypeExpr>,
 )
 
+private data class ParameterizedPatterns(
+  val patterns: List<TypeExpr>,
+  val domainProductions: List<Production>,
+)
+
 private fun primitiveGroundTypes(targetLanguage: TargetLanguage, includeNullableTypes: Boolean): Set<TypeExpr> {
   val primitiveNames = when (targetLanguage) {
     TargetLanguage.KOTLIN -> KotlinLiteralRules.map { it.typeName } + listOf("Unit")
@@ -1084,6 +1426,25 @@ private fun TypeExpr.substitute(substitution: Map<String, TypeExpr>): TypeExpr? 
   is TypeExpr.Applied -> copy(arguments = arguments.map { argument -> argument.substitute(substitution) ?: return null })
 }
 
+private fun TypeExpr.renameVariables(replacements: Map<String, TypeExpr.Variable>): TypeExpr = when (this) {
+  is TypeExpr.Variable -> replacements[name] ?: this
+  is TypeExpr.Applied -> copy(arguments = arguments.map { argument -> argument.renameVariables(replacements) })
+}
+
+private fun TypeExpr.readableTypePart(): String = when (this) {
+  is TypeExpr.Variable -> name.sanitizedNonterminalPart()
+  is TypeExpr.Applied -> buildString {
+    append(name.sanitizedNonterminalPart())
+    if (arguments.isNotEmpty()) {
+      append("_of_")
+      append(arguments.joinToString("_and_") { argument -> argument.readableTypePart() })
+    }
+    if (nullable) {
+      append("_nullable")
+    }
+  }
+}
+
 private fun TypeExpr.isGround(): Boolean = variables().isEmpty()
 
 private fun TypeExpr.depth(): Int = when (this) {
@@ -1094,12 +1455,12 @@ private fun TypeExpr.depth(): Int = when (this) {
 private fun TypeExpr.isTypeArgumentCandidate(targetLanguage: TargetLanguage): Boolean {
   val rendered = render()
   return !(targetLanguage == TargetLanguage.JAVA && rendered in JavaNonGenericArgumentTypes) &&
-    !rendered.startsWith("Function") &&
-    !rendered.startsWith("Comparator") &&
-    !rendered.startsWith("stream.") &&
-    !rendered.contains("Spliterator") &&
-    !rendered.endsWith("Array") &&
-    !rendered.endsWith("Iterator")
+      !rendered.startsWith("Function") &&
+      !rendered.startsWith("Comparator") &&
+      !rendered.startsWith("stream.") &&
+      !rendered.contains("Spliterator") &&
+      !rendered.endsWith("Array") &&
+      !rendered.endsWith("Iterator")
 }
 
 private fun TypeExpr.typeArgumentPriority(targetLanguage: TargetLanguage): Int {
@@ -1112,10 +1473,10 @@ private fun TypeExpr.typeArgumentPriority(targetLanguage: TargetLanguage): Int {
 
 private fun String.isGroundTypeConstructorName(): Boolean =
   !startsWith("Function") &&
-  !startsWith("Comparator") &&
-  !startsWith("stream.") &&
-  !contains("Spliterator") &&
-  !contains("[]")
+      !startsWith("Comparator") &&
+      !startsWith("stream.") &&
+      !contains("Spliterator") &&
+      !contains("[]")
 
 data class LiteralRule(val typeName: String, val literalToken: String)
 
@@ -1314,14 +1675,14 @@ private class ChomskyNormalFormConverter(private val start: TypeExpr) {
     val generatingProductions = productions
       .filter { production ->
         production.lhs in generating &&
-          production.rhs.all { symbol -> symbol !is Symbol.Type || symbol.type in generating }
+            production.rhs.all { symbol -> symbol !is Symbol.Type || symbol.type in generating }
       }
       .toSet()
     val reachable = reachableNonterminals(generatingProductions)
     return generatingProductions
       .filter { production ->
         production.lhs in reachable &&
-          production.rhs.all { symbol -> symbol !is Symbol.Type || symbol.type in reachable }
+            production.rhs.all { symbol -> symbol !is Symbol.Type || symbol.type in reachable }
       }
       .toSet()
   }
@@ -1371,10 +1732,10 @@ private class ChomskyNormalFormConverter(private val start: TypeExpr) {
     val reachable = reachableNonterminals(productions)
     return productions.all { production ->
       production.lhs in generating &&
-        production.lhs in reachable &&
-        production.rhs.all { symbol ->
-          symbol !is Symbol.Type || (symbol.type in generating && symbol.type in reachable)
-        }
+          production.lhs in reachable &&
+          production.rhs.all { symbol ->
+            symbol !is Symbol.Type || (symbol.type in generating && symbol.type in reachable)
+          }
     }
   }
 
@@ -1497,12 +1858,12 @@ class SubtypeIndex(
 
       actual is TypeExpr.Applied && expected is TypeExpr.Applied -> {
         nullableFits(actual, expected) &&
-          (
-            sameConstructorSubtype(actual, expected) ||
-              directSupertypes(actual).any { supertype ->
-                isSubtypeOf(supertype, expected, depth - 1, seen)
-              }
-            )
+            (
+                sameConstructorSubtype(actual, expected) ||
+                    directSupertypes(actual).any { supertype ->
+                      isSubtypeOf(supertype, expected, depth - 1, seen)
+                    }
+                )
       }
 
       else -> false
@@ -1511,10 +1872,10 @@ class SubtypeIndex(
 
   private fun typeVariableFits(actual: TypeExpr, expected: TypeExpr): Boolean =
     actual == expected ||
-    actual is TypeExpr.Variable &&
-    expected is TypeExpr.Variable &&
-    actual.name.removeSuffix("?") == expected.name.removeSuffix("?") &&
-    (!actual.name.endsWith("?") || expected.name.endsWith("?"))
+        actual is TypeExpr.Variable &&
+        expected is TypeExpr.Variable &&
+        actual.name.removeSuffix("?") == expected.name.removeSuffix("?") &&
+        (!actual.name.endsWith("?") || expected.name.endsWith("?"))
 
   private fun nullableFits(actual: TypeExpr.Applied, expected: TypeExpr.Applied): Boolean = !actual.nullable || expected.nullable
 
@@ -1522,15 +1883,15 @@ class SubtypeIndex(
     actual: TypeExpr.Applied,
     expected: TypeExpr.Applied,
   ): Boolean = actual.name == expected.name &&
-    actual.arguments.size == expected.arguments.size &&
-    actual.arguments == expected.arguments
+      actual.arguments.size == expected.arguments.size &&
+      actual.arguments == expected.arguments
 
   private fun directSupertypes(type: TypeExpr.Applied): Set<TypeExpr> =
     templatesBySubName[type.name].orEmpty()
-    .mapNotNull { template ->
-      val bindings = mutableMapOf<String, TypeExpr>()
-      if (unify(template.subtype, type, bindings)) substituteExact(template.supertype, bindings) else null
-    }.toSet()
+      .mapNotNull { template ->
+        val bindings = mutableMapOf<String, TypeExpr>()
+        if (unify(template.subtype, type, bindings)) substituteExact(template.supertype, bindings) else null
+      }.toSet()
 
   private fun substitute(template: TypeExpr, bindings: Map<String, TypeExpr>, depth: Int): Set<TypeExpr> = when (template) {
     is TypeExpr.Variable -> {
@@ -1563,9 +1924,9 @@ class SubtypeIndex(
 
     pattern is TypeExpr.Applied && actual is TypeExpr.Applied -> {
       pattern.name == actual.name &&
-        pattern.nullable == actual.nullable &&
-        pattern.arguments.size == actual.arguments.size &&
-        pattern.arguments.zip(actual.arguments).all { (left, right) -> unify(left, right, bindings) }
+          pattern.nullable == actual.nullable &&
+          pattern.arguments.size == actual.arguments.size &&
+          pattern.arguments.zip(actual.arguments).all { (left, right) -> unify(left, right, bindings) }
     }
 
     else -> false
@@ -1665,9 +2026,9 @@ class ClassPathPackageScanner {
         jar.entries().asSequence()
           .filter { entry ->
             !entry.isDirectory &&
-              entry.name.startsWith("$packagePath/") &&
-              entry.name.endsWith(".class") &&
-              entry.name.removePrefix("$packagePath/").contains('/').not()
+                entry.name.startsWith("$packagePath/") &&
+                entry.name.endsWith(".class") &&
+                entry.name.removePrefix("$packagePath/").contains('/').not()
           }
           .forEach { entry -> classNames += entry.name.removeSuffix(".class").replace('/', '.') }
       }
@@ -1770,7 +2131,7 @@ private fun KClass<*>.hasPublicVisibility(): Boolean =
 private fun KType.containsOnlySupportedArguments(): Boolean = arguments.all { projection ->
   val projectedType = projection.type ?: return@all false
   (projection.variance == null || projection.variance == KVariance.INVARIANT || projection.variance == KVariance.OUT) &&
-    projectedType.containsOnlySupportedArguments()
+      projectedType.containsOnlySupportedArguments()
 }
 
 private fun KClass<*>.safeSupertypes(): List<KType> = runCatching { supertypes }.getOrElse { emptyList() }
@@ -1821,8 +2182,8 @@ private fun safeMemberProperties(typeClass: KClass<*>, packageName: String): Lis
 
 private fun KClass<*>.shouldReflectMembers(packageName: String): Boolean =
   isTopTypeClass() ||
-    java.hasKotlinMetadata() ||
-    (qualifiedName?.startsWith("$packageName.") == true && !java.hasFragileJavaCloneMember())
+      java.hasKotlinMetadata() ||
+      (qualifiedName?.startsWith("$packageName.") == true && !java.hasFragileJavaCloneMember())
 
 private fun KClass<*>.isTopTypeClass(): Boolean =
   qualifiedName == "kotlin.Any" || qualifiedName == "java.lang.Object"
@@ -1832,8 +2193,8 @@ private fun Class<*>.hasKotlinMetadata(): Boolean =
 
 private fun Class<*>.hasFragileJavaCloneMember(): Boolean =
   !hasKotlinMetadata() &&
-    java.lang.Cloneable::class.java.isAssignableFrom(this) &&
-    methods.any { method -> method.name == "clone" }
+      java.lang.Cloneable::class.java.isAssignableFrom(this) &&
+      methods.any { method -> method.name == "clone" }
 
 private fun safeStaticFunctions(typeClass: KClass<*>, packageName: String): List<KFunction<*>> =
   if (!typeClass.shouldReflectMembers(packageName)) {
@@ -1854,22 +2215,22 @@ private fun Class<*>.safeKotlinClass(): KClass<*>? = runCatching { kotlin }.getO
 private fun isPublicTypeClass(javaClass: Class<*>): Boolean {
   val kotlinClass = javaClass.safeKotlinClass() ?: return false
   return Modifier.isPublic(javaClass.modifiers) &&
-    !javaClass.name.contains('$') &&
-    kotlinClass.isRelevantPublicTypeClass(kotlinClass.qualifiedName?.substringBeforeLast('.') ?: "")
+      !javaClass.name.contains('$') &&
+      kotlinClass.isRelevantPublicTypeClass(kotlinClass.qualifiedName?.substringBeforeLast('.') ?: "")
 }
 
 private fun KClass<*>.isRelevantPublicTypeClass(packageName: String): Boolean {
   val qualified = qualifiedName ?: return false
   val simple = simpleName ?: return false
   return qualified.startsWith("$packageName.") &&
-    hasPublicVisibility() &&
-    !java.isSynthetic &&
-    !java.isAnnotation &&
-    !java.name.contains('$') &&
-    simple != "Companion" &&
-    !simple.isGeneratedName() &&
-    !simple.contains("Kt") &&
-    !simple.endsWith("DefaultImpls")
+      hasPublicVisibility() &&
+      !java.isSynthetic &&
+      !java.isAnnotation &&
+      !java.name.contains('$') &&
+      simple != "Companion" &&
+      !simple.isGeneratedName() &&
+      !simple.contains("Kt") &&
+      !simple.endsWith("DefaultImpls")
 }
 
 private fun KClass<*>.isAdmissibleTypeClass(packageName: String, targetLanguage: TargetLanguage): Boolean =
@@ -1886,26 +2247,26 @@ private fun KClass<*>.isConcretePublicSignatureClass(targetLanguage: TargetLangu
     return false
   }
   return hasPublicVisibility() &&
-    !java.isSynthetic &&
-    !java.isAnnotation &&
-    !java.isArray &&
-    !java.isPrimitive &&
-    !java.isInterface &&
-    !Modifier.isAbstract(java.modifiers) &&
-    !java.name.contains('$') &&
-    simple != "Companion" &&
-    !simple.isGeneratedName() &&
-    !simple.contains("Kt") &&
-    !qualified.startsWith("kotlin.jvm.functions.") &&
-    qualified != "kotlin.String"
+      !java.isSynthetic &&
+      !java.isAnnotation &&
+      !java.isArray &&
+      !java.isPrimitive &&
+      !java.isInterface &&
+      !Modifier.isAbstract(java.modifiers) &&
+      !java.name.contains('$') &&
+      simple != "Companion" &&
+      !simple.isGeneratedName() &&
+      !simple.contains("Kt") &&
+      !qualified.startsWith("kotlin.jvm.functions.") &&
+      qualified != "kotlin.String"
 }
 
 private fun isPublicTopLevelFunctionHolder(javaClass: Class<*>): Boolean {
   val simpleName = javaClass.simpleName
   return !javaClass.isSynthetic &&
-    !javaClass.name.contains('$') &&
-    simpleName.contains("Kt") &&
-    !simpleName.isGeneratedName()
+      !javaClass.name.contains('$') &&
+      simpleName.contains("Kt") &&
+      !simpleName.isGeneratedName()
 }
 
 private fun KClass<*>.typeName(targetLanguage: TargetLanguage = TargetLanguage.KOTLIN, forceQualified: Boolean = false): String {
@@ -1935,6 +2296,17 @@ private fun KClass<*>.tokenName(): String = (simpleName ?: typeName()).noWhitesp
 private fun String.isGeneratedName(): Boolean = contains('$') || startsWith("<") || endsWith("DefaultImpls")
 
 private fun String.noWhitespaceToken(): String = replace(Regex("\\s+"), "_")
+
+private fun String.sanitizedNonterminalPart(): String {
+  val sanitized = map { character -> if (character.isLetterOrDigit()) character else '_' }.joinToString("")
+    .trim('_')
+  return sanitized.ifBlank { "X" }
+}
+
+private fun String.sha256Base64Url(): String {
+  val digest = MessageDigest.getInstance("SHA-256").digest(toByteArray(Charsets.UTF_8))
+  return Base64.getUrlEncoder().withoutPadding().encodeToString(digest)
+}
 
 private fun String.sanitizedCnfNamePart(): String {
   val sanitized = map { character -> if (character.isLetterOrDigit()) character else '_' }.joinToString("")
