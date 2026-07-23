@@ -13,6 +13,7 @@ repositories {
 dependencies {
   implementation(kotlin("reflect"))
   testImplementation(kotlin("test"))
+  implementation("io.github.classgraph:classgraph:4.8.184")
 }
 
 kotlin {
@@ -25,4 +26,11 @@ tasks.test {
 
 application {
   mainClass.set("org.lib2cfg.MainKt")
+}
+
+tasks.register<JavaExec>("runClassGraph") {
+  group = "application"
+  description = "Generate a grammar with the ClassGraph-backed implementation"
+  classpath = sourceSets["main"].runtimeClasspath
+  mainClass.set("org.lib2cfg.ClassGraphKt")
 }

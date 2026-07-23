@@ -109,48 +109,6 @@ data class GeneratorOptions(
   val targetLanguage: TargetLanguage = TargetLanguage.fromPackageName(packageName),
 )
 
-data class GeneratedGrammar(
-  val text: String,
-  val productionCount: Int,
-  val nonterminalCount: Int,
-  val terminalCount: Int,
-) {
-  companion object {
-    fun from(productions: Iterable<Production>): GeneratedGrammar {
-      val sortedProductions = productions
-        .sortedWith(compareBy<Production> { it.lhs.render() }.thenBy { it.rhs.joinToString(" ") { symbol -> symbol.render() } })
-      val nonterminals = linkedSetOf<TypeExpr>()
-      val terminals = linkedSetOf<String>()
-
-      for (production in sortedProductions) {
-        nonterminals += production.lhs
-        for (symbol in production.rhs) {
-          when (symbol) {
-            is Symbol.Type -> nonterminals += symbol.type
-            is Symbol.Token -> terminals += symbol.value
-          }
-        }
-      }
-
-      return GeneratedGrammar(
-        text = sortedProductions.joinToString("\n") { it.render() },
-        productionCount = sortedProductions.size,
-        nonterminalCount = nonterminals.size,
-        terminalCount = terminals.size,
-      )
-    }
-  }
-}
-
-enum class TargetLanguage {
-  KOTLIN,
-  JAVA;
-
-  companion object {
-    fun fromPackageName(packageName: String): TargetLanguage = if (packageName.startsWith("kotlin.")) KOTLIN else JAVA
-  }
-}
-
 private fun <T, R> Iterable<T>.parallelFlatMap(transform: (T) -> Iterable<R>): List<R> =
   materializedCollection().parallelStream()
     .flatMap { item -> transform(item).materializedCollection().stream() }
@@ -263,19 +221,19 @@ class CfgGenerator(private val options: GeneratorOptions) {
     if (options.includeNullableTypes) {
       nullableLiteralProductions(productions.flatMap { it.types() }).forEach { productions += it }
     }
-    val bodyProductions = if (options.emitParameterizedSignatures) {
-      productions
+    val body = if (options.emitParameterizedSignatures) {
+      CFG(productions)
     } else {
-      pruneUndefinedNonterminals(productions)
+      CFG(productions).withoutUndefinedNonterminals()
     }
-    val allProductions = bodyProductions + startProductions(bodyProductions)
-    val finalProductions = if (options.normalizeChomskyNormalForm) {
-      toChomskyNormalForm(allProductions, StartType)
+    val withStart = body.withStartProductions()
+    val finalGrammar = if (options.normalizeChomskyNormalForm) {
+      withStart.toChomskyNormalForm()
     } else {
-      allProductions
+      withStart
     }
 
-    return GeneratedGrammar.from(finalProductions)
+    return finalGrammar.toGeneratedGrammar()
   }
 
   private fun constructorProductions(
@@ -1286,58 +1244,6 @@ class CfgGenerator(private val options: GeneratorOptions) {
       .map { type -> Production(type, listOf(Symbol.Token("null"))) }
   }
 
-  private fun startProductions(productions: Iterable<Production>): List<Production> =
-    productions.map { it.lhs }.filter { it != StartType }.toSet().sortedBy { it.render() }
-      .map { type -> Production(StartType, listOf(Symbol.Type(type))) }
-
-  private fun pruneUndefinedNonterminals(productions: Iterable<Production>): Set<Production> {
-    var remaining = productions.toSet()
-    while (true) {
-      val definedTypes = remaining.mapTo(mutableSetOf()) { it.lhs }
-      val pruned = remaining
-        .filter { production ->
-          production.rhs.all { symbol -> symbol !is Symbol.Type || symbol.type in definedTypes }
-        }
-        .toSet()
-      if (pruned.size == remaining.size) return pruned
-      remaining = pruned
-    }
-  }
-}
-
-data class Production(val lhs: TypeExpr, val rhs: List<Symbol>) {
-  fun render(): String = "${lhs.render()} -> ${rhs.joinToString(" ") { it.render() }}"
-
-  fun types(): Set<TypeExpr> = buildSet {
-    add(lhs)
-    rhs.forEach { symbol ->
-      if (symbol is Symbol.Type) add(symbol.type)
-    }
-  }
-}
-
-sealed interface Symbol {
-  fun render(): String
-
-  data class Type(val type: TypeExpr) : Symbol { override fun render(): String = type.render() }
-  data class Token(val value: String) : Symbol { override fun render(): String = value.noWhitespaceToken() }
-}
-
-sealed interface TypeExpr {
-  fun render(): String
-
-  data class Applied(
-    val name: String,
-    val arguments: List<TypeExpr> = emptyList(),
-    val nullable: Boolean = false,
-  ) : TypeExpr {
-    override fun render(): String {
-      val renderedArguments = if (arguments.isEmpty()) "" else arguments.joinToString(",", "<", ">") { it.render() }
-      return "$name$renderedArguments${if (nullable) "?" else ""}"
-    }
-  }
-
-  data class Variable(val name: String) : TypeExpr { override fun render(): String = name.noWhitespaceToken() }
 }
 
 data class GroundTypeConstructor(val name: String, val arity: Int)
@@ -1361,10 +1267,8 @@ private data class ParameterizedPatterns(
 )
 
 private fun primitiveGroundTypes(targetLanguage: TargetLanguage, includeNullableTypes: Boolean): Set<TypeExpr> {
-  val primitiveNames = when (targetLanguage) {
-    TargetLanguage.KOTLIN -> KotlinLiteralRules.map { it.typeName } + listOf("Unit")
-    TargetLanguage.JAVA -> JavaLiteralRules.map { it.typeName }
-  }
+  val primitiveNames = PrimitiveLiteralRules.typeNames(targetLanguage) +
+      if (targetLanguage == TargetLanguage.KOTLIN) listOf("Unit") else emptyList()
   return buildSet {
     primitiveNames.forEach { name ->
       add(TypeExpr.Applied(name))
@@ -1383,11 +1287,6 @@ private fun primitiveGroundTypes(targetLanguage: TargetLanguage, includeNullable
       }
     }
   }
-}
-
-private fun TypeExpr.variables(): Set<String> = when (this) {
-  is TypeExpr.Variable -> setOf(name)
-  is TypeExpr.Applied -> arguments.flatMapTo(mutableSetOf()) { it.variables() }
 }
 
 private fun TypeExpr.erased(): TypeExpr = when (this) {
@@ -1421,11 +1320,6 @@ private fun normalizeVariables(types: List<TypeExpr>): List<TypeExpr> {
   return types.map(::normalize)
 }
 
-private fun TypeExpr.substitute(substitution: Map<String, TypeExpr>): TypeExpr? = when (this) {
-  is TypeExpr.Variable -> substitution[name]
-  is TypeExpr.Applied -> copy(arguments = arguments.map { argument -> argument.substitute(substitution) ?: return null })
-}
-
 private fun TypeExpr.renameVariables(replacements: Map<String, TypeExpr.Variable>): TypeExpr = when (this) {
   is TypeExpr.Variable -> replacements[name] ?: this
   is TypeExpr.Applied -> copy(arguments = arguments.map { argument -> argument.renameVariables(replacements) })
@@ -1443,13 +1337,6 @@ private fun TypeExpr.readableTypePart(): String = when (this) {
       append("_nullable")
     }
   }
-}
-
-private fun TypeExpr.isGround(): Boolean = variables().isEmpty()
-
-private fun TypeExpr.depth(): Int = when (this) {
-  is TypeExpr.Variable -> 0
-  is TypeExpr.Applied -> if (arguments.isEmpty()) 0 else 1 + arguments.maxOf { it.depth() }
 }
 
 private fun TypeExpr.isTypeArgumentCandidate(targetLanguage: TargetLanguage): Boolean {
@@ -1477,44 +1364,6 @@ private fun String.isGroundTypeConstructorName(): Boolean =
       !startsWith("stream.") &&
       !contains("Spliterator") &&
       !contains("[]")
-
-data class LiteralRule(val typeName: String, val literalToken: String)
-
-private val KotlinLiteralRules = listOf(
-  LiteralRule("Boolean", "true"),
-  LiteralRule("Byte", "0"),
-  LiteralRule("Char", "'x'"),
-  LiteralRule("Double", "0.0"),
-  LiteralRule("Float", "0.0f"),
-  LiteralRule("Int", "0"),
-  LiteralRule("Long", "0L"),
-  LiteralRule("Short", "0"),
-  LiteralRule("String", "\"s\""),
-  LiteralRule("UByte", "0u"),
-  LiteralRule("UInt", "0u"),
-  LiteralRule("ULong", "0UL"),
-  LiteralRule("UShort", "0u"),
-)
-
-private val JavaLiteralRules = listOf(
-  LiteralRule("boolean", "true"),
-  LiteralRule("byte", "0"),
-  LiteralRule("char", "'x'"),
-  LiteralRule("double", "0.0"),
-  LiteralRule("float", "0.0f"),
-  LiteralRule("int", "0"),
-  LiteralRule("long", "0L"),
-  LiteralRule("short", "0"),
-  LiteralRule("Boolean", "true"),
-  LiteralRule("Byte", "0"),
-  LiteralRule("Character", "'x'"),
-  LiteralRule("Double", "0.0"),
-  LiteralRule("Float", "0.0f"),
-  LiteralRule("Integer", "0"),
-  LiteralRule("Long", "0L"),
-  LiteralRule("Short", "0"),
-  LiteralRule("String", "\"s\""),
-)
 
 private val JavaNonGenericArgumentTypes = setOf("boolean", "byte", "char", "double", "float", "int", "long", "short", "void")
 
@@ -1569,188 +1418,6 @@ private val JavaTypeArgumentPriority = linkedMapOf(
   "Set<Integer>" to 12,
   "Collection<Integer>" to 13,
 )
-
-fun toChomskyNormalForm(productions: Iterable<Production>, start: TypeExpr): Set<Production> =
-  ChomskyNormalFormConverter(start).convert(productions)
-
-private class ChomskyNormalFormConverter(private val start: TypeExpr) {
-  private val terminalNonterminals = linkedMapOf<String, TypeExpr>()
-  private val suffixNonterminals = linkedMapOf<List<Symbol.Type>, TypeExpr>()
-  private var terminalCounter = 0
-  private var suffixCounter = 0
-
-  fun convert(productions: Iterable<Production>): Set<Production> {
-    val normalized = linkedSetOf<Production>()
-    productions
-      .filter { it.rhs.isNotEmpty() }
-      .sortedWith(compareBy<Production> { it.lhs.render() }.thenBy { it.rhs.joinToString(" ") { symbol -> symbol.render() } })
-      .forEach { production -> normalized += normalizeShape(production) }
-
-    terminalNonterminals.forEach { (terminal, nonterminal) ->
-      normalized += Production(nonterminal, listOf(Symbol.Token(terminal)))
-    }
-
-    val withoutUnits = eliminateUnitProductions(normalized)
-    val useful = pruneToUsefulProductions(withoutUnits)
-    require(useful.all(::isChomskyNormalForm)) {
-      "CNF conversion produced non-CNF productions"
-    }
-    require(allProductionsAreUseful(useful)) {
-      "CNF conversion produced unreachable or non-generating productions"
-    }
-    return useful
-  }
-
-  private fun normalizeShape(production: Production): Set<Production> {
-    val rhs = if (production.rhs.size == 1) {
-      production.rhs
-    } else {
-      production.rhs.map { symbol ->
-        when (symbol) {
-          is Symbol.Type -> symbol
-          is Symbol.Token -> Symbol.Type(terminalNonterminal(symbol.value))
-        }
-      }
-    }
-
-    return when (rhs.size) {
-      1, 2 -> setOf(Production(production.lhs, rhs))
-      else -> binarize(production.lhs, rhs.map { it as Symbol.Type })
-    }
-  }
-
-  private fun binarize(lhs: TypeExpr, rhs: List<Symbol.Type>): Set<Production> {
-    val result = linkedSetOf<Production>()
-    var currentLhs = lhs
-    for (index in 0 until rhs.size - 2) {
-      val suffix = rhs.drop(index + 1)
-      val suffixType = suffixNonterminal(suffix)
-      result += Production(currentLhs, listOf(rhs[index], Symbol.Type(suffixType)))
-      currentLhs = suffixType
-    }
-    result += Production(currentLhs, rhs.takeLast(2))
-    return result
-  }
-
-  private fun eliminateUnitProductions(productions: Set<Production>): Set<Production> {
-    val unitTargets = productions
-      .filter { it.rhs.size == 1 && it.rhs.single() is Symbol.Type }
-      .groupBy({ it.lhs }, { (it.rhs.single() as Symbol.Type).type })
-    val nonUnitProductions = productions
-      .filterNot { it.rhs.size == 1 && it.rhs.single() is Symbol.Type }
-    val nonUnitsByLhs = nonUnitProductions.groupBy { it.lhs }
-    val nonterminals = productions.flatMapTo(mutableSetOf()) { production ->
-      production.types()
-    }
-
-    val result = linkedSetOf<Production>()
-    for (source in nonterminals.sortedBy { it.render() }) {
-      val closure = unitClosure(source, unitTargets)
-      for (target in closure) {
-        for (production in nonUnitsByLhs[target].orEmpty()) {
-          result += production.copy(lhs = source)
-        }
-      }
-    }
-    return result
-  }
-
-  private fun unitClosure(source: TypeExpr, unitTargets: Map<TypeExpr, List<TypeExpr>>): Set<TypeExpr> {
-    val closure = linkedSetOf(source)
-    val queue = ArrayDeque<TypeExpr>()
-    queue += source
-    while (queue.isNotEmpty()) {
-      val current = queue.removeFirst()
-      for (target in unitTargets[current].orEmpty()) {
-        if (closure.add(target)) {
-          queue += target
-        }
-      }
-    }
-    return closure
-  }
-
-  private fun pruneToUsefulProductions(productions: Set<Production>): Set<Production> {
-    val generating = generatingNonterminals(productions)
-    val generatingProductions = productions
-      .filter { production ->
-        production.lhs in generating &&
-            production.rhs.all { symbol -> symbol !is Symbol.Type || symbol.type in generating }
-      }
-      .toSet()
-    val reachable = reachableNonterminals(generatingProductions)
-    return generatingProductions
-      .filter { production ->
-        production.lhs in reachable &&
-            production.rhs.all { symbol -> symbol !is Symbol.Type || symbol.type in reachable }
-      }
-      .toSet()
-  }
-
-  private fun generatingNonterminals(productions: Set<Production>): Set<TypeExpr> {
-    val generating = linkedSetOf<TypeExpr>()
-    var changed: Boolean
-    do {
-      changed = false
-      for (production in productions) {
-        if (production.lhs in generating) continue
-        if (production.rhs.all { symbol -> symbol !is Symbol.Type || symbol.type in generating }) {
-          changed = generating.add(production.lhs) || changed
-        }
-      }
-    } while (changed)
-    return generating
-  }
-
-  private fun reachableNonterminals(productions: Set<Production>): Set<TypeExpr> {
-    val byLhs = productions.groupBy { it.lhs }
-    val reachable = linkedSetOf(start)
-    val queue = ArrayDeque<TypeExpr>()
-    queue += start
-    while (queue.isNotEmpty()) {
-      val current = queue.removeFirst()
-      for (production in byLhs[current].orEmpty()) {
-        for (symbol in production.rhs) {
-          if (symbol is Symbol.Type && reachable.add(symbol.type)) {
-            queue += symbol.type
-          }
-        }
-      }
-    }
-    return reachable
-  }
-
-  private fun isChomskyNormalForm(production: Production): Boolean =
-    when (production.rhs.size) {
-      1 -> production.rhs.single() is Symbol.Token
-      2 -> production.rhs.all { it is Symbol.Type }
-      else -> false
-    }
-
-  private fun allProductionsAreUseful(productions: Set<Production>): Boolean {
-    val generating = generatingNonterminals(productions)
-    val reachable = reachableNonterminals(productions)
-    return productions.all { production ->
-      production.lhs in generating &&
-          production.lhs in reachable &&
-          production.rhs.all { symbol ->
-            symbol !is Symbol.Type || (symbol.type in generating && symbol.type in reachable)
-          }
-    }
-  }
-
-  private fun terminalNonterminal(terminal: String): TypeExpr =
-    terminalNonterminals.getOrPut(terminal) {
-      terminalCounter += 1
-      TypeExpr.Applied("__CNF_T_${terminal.sanitizedCnfNamePart()}_${terminalCounter.toString().padStart(4, '0')}")
-    }
-
-  private fun suffixNonterminal(suffix: List<Symbol.Type>): TypeExpr =
-    suffixNonterminals.getOrPut(suffix) {
-      suffixCounter += 1
-      TypeExpr.Applied("__CNF_N_${suffixCounter.toString().padStart(6, '0')}")
-    }
-}
 
 class TypeRenderer(
   private val targetLanguage: TargetLanguage,
@@ -1940,29 +1607,6 @@ class SubtypeIndex(
   }
 }
 
-object PrimitiveLiteralRules {
-  fun rules(targetLanguage: TargetLanguage, includeNullableTypes: Boolean): List<Production> {
-    val primitiveRules = when (targetLanguage) {
-      TargetLanguage.KOTLIN -> KotlinLiteralRules
-      TargetLanguage.JAVA -> JavaLiteralRules
-    }
-    val nullRules = if (includeNullableTypes && targetLanguage == TargetLanguage.KOTLIN) {
-      listOf(Production(TypeExpr.Applied("Nothing", nullable = true), listOf(Symbol.Token("null"))))
-    } else {
-      emptyList()
-    }
-
-    return primitiveRules.flatMap { (typeName, literalToken) ->
-      buildList {
-        add(Production(TypeExpr.Applied(typeName), listOf(Symbol.Token(literalToken))))
-        if (includeNullableTypes) {
-          add(Production(TypeExpr.Applied(typeName, nullable = true), listOf(Symbol.Token("null"))))
-        }
-      }
-    } + nullRules
-  }
-}
-
 class ClassPathPackageScanner {
   fun scan(packageName: String): List<Class<*>> {
     val packagePath = packageName.replace('.', '/')
@@ -2080,7 +1724,6 @@ private val JavaBackedKotlinTypeAliases = mapOf(
   "kotlin.Unit" to "void",
   "kotlin.Nothing" to "java.lang.Void",
 )
-private val StartType = TypeExpr.Applied("START")
 private val AlwaysUnqualifiedTypeNames = setOf(
   "Any",
   "Nothing",
@@ -2306,11 +1949,4 @@ private fun String.sanitizedNonterminalPart(): String {
 private fun String.sha256Base64Url(): String {
   val digest = MessageDigest.getInstance("SHA-256").digest(toByteArray(Charsets.UTF_8))
   return Base64.getUrlEncoder().withoutPadding().encodeToString(digest)
-}
-
-private fun String.sanitizedCnfNamePart(): String {
-  val sanitized = map { character -> if (character.isLetterOrDigit()) character else '_' }.joinToString("")
-    .trim('_')
-    .ifBlank { "TOKEN" }
-  return sanitized.take(32)
 }

@@ -196,3 +196,29 @@ Examples:
 ./gradlew run --args='--cnf kotlin.collections'
 ./gradlew run --args='--parameterized kotlin.collections'
 ```
+
+### ClassGraph JVM scanner
+
+The parallel bytecode-only implementation has its own entry point and output
+suffix, so its grammar can be compared with the reflection-based generator:
+
+```sh
+./gradlew runClassGraph --args='java.util.function'
+./gradlew runClassGraph --args='--cnf java.util.function'
+```
+
+These commands write `gen/java_util_function.classgraph.cfg` and
+`gen/java_util_function.classgraph.cnf`, respectively.
+
+This scanner intentionally implements a small JVM-language-agnostic fragment:
+public declared constructors and methods with zero through three arguments,
+chained instance calls, direct generic subtyping, and at most two upper-bounded
+type variables instantiated from a small ground universe. Arrays, wildcards,
+varargs, nested classes, fields, ambiguous overload families, and
+Kotlin-specific source constructs are skipped rather than reconstructed from
+bytecode.
+
+Both JVM scanners delegate their shared grammar representation, production
+rendering, pruning, start-symbol handling, and Chomsky normalization to
+`CFG.kt`. The ClassGraph scanner contributes grounded calls and a subtype
+predicate without constructing grammar symbols directly.
