@@ -22,15 +22,6 @@ from typing import Any, Iterable, Iterator, Mapping, Sequence
 
 PARAMETERIZED_NAME_HASH_CHARS = 5
 START_TYPE_NAME = "START"
-DEFAULT_NUMPY_GROUND_DTYPES = (
-    "bool_",
-    "int32",
-    "int64",
-    "float32",
-    "float64",
-    "complex64",
-    "complex128",
-)
 _BUILTIN_TYPE_NAMES = frozenset(
     {
         "object",
@@ -245,49 +236,25 @@ def default_output_file(
 
 @dataclass(frozen=True)
 class LibraryProfile:
-    """Declarative naming and optional reflection extension for one library.
-
-    The reflection core only needs to know how a module is imported and how
-    its qualified names should be rendered.  Library-specific typing oracles
-    are selected by ``extension`` and can be added without changing the core
-    scanner, signature renderer, or grammar machinery.
-    """
+    """Declarative import and qualified-name rendering for one library."""
 
     module_name: str
     namespace_module: str
     alias: str | None = None
-    extension: str | None = None
-    array_type_name: str | None = None
-    ground_type_names: tuple[str, ...] = ()
 
     @staticmethod
     def for_module(
         module_name: str,
         *,
         alias: str | None = None,
-        ground_type_names: tuple[str, ...] | None = None,
     ) -> LibraryProfile:
         if alias is not None and not _is_valid_module_alias(alias):
             raise ValueError("module_alias must be a non-keyword Python identifier")
         root_name = module_name.split(".", 1)[0]
-        if root_name == "numpy":
-            return LibraryProfile(
-                module_name=module_name,
-                namespace_module=root_name,
-                alias="np" if alias is None else alias,
-                extension="numpy",
-                array_type_name="numpy.ndarray",
-                ground_type_names=(
-                    DEFAULT_NUMPY_GROUND_DTYPES
-                    if ground_type_names is None
-                    else ground_type_names
-                ),
-            )
         return LibraryProfile(
             module_name=module_name,
             namespace_module=module_name if alias is not None else root_name,
             alias=alias,
-            ground_type_names=ground_type_names or (),
         )
 
     def render_qualified_name(self, qualified_name: str) -> str:
@@ -322,10 +289,6 @@ class LibraryProfile:
         )
         return (self.alias, *suffix, member_name)
 
-    def root_access_parts(self, member_name: str) -> tuple[str, ...]:
-        root = self.alias or self.namespace_module
-        return (root, member_name)
-
 
 @dataclass(frozen=True)
 class GeneratorOptions:
@@ -334,11 +297,9 @@ class GeneratorOptions:
     max_type_arguments_per_variable: int = 26
     max_type_variables_per_callable: int = 2
     max_vararg_arity: int = 3
-    max_array_literal_values: int = 3
     normalize_chomsky_normal_form: bool = False
     emit_parameterized_signatures: bool = False
     module_alias: str | None = None
-    ground_type_names: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -431,81 +392,7 @@ _UNARY_OPERATOR_TOKENS = {
     "__invert__": "~",
     "__abs__": "abs",
 }
-_UFUNC_OPERATOR_TOKENS = {
-    "absolute": "abs",
-    "add": "+",
-    "subtract": "-",
-    "multiply": "*",
-    "matmul": "@",
-    "true_divide": "/",
-    "floor_divide": "//",
-    "remainder": "%",
-    "power": "**",
-    "left_shift": "<<",
-    "right_shift": ">>",
-    "bitwise_and": "&",
-    "bitwise_xor": "^",
-    "bitwise_or": "|",
-    "invert": "~",
-    "negative": "-",
-    "positive": "+",
-    "less": "<",
-    "less_equal": "<=",
-    "equal": "==",
-    "not_equal": "!=",
-    "greater": ">",
-    "greater_equal": ">=",
-    "divmod": "divmod",
-}
-_UNARY_UFUNC_OPERATORS = {"absolute", "invert", "negative", "positive"}
-_UFUNC_INPLACE_TOKENS = {
-    name: f"{token}="
-    for name, token in _UFUNC_OPERATOR_TOKENS.items()
-    if token in {"+", "-", "*", "@", "/", "//", "%", "**", "<<", ">>", "&", "^", "|"}
-}
-_NUMPY_UFUNC_BACKED_DUNDERS = frozenset(
-    {
-        *_BINARY_OPERATOR_TOKENS,
-        *_REFLECTED_OPERATOR_TOKENS,
-        *_INPLACE_OPERATOR_TOKENS,
-        *_UNARY_OPERATOR_TOKENS,
-        "__divmod__",
-    }
-)
-
-_NUMPY_LITERAL_TERMINALS: Mapping[str, tuple[str, ...]] = {
-    "BOOL": ("False", "True"),
-    "SIGNED": ("-1", "0", "1"),
-    "UNSIGNED": ("0", "1", "2"),
-    "FLOAT": ("-1.0", "0.0", "1.0"),
-    "COMPLEX": ("-1j", "0j", "1j"),
-    "DATETIME": ('"2000-01-01"', '"2000-01-02"', '"2000-01-03"'),
-    "TIMEDELTA": ("0", "1", "2"),
-    "STRING": ('""', '"a"', '"b"'),
-    "BYTES": ('b""', 'b"a"', 'b"b"'),
-    "OBJECT": ("0", "1", "2"),
-}
-
-_NUMPY_KIND_LITERAL_CATEGORY: Mapping[str, str] = {
-    "b": "BOOL",
-    "i": "SIGNED",
-    "u": "UNSIGNED",
-    "f": "FLOAT",
-    "c": "COMPLEX",
-    "M": "DATETIME",
-    "m": "TIMEDELTA",
-    "U": "STRING",
-    "S": "BYTES",
-    "O": "OBJECT",
-    "V": "BYTES",
-}
 _PROTOCOL_DUNDERS = {
-    "__array__",
-    "__array_finalize__",
-    "__array_function__",
-    "__array_prepare__",
-    "__array_ufunc__",
-    "__array_wrap__",
     "__bytes__",
     "__bool__",
     "__call__",
@@ -739,24 +626,10 @@ class TypeRenderer:
         text = documented.replace("`", "").replace("~", "").strip()
         text = re.sub(r",?\s*optional\b", "", text, flags=re.IGNORECASE)
         lowered = text.lower()
-        if not text or lowered in {"any", "object", "array_like or scalar", "scalar or array_like"}:
+        if not text or lowered in {"any", "object"}:
             return OBJECT_TYPE
         if lowered in {"none", "nonetype"}:
             return NONE_TYPE
-        if "ndarray" in lowered or "array_like" in lowered or "array-like" in lowered:
-            if self.profile.array_type_name is None:
-                return TypeExpr.applied("list") if "array" in lowered and "like" in lowered else OBJECT_TYPE
-            array_type = self._named_export_type("ndarray") or TypeExpr.applied(
-                self.profile.render_qualified_name(self.profile.array_type_name)
-            )
-            if "bool" in lowered:
-                bool_type = self._named_export_type("bool_") or TypeExpr.applied("bool")
-                return TypeExpr.applied(array_type.name, bool_type)
-            return array_type
-        if re.search(r"\b(dtype|data-type)\b", lowered):
-            return self._named_export_type("dtype") or OBJECT_TYPE
-        if re.search(r"\bscalar\b", lowered):
-            return self._named_export_type("generic") or OBJECT_TYPE
         simple_types: tuple[tuple[str, type], ...] = (
             (r"\bboolean\b|\bbool\b", bool),
             (r"\binteger\b|\bint\b", int),
@@ -830,10 +703,10 @@ def _parameters_from_doc_signature(documentation: str | None, renderer: TypeRend
         return None
     content = signature_line[start + 1 : end]
 
-    # NumPy documents optional groups both as defaults (``axis=None``) and as
-    # brackets. Remove bracket groups completely because this generator emits
+    # Some APIs document optional groups both as defaults and as brackets.
+    # Remove bracket groups completely because this generator emits
     # the minimal call. Importantly, required text outside a group survives:
-    # ``arange([start,] stop[, step,])`` becomes ``arange(stop)``.
+    # ``call([start,] stop[, step,])`` becomes ``call(stop)``.
     required_content: list[str] = []
     bracket_depth = 0
     for character in content:
@@ -990,7 +863,7 @@ def _signature_parameters(
         ]
         if not inspect_required and documented_required:
             # Decorator-generated ``(*args, **kwargs)`` signatures can be less
-            # informative than NumPy's first doc line (notably ``einsum``).
+            # informative than a callable's documented signature.
             parameters = typing.cast(list[inspect.Parameter], documented_parameters)
             used_inspect_signature = False
     except (TypeError, ValueError):
@@ -1014,10 +887,9 @@ def _reflected_signatures(
 ) -> list[SignatureSpec]:
     parameters, documented, resolved_hints, used_inspect_signature = _signature_parameters(callable_object, renderer)
     # ``inspect.signature`` exposes ``self`` for Python functions and many
-    # descriptors, whereas NumPy's C-level doc signatures are already written
-    # as calls on the receiver (for example ``a.sum(axis=...)``).  A successful
-    # signature on the unbound class member includes its receiver regardless of
-    # the author's parameter spelling; a parsed doc signature does not.
+    # descriptors, whereas C-level doc signatures may already be written as
+    # calls on the receiver. A successful signature on the unbound class
+    # member includes its receiver; a parsed doc signature does not.
     if strip_receiver and used_inspect_signature and parameters:
         parameters = parameters[1:]
     reflected: list[ReflectedParameter] = []
@@ -1101,25 +973,17 @@ def _rhs_for_call(prefix: Iterable[Symbol], parameters: Sequence[ReflectedParame
 
 class CfgGenerator:
     def __init__(self, options: GeneratorOptions):
-        if options.max_array_literal_values < 0:
-            raise ValueError("max_array_literal_values must be non-negative")
         self.options = options
         self.profile = LibraryProfile.for_module(
             options.module_name,
             alias=options.module_alias,
-            ground_type_names=options.ground_type_names,
         )
-        if self.profile.extension == "numpy" and not self.profile.ground_type_names:
-            raise ValueError("ground_type_names must contain at least one type")
-        if len(set(self.profile.ground_type_names)) != len(self.profile.ground_type_names):
-            raise ValueError("ground_type_names must not contain duplicate names")
         self.scanner = PythonModuleScanner()
         self.module: types.ModuleType | None = None
         self.renderer: TypeRenderer | None = None
         self.members: list[ExportedMember] = []
         self.parameterized_name_keys: dict[str, str] = {}
         self.type_argument_types: tuple[TypeExpr, ...] = ()
-        self.ground_type_entries: tuple[tuple[str, Any, TypeExpr], ...] = ()
 
     def generate(self) -> GeneratedGrammar:
         module = importlib.import_module(self.options.module_name)
@@ -1130,17 +994,14 @@ class CfgGenerator:
         self.members = self.scanner.exported_members(module)
         self.renderer = TypeRenderer(module, self.members, self.profile)
         renderer = self.renderer
-        self.ground_type_entries = self._build_ground_type_entries()
         self.type_argument_types = self._build_type_argument_types()
         productions: set[Production] = set(self._literal_productions())
-        productions.update(self._library_literal_productions())
 
         callable_members = [member for member in self.members if callable(member.value)]
         class_members = [
             member
             for member in callable_members
             if inspect.isclass(member.value)
-            and self._class_is_in_profile_scope(typing.cast(type, member.value))
         ]
         for member in class_members:
             productions.update(self._constructor_productions(member.name, typing.cast(type, member.value)))
@@ -1157,11 +1018,7 @@ class CfgGenerator:
         for member in callable_members:
             if inspect.isclass(member.value):
                 continue
-            specialized = self._library_callable_productions(member.name, member.value)
-            if specialized is None:
-                productions.update(self._top_level_callable_productions(member.name, member.value))
-            else:
-                productions.update(specialized)
+            productions.update(self._top_level_callable_productions(member.name, member.value))
 
         productions.update(self._supporting_type_productions(productions))
         if not self.options.emit_parameterized_signatures:
@@ -1178,16 +1035,6 @@ class CfgGenerator:
         assert self.renderer is not None
         return self.renderer
 
-    @property
-    def _uses_numpy_extension(self) -> bool:
-        return self.profile.extension == "numpy"
-
-    @property
-    def _array_type_name(self) -> str | None:
-        if self.profile.array_type_name is None:
-            return None
-        return self.profile.render_qualified_name(self.profile.array_type_name)
-
     @staticmethod
     def _dotted_prefix(parts: Sequence[str]) -> tuple[Symbol, ...]:
         result: list[Symbol] = []
@@ -1201,79 +1048,6 @@ class CfgGenerator:
         assert self.module is not None
         return self._dotted_prefix(self.profile.module_access_parts(self.module.__name__, name))
 
-    def _library_root_access_prefix(self, name: str) -> tuple[Symbol, ...]:
-        return self._dotted_prefix(self.profile.root_access_parts(name))
-
-    def _build_ground_type_entries(self) -> tuple[tuple[str, Any, TypeExpr], ...]:
-        if not self._uses_numpy_extension:
-            return ()
-        numpy = importlib.import_module("numpy")
-        entries: list[tuple[str, Any, TypeExpr]] = []
-        scalar_classes: set[type] = set()
-        for name in self.profile.ground_type_names:
-            try:
-                scalar_class = getattr(numpy, name)
-                dtype = numpy.dtype(scalar_class)
-            except (AttributeError, TypeError, ValueError) as error:
-                raise ValueError(f"Unknown NumPy ground dtype: {name}") from error
-            if not inspect.isclass(scalar_class) or dtype.type is not scalar_class:
-                raise ValueError(f"NumPy ground dtype must name a concrete scalar class: {name}")
-            if scalar_class in scalar_classes:
-                raise ValueError(f"NumPy ground dtype aliases an earlier entry: {name}")
-            scalar_classes.add(scalar_class)
-            entries.append((name, dtype, self._type_renderer.render_class(scalar_class)))
-        return tuple(entries)
-
-    @property
-    def _ground_scalar_classes(self) -> frozenset[type]:
-        return frozenset(entry[1].type for entry in self.ground_type_entries)
-
-    def _class_is_in_profile_scope(self, type_class: type) -> bool:
-        """Keep only configured concrete NumPy scalars and their supertypes."""
-
-        if not self._uses_numpy_extension:
-            return True
-        numpy = importlib.import_module("numpy")
-        try:
-            if not issubclass(type_class, numpy.generic):
-                return True
-        except TypeError:
-            return True
-        if type_class in self._ground_scalar_classes:
-            return True
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            try:
-                is_concrete = numpy.dtype(type_class).type is type_class
-            except (TypeError, ValueError):
-                is_concrete = False
-        if is_concrete:
-            return False
-        return any(
-            issubclass(scalar_class, type_class)
-            for scalar_class in self._ground_scalar_classes
-        )
-
-    def _type_expr_is_in_scope(self, type_expr: TypeExpr) -> bool:
-        if not self._uses_numpy_extension:
-            return True
-        for nested in type_expr.walk():
-            if nested.is_variable:
-                continue
-            type_class = self._type_renderer._class_for_name(nested.name)
-            if type_class is not None and not self._class_is_in_profile_scope(type_class):
-                return False
-        return True
-
-    def _uses_strict_numpy_ufunc_operators(self, type_class: type) -> bool:
-        if not self._uses_numpy_extension:
-            return False
-        numpy = importlib.import_module("numpy")
-        try:
-            return issubclass(type_class, (numpy.generic, numpy.ndarray))
-        except TypeError:
-            return False
-
     def _build_type_argument_types(self) -> tuple[TypeExpr, ...]:
         preferred: list[TypeExpr] = [
             TypeExpr.applied("int"),
@@ -1286,20 +1060,11 @@ class CfgGenerator:
             TypeExpr.applied("tuple"),
             OBJECT_TYPE,
         ]
-        if self._uses_numpy_extension:
-            numpy = importlib.import_module("numpy")
-            for name in (*self.profile.ground_type_names, "generic", "ndarray", "dtype"):
-                value = getattr(numpy, name, None)
-                if inspect.isclass(value):
-                    candidate = self._type_renderer.render_class(value)
-                    if candidate not in preferred:
-                        preferred.append(candidate)
-        else:
-            for member in self.members:
-                if inspect.isclass(member.value):
-                    candidate = self._type_renderer.render_class(typing.cast(type, member.value))
-                    if candidate not in preferred:
-                        preferred.append(candidate)
+        for member in self.members:
+            if inspect.isclass(member.value):
+                candidate = self._type_renderer.render_class(typing.cast(type, member.value))
+                if candidate not in preferred:
+                    preferred.append(candidate)
         return tuple(preferred[: self.options.max_type_arguments_per_variable])
 
     def _literal_productions(self) -> list[Production]:
@@ -1331,52 +1096,10 @@ class CfgGenerator:
             ),
         ]
 
-    def _library_literal_productions(self) -> list[Production]:
-        """Return literal helpers supplied by the active library extension."""
-
-        if not self._uses_numpy_extension:
-            return []
-        productions: list[Production] = []
-        categories: set[str] = set()
-        for _name, dtype, _type_expr in self.ground_type_entries:
-            category = _NUMPY_KIND_LITERAL_CATEGORY.get(dtype.kind)
-            if category is not None:
-                categories.add(category)
-        for category in sorted(categories):
-            terminals = _NUMPY_LITERAL_TERMINALS[category]
-            literal_type = TypeExpr.applied(f"__NP_LITERAL_{category}")
-            list_type = TypeExpr.applied(f"__NP_LITERAL_LIST_{category}")
-            productions.extend(Production(literal_type, (Token(value),)) for value in terminals)
-            for length in range(self.options.max_array_literal_values + 1):
-                symbols: list[Symbol] = [Token("[")]
-                for index in range(length):
-                    if index:
-                        symbols.append(Token(","))
-                    symbols.append(TypeSymbol(literal_type))
-                symbols.append(Token("]"))
-                productions.append(Production(list_type, symbols))
-        for operand_count in range(1, max(self.options.max_vararg_arity, 1) + 1):
-            subscripts = ",".join("i" for _ in range(operand_count))
-            productions.append(
-                Production(
-                    TypeExpr.applied(f"__NP_EINSUM_SUBSCRIPT_{operand_count}"),
-                    (Token(f'"{subscripts}"'),),
-                )
-            )
-        return productions
-
     def _constructor_productions(self, token_name: str, type_class: type) -> list[Production]:
         result_type = self._type_renderer.render_class(type_class)
-        if not self._class_is_in_profile_scope(type_class):
-            return []
         if inspect.isabstract(type_class):
             return []
-        if self._uses_numpy_extension and token_name in {"flatiter", "ufunc"}:
-            # These public type objects explicitly reject direct construction.
-            return []
-        numpy_scalar = self._numpy_scalar_constructor_productions(token_name, type_class, result_type)
-        if numpy_scalar is not None:
-            return numpy_scalar
         signatures = _reflected_signatures(
             type_class,
             self._type_renderer,
@@ -1389,221 +1112,17 @@ class CfgGenerator:
             rhs_builder=lambda parameters: _rhs_for_call(self._module_access_prefix(token_name), parameters),
         )
 
-    def _numpy_scalar_constructor_productions(
-        self,
-        token_name: str,
-        type_class: type,
-        result_type: TypeExpr,
-    ) -> list[Production] | None:
-        """Return conservative constructors for concrete NumPy scalar classes.
-
-        NumPy's scalar classes generally do not expose inspectable signatures;
-        the generic fallback consequently used to give every scalar zero to
-        three arbitrary arguments.  A concrete dtype plus a small literal
-        domain is both more useful and faithful to the runtime API.
-        """
-
-        if not self._uses_numpy_extension:
-            return None
-        numpy = importlib.import_module("numpy")
-        try:
-            if not issubclass(type_class, numpy.generic):
-                return None
-        except TypeError:
-            return None
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            try:
-                dtype = numpy.dtype(type_class)
-            except (TypeError, ValueError):
-                return []
-        # ``np.integer``, ``np.floating`` and friends coerce to a default
-        # concrete dtype, but the classes themselves cannot be instantiated.
-        if dtype.type is not type_class:
-            return []
-        configured_name = next(
-            (
-                name
-                for name, configured_dtype, _type_expr in self.ground_type_entries
-                if configured_dtype.type is type_class
-            ),
-            None,
-        )
-        if configured_name is None or token_name != configured_name:
-            return []
-
-        category = _NUMPY_KIND_LITERAL_CATEGORY.get(dtype.kind)
-        if category is None:
-            return []
-        prefix = self._module_access_prefix(token_name)
-        literal_type = TypeExpr.applied(f"__NP_LITERAL_{category}")
-        if dtype.kind == "O":
-            # np.object_(x) deliberately unwraps to the ordinary Python value.
-            return [
-                Production(
-                    TypeExpr.applied("int"),
-                    _rhs_for_call(prefix, (ReflectedParameter("value", literal_type),)),
-                )
-            ]
-        parameters = [ReflectedParameter("value", literal_type)]
-        if dtype.kind in {"M", "m"}:
-            parameters.append(ReflectedParameter("unit", TypeExpr.applied("__NP_DAY_UNIT")))
-        productions = self._emit_signatures(
-            [SignatureSpec(tuple(parameters), result_type)],
-            scope=f"numpy-scalar-constructor|{token_name}|{result_type.render()}",
-            rhs_builder=lambda reflected: _rhs_for_call(prefix, reflected),
-        )
-        if dtype.kind in {"M", "m"}:
-            productions.append(Production(TypeExpr.applied("__NP_DAY_UNIT"), (Token('"D"'),)))
-        return productions
-
     def _top_level_callable_productions(self, name: str, value: object) -> list[Production]:
-        if self._uses_numpy_extension:
-            numpy_override = self._numpy_internal_function_productions(name)
-            if numpy_override is not None:
-                return numpy_override
-        signature_value = value
-        if self._uses_numpy_extension:
-            signature_aliases = {
-                "alltrue": "all",
-                "cumproduct": "cumprod",
-                "product": "prod",
-                "sometrue": "any",
-            }
-            aliased_name = signature_aliases.get(name)
-            if aliased_name is not None:
-                signature_value = getattr(importlib.import_module("numpy"), aliased_name)
-        minimum_varargs = 1 if self._uses_numpy_extension and name in {
-            "einsum",
-            "einsum_path",
-            "result_type",
-        } else 0
         signatures = _reflected_signatures(
-            signature_value,
+            value,
             self._type_renderer,
             self.options.max_vararg_arity,
-            min_vararg_arity=minimum_varargs,
         )
-        if name in {"einsum", "einsum_path"}:
-            arity_specific_signatures: list[SignatureSpec] = []
-            for signature in signatures:
-                operand_count = sum(parameter.name != "subscripts" for parameter in signature.parameters)
-                subscript_type = TypeExpr.applied(f"__NP_EINSUM_SUBSCRIPT_{operand_count}")
-                arity_specific_signatures.append(
-                    SignatureSpec(
-                        tuple(
-                            ReflectedParameter(parameter.name, subscript_type, parameter.kind)
-                            if parameter.name == "subscripts"
-                            else parameter
-                            for parameter in signature.parameters
-                        ),
-                        signature.return_type,
-                        signature.domains,
-                        signature.bounds,
-                        signature.variable_labels,
-                    )
-                )
-            signatures = arity_specific_signatures
         return self._emit_signatures(
             signatures,
             scope=f"function|{self.options.module_name}|{name}",
             rhs_builder=lambda parameters: _rhs_for_call(self._module_access_prefix(name), parameters),
         )
-
-    def _numpy_internal_function_productions(self, name: str) -> list[Production] | None:
-        overrides: Mapping[str, tuple[TypeExpr, tuple[Symbol, ...]]] = {
-            "_get_promotion_state": (
-                TypeExpr.applied("str"),
-                _rhs_for_call(self._module_access_prefix(name), ()),
-            ),
-            "_using_numpy2_behavior": (
-                TypeExpr.applied("bool"),
-                _rhs_for_call(self._module_access_prefix(name), ()),
-            ),
-            "_set_promotion_state": (
-                NONE_TYPE,
-                (
-                    *self._module_access_prefix(name),
-                    Token("("),
-                    Token('"weak"'),
-                    Token(")"),
-                ),
-            ),
-        }
-        override = overrides.get(name)
-        if override is None:
-            return None
-        return [Production(*override)]
-
-    @staticmethod
-    def _has_usable_signature(value: object) -> bool:
-        try:
-            inspect.signature(typing.cast(typing.Callable[..., Any], value), follow_wrapped=True)
-            return True
-        except (TypeError, ValueError):
-            return _balanced_doc_signature(inspect.getdoc(value)) is not None
-
-    def _numpy_member_signature_override(
-        self,
-        name: str,
-        reflected_member: object,
-        receiver_type: TypeExpr,
-        forced_return: TypeExpr | None,
-        *,
-        strip_receiver: bool,
-    ) -> list[SignatureSpec] | None:
-        if not self._uses_numpy_extension or self._has_usable_signature(reflected_member):
-            return None
-        numpy = importlib.import_module("numpy")
-        ndarray_member = getattr(numpy.ndarray, name, None)
-        if strip_receiver and callable(ndarray_member) and self._has_usable_signature(ndarray_member):
-            return _reflected_signatures(
-                ndarray_member,
-                self._type_renderer,
-                self.options.max_vararg_arity,
-                strip_receiver=True,
-                fallback_return_type=forced_return,
-            )
-
-        parameter_types: Mapping[str, tuple[TypeExpr, ...]] = {
-            "__array_function__": (OBJECT_TYPE, TypeExpr.applied("tuple"), TypeExpr.applied("tuple"), TypeExpr.applied("dict")),
-            "__array_ufunc__": (OBJECT_TYPE, TypeExpr.applied("str"), TypeExpr.applied("tuple"), TypeExpr.applied("dict")),
-            "__complex__": (),
-            "__enter__": (),
-            "__exit__": (OBJECT_TYPE, OBJECT_TYPE, OBJECT_TYPE),
-            "__format__": (TypeExpr.applied("str"),),
-            "__getnewargs__": (),
-            "__init_subclass__": (),
-            "__reduce_ex__": (TypeExpr.applied("int"),),
-            "__round__": (),
-            "__sizeof__": (),
-            "bit_count": (),
-            "dot": (receiver_type,),
-            "hex": (),
-        }
-        types_for_parameters = parameter_types.get(name)
-        if types_for_parameters is None:
-            return None
-        known_returns: Mapping[str, TypeExpr] = {
-            "__enter__": receiver_type,
-            "__format__": TypeExpr.applied("str"),
-            "__getnewargs__": TypeExpr.applied("tuple"),
-            "__init_subclass__": NONE_TYPE,
-            "__reduce_ex__": TypeExpr.applied("tuple"),
-            "__sizeof__": TypeExpr.applied("int"),
-            "bit_count": TypeExpr.applied("int"),
-            "dot": receiver_type,
-            "hex": TypeExpr.applied("str"),
-        }
-        if forced_return is not None:
-            return_type = forced_return
-        else:
-            return_type = known_returns.get(name, OBJECT_TYPE)
-        parameters = tuple(
-            ReflectedParameter(f"arg{index + 1}", parameter_type, inspect.Parameter.POSITIONAL_ONLY)
-            for index, parameter_type in enumerate(types_for_parameters)
-        )
-        return [SignatureSpec(parameters, return_type)]
 
     def _member_productions(self, type_class: type, owner_token: str) -> list[Production]:
         receiver_type = self._type_renderer.render_class(type_class)
@@ -1614,14 +1133,6 @@ class CfgGenerator:
             return result
         for name in names:
             if name in {"__init__", "__new__", "__class__"}:
-                continue
-            if (
-                name in _NUMPY_UFUNC_BACKED_DUNDERS
-                and self._uses_strict_numpy_ufunc_operators(type_class)
-            ):
-                # Direct ufunc schemas emit both call and operator spellings.
-                # Reflecting these dunders as ``object``-typed methods would
-                # reintroduce mixed operands and NumPy promotion paths.
                 continue
             is_dunder = name.startswith("__") and name.endswith("__")
             if name.startswith("_") and not is_dunder:
@@ -1637,13 +1148,7 @@ class CfgGenerator:
                 is_class = isinstance(raw_member, (classmethod, types.ClassMethodDescriptorType))
                 strip_receiver = not (is_static or is_class)
                 forced_return = self._special_method_return_type(name, receiver_type)
-                signatures = self._numpy_member_signature_override(
-                    name,
-                    reflected_member,
-                    receiver_type,
-                    forced_return,
-                    strip_receiver=strip_receiver,
-                ) or _reflected_signatures(
+                signatures = _reflected_signatures(
                     reflected_member,
                     self._type_renderer,
                     self.options.max_vararg_arity,
@@ -1719,11 +1224,6 @@ class CfgGenerator:
 
     def _special_method_return_type(self, name: str, receiver_type: TypeExpr) -> TypeExpr | None:
         if name in {"__lt__", "__le__", "__eq__", "__ne__", "__gt__", "__ge__"}:
-            if receiver_type.name.endswith(".ndarray"):
-                bool_type = self._type_renderer._named_export_type("bool_") or TypeExpr.applied("bool")
-                return TypeExpr.applied(receiver_type.name, bool_type)
-            if self.profile.import_qualified_name(receiver_type.name).startswith("numpy."):
-                return self._type_renderer._named_export_type("bool_") or TypeExpr.applied("bool")
             return TypeExpr.applied("bool")
         if name in {"__contains__", "__bool__"}:
             return TypeExpr.applied("bool")
@@ -1741,8 +1241,6 @@ class CfgGenerator:
             return TypeExpr.applied("bytes")
         if name in {"__setitem__", "__delitem__"}:
             return NONE_TYPE
-        if name == "at" and receiver_type.name.endswith(".ufunc"):
-            return NONE_TYPE
         if name in _INPLACE_OPERATOR_TOKENS:
             return receiver_type
         return None
@@ -1757,7 +1255,8 @@ class CfgGenerator:
             # Assignment/delete forms are statements, not values. Keep them in
             # a root-only nonterminal and first bind the reflected receiver to
             # a legal target; this preserves every operator without allowing
-            # ``np.array(...) += x`` to nest inside another expression.
+            # constructor calls such as ``Vector(...) += x`` to nest inside
+            # another expression.
             statement_signatures = [
                 SignatureSpec(
                     signature.parameters,
@@ -1891,11 +1390,6 @@ class CfgGenerator:
             builtin = name[2:-2]
             return _rhs_for_call((Token(builtin),), (ReflectedParameter("value", receiver_type),))
         if name in {"__floor__", "__ceil__", "__trunc__"}:
-            if self._uses_numpy_extension:
-                # NumPy already exposes these names as ufuncs with dtype-aware
-                # return types.  Re-spelling a scalar protocol method as that
-                # top-level ufunc creates a conflicting ``int`` production.
-                return None
             builtin = name[2:-2]
             prefix = (Token("math"), Token("."), Token(builtin))
             return _rhs_for_call(
@@ -1918,427 +1412,6 @@ class CfgGenerator:
                     result.append(Production(supertype, (TypeSymbol(subtype),)))
         return result
 
-    def _is_numpy_ufunc(self, value: object) -> bool:
-        if self.module is None or not self._uses_numpy_extension:
-            return False
-        try:
-            numpy = importlib.import_module("numpy")
-            return isinstance(value, numpy.ufunc)
-        except (ImportError, AttributeError):
-            return False
-
-    def _library_callable_productions(self, name: str, value: object) -> list[Production] | None:
-        """Dispatch a callable to an optional library-specific typing oracle."""
-
-        if not self._is_numpy_ufunc(value):
-            return None
-        result = self._ufunc_productions(name, value)
-        if result:
-            result.extend(self._ufunc_member_productions(name, value))
-        return result
-
-    def _ufunc_productions(self, name: str, ufunc: object) -> list[Production]:
-        numpy = importlib.import_module("numpy")
-        include_scalar_signatures = getattr(ufunc, "signature", None) is None
-        if callable(getattr(ufunc, "resolve_dtypes", None)):
-            loops = self._resolved_ufunc_loops(numpy, ufunc)
-        else:
-            loops = self._raw_ufunc_loops(numpy, ufunc)
-        specs = self._ufunc_schema_specs(
-            loops,
-            include_scalar=include_scalar_signatures,
-        )
-        if not specs:
-            # A ufunc with no exact loop in the configured ground universe is
-            # outside this grammar.  An ``object`` fallback would silently
-            # reintroduce precisely the implicit conversions excluded here.
-            return []
-
-        result = self._emit_signatures(
-            specs,
-            scope=f"ufunc|{self.options.module_name}|{name}",
-            rhs_builder=lambda parameters: _rhs_for_call(self._module_access_prefix(name), parameters),
-        )
-        operator_token = _UFUNC_OPERATOR_TOKENS.get(name)
-        if operator_token is not None:
-            def operator_rhs(parameters: Sequence[ReflectedParameter]) -> tuple[Symbol, ...]:
-                if name in _UNARY_UFUNC_OPERATORS and parameters:
-                    if operator_token == "abs":
-                        return _rhs_for_call((Token("abs"),), (parameters[0],))
-                    return (Token(operator_token), TypeSymbol(parameters[0].type))
-                if operator_token == "divmod" and len(parameters) >= 2:
-                    return _rhs_for_call((Token("divmod"),), parameters[:2])
-                if len(parameters) >= 2:
-                    return (
-                        TypeSymbol(parameters[0].type),
-                        Token(operator_token),
-                        TypeSymbol(parameters[1].type),
-                    )
-                return _rhs_for_call(self._module_access_prefix(name), parameters)
-
-            result.extend(
-                self._emit_signatures(
-                    specs,
-                    scope=f"ufunc-operator|{self.options.module_name}|{name}",
-                    rhs_builder=operator_rhs,
-                )
-            )
-        inplace_token = _UFUNC_INPLACE_TOKENS.get(name)
-        if inplace_token is not None:
-            inplace_specs = [
-                SignatureSpec(
-                    signature.parameters,
-                    STATEMENT_TYPE,
-                    signature.domains,
-                    signature.bounds,
-                    signature.variable_labels,
-                )
-                for signature in specs
-                if len(signature.parameters) == 2
-                and signature.return_type == signature.parameters[0].type
-            ]
-
-            def inplace_rhs(parameters: Sequence[ReflectedParameter]) -> tuple[Symbol, ...]:
-                return (
-                    Token("_value"),
-                    Token("="),
-                    TypeSymbol(parameters[0].type),
-                    Token(";"),
-                    Token("_value"),
-                    Token(inplace_token),
-                    TypeSymbol(parameters[1].type),
-                )
-
-            result.extend(
-                self._emit_signatures(
-                    inplace_specs,
-                    scope=f"ufunc-inplace|{self.options.module_name}|{name}",
-                    rhs_builder=inplace_rhs,
-                )
-            )
-        return result
-
-    def _ufunc_member_productions(self, name: str, ufunc: object) -> list[Production]:
-        """Emit only bound operations derivable from the strict dtype rows.
-
-        ``at`` and the reduction methods have additional accumulator/casting
-        rules, so reflecting their untyped compiled signatures would bypass
-        the no-promotion policy.  Binary non-gufunc ``outer`` has the same
-        elementwise dtype relation as its parent ufunc and is safe to retain.
-        """
-
-        if int(getattr(ufunc, "nin", 0)) != 2 or getattr(ufunc, "signature", None) is not None:
-            return []
-        numpy = importlib.import_module("numpy")
-        if callable(getattr(ufunc, "resolve_dtypes", None)):
-            loops = self._resolved_ufunc_loops(numpy, ufunc)
-        else:
-            loops = self._raw_ufunc_loops(numpy, ufunc)
-        signatures = self._ufunc_schema_specs(loops, include_scalar=False)
-        prefix = (*self._module_access_prefix(name), Token("."), Token("outer"))
-        return self._emit_signatures(
-            signatures,
-            scope=f"ufunc-member|{self.options.module_name}|{name}|outer",
-            rhs_builder=lambda parameters: _rhs_for_call(prefix, parameters),
-        )
-
-    def _resolved_ufunc_loops(
-        self,
-        numpy: types.ModuleType,
-        ufunc: object,
-    ) -> list[tuple[tuple[TypeExpr, ...], tuple[TypeExpr, ...]]]:
-        resolve_dtypes = getattr(ufunc, "resolve_dtypes", None)
-        input_count = int(getattr(ufunc, "nin", 0))
-        output_count = int(getattr(ufunc, "nout", 0))
-        if not callable(resolve_dtypes) or input_count <= 0:
-            return []
-        candidate_dtypes = tuple(entry[1] for entry in self.ground_type_entries)
-        allowed_scalar_classes = self._ground_scalar_classes
-
-        result: list[tuple[tuple[TypeExpr, ...], tuple[TypeExpr, ...]]] = []
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            for requested_inputs in itertools.product(candidate_dtypes, repeat=input_count):
-                requested = (*requested_inputs, *(None for _ in range(output_count)))
-                try:
-                    resolved = resolve_dtypes(requested, casting="no")
-                except TypeError as error:
-                    # Older NumPy releases lack the keyword.  Equality of the
-                    # resolved input slots below still rejects every cast.
-                    message = str(error).lower()
-                    if "casting" not in message or "keyword" not in message:
-                        continue
-                    try:
-                        resolved = resolve_dtypes(requested)
-                    except (TypeError, ValueError):
-                        continue
-                except ValueError:
-                    continue
-                if len(resolved) != input_count + output_count:
-                    continue
-                resolved_inputs = tuple(resolved[:input_count])
-                output_dtypes = tuple(resolved[input_count:])
-                if any(actual != requested for actual, requested in zip(resolved_inputs, requested_inputs)):
-                    continue
-                if any(dtype.type not in allowed_scalar_classes for dtype in (*resolved_inputs, *output_dtypes)):
-                    continue
-                inputs = tuple(self._type_renderer.render_class(dtype.type) for dtype in resolved_inputs)
-                outputs = tuple(self._type_renderer.render_class(dtype.type) for dtype in output_dtypes)
-                result.append((inputs, outputs))
-        return sorted(
-            set(result),
-            key=lambda loop: (
-                tuple(type_expr.render() for type_expr in loop[0]),
-                tuple(type_expr.render() for type_expr in loop[1]),
-            ),
-        )
-
-    def _raw_ufunc_loops(
-        self,
-        numpy: types.ModuleType,
-        ufunc: object,
-    ) -> list[tuple[tuple[TypeExpr, ...], tuple[TypeExpr, ...]]]:
-        """Compatibility fallback for ufuncs without ``resolve_dtypes``."""
-
-        allowed_scalar_classes = self._ground_scalar_classes
-        result: set[tuple[tuple[TypeExpr, ...], tuple[TypeExpr, ...]]] = set()
-        for loop in getattr(ufunc, "types", ()):
-            try:
-                inputs_text, outputs_text = loop.split("->", 1)
-                input_dtypes = tuple(numpy.dtype(code) for code in inputs_text)
-                output_dtypes = tuple(numpy.dtype(code) for code in outputs_text)
-            except (AttributeError, TypeError, ValueError, KeyError):
-                continue
-            if any(dtype.type not in allowed_scalar_classes for dtype in (*input_dtypes, *output_dtypes)):
-                continue
-            result.add(
-                (
-                    tuple(self._type_renderer.render_class(dtype.type) for dtype in input_dtypes),
-                    tuple(self._type_renderer.render_class(dtype.type) for dtype in output_dtypes),
-                )
-            )
-        return sorted(
-            result,
-            key=lambda row: (
-                tuple(type_expr.render() for type_expr in row[0]),
-                tuple(type_expr.render() for type_expr in row[1]),
-            ),
-        )
-
-    def _ufunc_schema_specs(
-        self,
-        loops: Sequence[tuple[tuple[TypeExpr, ...], tuple[TypeExpr, ...]]],
-        *,
-        include_scalar: bool,
-    ) -> list[SignatureSpec]:
-        """Factor exact concrete ufunc rows into safe equality schemas.
-
-        A variable is shared only when the corresponding dtype positions are
-        equal in every represented row.  A multi-variable schema is emitted
-        only if its observed assignments form a complete Cartesian product;
-        otherwise it is split into exact singleton schemas.  Consequently,
-        expanding the returned specs cannot invent a dtype combination.
-        """
-
-        if not loops:
-            return []
-        input_count = len(loops[0][0])
-        output_count = len(loops[0][1])
-        loops = tuple(
-            row
-            for row in loops
-            if len(row[0]) == input_count and len(row[1]) == output_count
-        )
-        if not loops:
-            return []
-
-        def constant_at(values: Sequence[TypeExpr]) -> TypeExpr | None:
-            first = values[0]
-            return first if all(value == first for value in values[1:]) else None
-
-        input_constants = tuple(
-            constant_at(tuple(inputs[index] for inputs, _outputs in loops))
-            for index in range(input_count)
-        )
-        output_constants = tuple(
-            constant_at(tuple(outputs[index] for _inputs, outputs in loops))
-            for index in range(output_count)
-        )
-
-        Marker = tuple[str, TypeExpr | int]
-        grouped: dict[tuple[Marker, ...], set[tuple[TypeExpr, ...]]] = {}
-        for inputs, outputs in loops:
-            value_to_variable: dict[TypeExpr, int] = {}
-            assignments: list[TypeExpr] = []
-            markers: list[Marker] = []
-            for index, value in enumerate(inputs):
-                constant = input_constants[index]
-                if constant is not None:
-                    markers.append(("constant", constant))
-                    continue
-                variable_index = value_to_variable.get(value)
-                if variable_index is None:
-                    variable_index = len(assignments)
-                    value_to_variable[value] = variable_index
-                    assignments.append(value)
-                markers.append(("variable", variable_index))
-            for index, value in enumerate(outputs):
-                constant = output_constants[index]
-                if constant is not None:
-                    markers.append(("constant", constant))
-                    continue
-                variable_index = value_to_variable.get(value)
-                if variable_index is None:
-                    markers.append(("constant", value))
-                else:
-                    markers.append(("variable", variable_index))
-            grouped.setdefault(tuple(markers), set()).add(tuple(assignments))
-
-        ground_order = {
-            type_expr: index
-            for index, (_name, _dtype, type_expr) in enumerate(self.ground_type_entries)
-        }
-
-        def ordered(values: Iterable[TypeExpr]) -> tuple[TypeExpr, ...]:
-            return tuple(
-                sorted(
-                    set(values),
-                    key=lambda value: (ground_order.get(value, len(ground_order)), value.render()),
-                )
-            )
-
-        variable_names = ("T", "U", "V", "W", "X", "Y", "Z")
-        result: list[SignatureSpec] = []
-        for schema_markers, observed_assignments in grouped.items():
-            variable_count = max(
-                (
-                    typing.cast(int, marker_value) + 1
-                    for marker_kind, marker_value in schema_markers
-                    if marker_kind == "variable"
-                ),
-                default=0,
-            )
-            readable_labels: list[str] = []
-            for variable_index in range(variable_count):
-                input_positions = [
-                    index
-                    for index, marker in enumerate(schema_markers[:input_count])
-                    if marker == ("variable", variable_index)
-                ]
-                output_positions = [
-                    index
-                    for index, marker in enumerate(schema_markers[input_count:])
-                    if marker == ("variable", variable_index)
-                ]
-                if len(input_positions) == input_count and output_positions:
-                    label = "DType"
-                elif len(input_positions) > 1 and not output_positions:
-                    label = "OperandDType"
-                elif input_positions and output_positions:
-                    label = "ResultDType"
-                elif input_positions:
-                    label = f"Input{input_positions[0] + 1}DType"
-                else:
-                    label = f"Output{output_positions[0] + 1}DType"
-                if label in readable_labels:
-                    label = f"{label}{variable_index + 1}"
-                readable_labels.append(label)
-            domains = tuple(
-                ordered(assignment[index] for assignment in observed_assignments)
-                for index in range(variable_count)
-            )
-            rectangular = set(itertools.product(*domains)) == observed_assignments
-            assignment_groups: tuple[set[tuple[TypeExpr, ...]], ...]
-            if rectangular:
-                assignment_groups = (observed_assignments,)
-            else:
-                assignment_groups = tuple({assignment} for assignment in sorted(
-                    observed_assignments,
-                    key=lambda assignment: tuple(value.render() for value in assignment),
-                ))
-
-            for assignment_group in assignment_groups:
-                group_domains = tuple(
-                    ordered(assignment[index] for assignment in assignment_group)
-                    for index in range(variable_count)
-                )
-                variables = tuple(
-                    TypeExpr.variable(
-                        variable_names[index] if index < len(variable_names) else f"T{index + 1}"
-                    )
-                    for index in range(variable_count)
-                )
-
-                def marker_type(marker: Marker) -> TypeExpr:
-                    marker_kind, marker_value = marker
-                    if marker_kind == "constant":
-                        return typing.cast(TypeExpr, marker_value)
-                    return variables[typing.cast(int, marker_value)]
-
-                input_types = tuple(marker_type(marker) for marker in schema_markers[:input_count])
-                output_types = tuple(marker_type(marker) for marker in schema_markers[input_count:])
-                schema_domains = {
-                    variable.name: group_domains[index]
-                    for index, variable in enumerate(variables)
-                }
-                variable_labels = {
-                    variable.name: readable_labels[index]
-                    for index, variable in enumerate(variables)
-                }
-                result.extend(
-                    self._ufunc_signature_specs(
-                        input_types,
-                        output_types,
-                        schema_domains,
-                        variable_labels,
-                        include_scalar=include_scalar,
-                    )
-                )
-        return result
-
-    def _ufunc_signature_specs(
-        self,
-        input_dtypes: tuple[TypeExpr, ...],
-        output_dtypes: tuple[TypeExpr, ...],
-        domains: Mapping[str, tuple[TypeExpr, ...]],
-        variable_labels: Mapping[str, str],
-        *,
-        include_scalar: bool,
-    ) -> list[SignatureSpec]:
-        def returned(outputs: tuple[TypeExpr, ...]) -> TypeExpr:
-            return outputs[0] if len(outputs) == 1 else TypeExpr.applied("tuple", *outputs)
-
-        scalar_parameters = tuple(
-            ReflectedParameter(f"x{index + 1}", input_type, inspect.Parameter.POSITIONAL_ONLY)
-            for index, input_type in enumerate(input_dtypes)
-        )
-        assert self._array_type_name is not None
-        array_inputs = tuple(TypeExpr.applied(self._array_type_name, dtype) for dtype in input_dtypes)
-        array_outputs = tuple(TypeExpr.applied(self._array_type_name, dtype) for dtype in output_dtypes)
-        array_parameters = tuple(
-            ReflectedParameter(f"x{index + 1}", input_type, inspect.Parameter.POSITIONAL_ONLY)
-            for index, input_type in enumerate(array_inputs)
-        )
-        result = [
-            SignatureSpec(
-                array_parameters,
-                returned(array_outputs),
-                domains,
-                variable_labels=variable_labels,
-            )
-        ]
-        if include_scalar:
-            result.insert(
-                0,
-                SignatureSpec(
-                    scalar_parameters,
-                    returned(output_dtypes),
-                    domains,
-                    variable_labels=variable_labels,
-                ),
-            )
-        return result
-
     def _emit_signatures(
         self,
         signatures: Iterable[SignatureSpec],
@@ -2350,10 +1423,6 @@ class CfgGenerator:
         for signature_index, signature in enumerate(signatures):
             signature_scope = f"{scope}|overload={signature_index}|{self._signature_key(signature)}"
             signature_types = [signature.return_type, *(parameter.type for parameter in signature.parameters)]
-            if any(not self._type_expr_is_in_scope(type_expr) for type_expr in signature_types):
-                continue
-            if any(not self._type_expr_is_in_scope(bound) for bound in signature.bounds.values()):
-                continue
             variables = sorted(
                 set(signature.return_type.variables()).union(
                     *(parameter.type.variables() for parameter in signature.parameters)
@@ -2373,7 +1442,6 @@ class CfgGenerator:
                         candidate
                         for candidate in signature.domains.get(variable, self.type_argument_types)
                         if candidate.depth() <= max_depths.get(variable, self.options.monomorphization_depth)
-                        and self._type_expr_is_in_scope(candidate)
                         and (
                             variable not in signature.bounds
                             or self._type_renderer.is_subtype(candidate, signature.bounds[variable])
@@ -2490,32 +1558,6 @@ class CfgGenerator:
             hash_length += 1
         raise RuntimeError(f"Unable to assign collision-free parameterized symbol for {key}")
 
-    def _numpy_dtype_literal_details(self, dtype_type: TypeExpr) -> tuple[str, tuple[Symbol, ...]] | None:
-        if not self._uses_numpy_extension or dtype_type.is_variable:
-            return None
-        type_class = self._type_renderer._class_for_name(dtype_type.name)
-        if type_class is None:
-            return None
-        numpy = importlib.import_module("numpy")
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            try:
-                dtype = numpy.dtype(type_class)
-            except (TypeError, ValueError):
-                return None
-        if dtype.type is not type_class or type_class not in self._ground_scalar_classes:
-            return None
-        category = _NUMPY_KIND_LITERAL_CATEGORY.get(dtype.kind)
-        if category is None:
-            return None
-        dtype_name = next(
-            name
-            for name, configured_dtype, _type_expr in self.ground_type_entries
-            if configured_dtype.type is type_class
-        )
-        dtype_symbols: tuple[Symbol, ...] = self._library_root_access_prefix(dtype_name)
-        return category, dtype_symbols
-
     def _supporting_type_productions(self, productions: Iterable[Production]) -> set[Production]:
         result: set[Production] = set()
         all_types = {type_expr for production in productions for type_expr in production.types()}
@@ -2546,58 +1588,6 @@ class CfgGenerator:
                             tuple_symbols.append(Token(","))
                         tuple_symbols.append(Token(")"))
                         result.add(Production(nested, tuple_symbols))
-                elif nested.name == self._array_type_name and not nested.arguments:
-                    preferred_names = ("float64", "float32", "int64", "int32", "complex128", "complex64", "bool_")
-                    seed_entry = next(
-                        (
-                            entry
-                            for preferred_name in preferred_names
-                            for entry in self.ground_type_entries
-                            if entry[0] == preferred_name
-                        ),
-                        self.ground_type_entries[0],
-                    )
-                    seed_name, seed_dtype, _seed_type = seed_entry
-                    seed_category = _NUMPY_KIND_LITERAL_CATEGORY.get(seed_dtype.kind)
-                    if seed_category is None:
-                        continue
-                    result.add(
-                        Production(
-                            nested,
-                            (
-                                *self._library_root_access_prefix("array"),
-                                Token("("),
-                                TypeSymbol(TypeExpr.applied(f"__NP_LITERAL_LIST_{seed_category}")),
-                                Token(","),
-                                Token("dtype"),
-                                Token("="),
-                                *self._library_root_access_prefix(seed_name),
-                                Token(")"),
-                            ),
-                        )
-                    )
-                elif nested.name == self._array_type_name and len(nested.arguments) == 1:
-                    literal_details = self._numpy_dtype_literal_details(nested.arguments[0])
-                    if literal_details is None:
-                        continue
-                    category, dtype_symbols = literal_details
-                    list_type = TypeExpr.applied(f"__NP_LITERAL_LIST_{category}")
-                    array_rhs: list[Symbol] = [
-                        *self._library_root_access_prefix("array"),
-                        Token("("),
-                        TypeSymbol(list_type),
-                        Token(","),
-                        Token("dtype"),
-                        Token("="),
-                        *dtype_symbols,
-                        Token(")"),
-                    ]
-                    result.add(
-                        Production(
-                            nested,
-                            array_rhs,
-                        )
-                    )
         return result
 
     @staticmethod
