@@ -971,7 +971,7 @@ def _rhs_for_call(prefix: Iterable[Symbol], parameters: Sequence[ReflectedParame
     return tuple(symbols)
 
 
-class CfgGenerator:
+class CFGGenerator:
     def __init__(self, options: GeneratorOptions):
         self.options = options
         self.profile = LibraryProfile.for_module(
@@ -1769,7 +1769,7 @@ def run(command_line: CommandLineArguments) -> tuple[GeneratedGrammar, Path]:
         command_line.emit_parameterized_signatures,
     )
     output_file.parent.mkdir(parents=True, exist_ok=True)
-    grammar = CfgGenerator(options).generate()
+    grammar = CFGGenerator(options).generate()
     output_file.write_text(f"{grammar.text}\n", encoding="utf-8")
     print(
         f"Wrote |P|={grammar.production_count}, |V|={grammar.nonterminal_count}, "

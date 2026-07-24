@@ -3,7 +3,7 @@ plugins {
   application
 }
 
-group = "org.lib2cfg"
+group = "org.api2cfg"
 version = "1.0-SNAPSHOT"
 
 repositories {
@@ -20,17 +20,15 @@ kotlin {
   jvmToolchain(21)
 }
 
-tasks.test {
-  useJUnitPlatform()
-}
+tasks.test { useJUnitPlatform() }
 
 application {
-  mainClass.set("org.lib2cfg.MainKt")
+  mainClass.set("org.api2cfg.MainKt")
 }
 
 tasks.register<JavaExec>("runClassGraph") {
   group = "application"
   description = "Generate a grammar with the ClassGraph-backed implementation"
   classpath = sourceSets["main"].runtimeClasspath
-  mainClass.set("org.lib2cfg.ClassGraphKt")
+  mainClass.set("org.api2cfg.ClassGraphKt")
 }

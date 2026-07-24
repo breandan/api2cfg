@@ -1159,7 +1159,7 @@ class ParsedSignature:
     return_type: cfg.TypeExpr
 
 
-class PyiCfgGenerator:
+class PyiCFGGenerator:
     def __init__(
         self,
         repository: StubRepository,
@@ -1173,7 +1173,7 @@ class PyiCfgGenerator:
         self.renderer = AnnotationRenderer(repository, options, self.public_type_names)
 
     def generate(self) -> cfg.GeneratedGrammar:
-        helper = cfg.CfgGenerator(cfg.GeneratorOptions(self.options.api_module))
+        helper = cfg.CFGGenerator(cfg.GeneratorOptions(self.options.api_module))
         productions: set[cfg.Production] = set(helper._literal_productions())
         for projection in self.projections:
             for public_name in sorted(projection.public_names):
@@ -1744,7 +1744,7 @@ def run(
         max_vararg_arity=command_line.max_vararg_arity,
         normalize_chomsky_normal_form=command_line.normalize_chomsky_normal_form,
     )
-    grammar = PyiCfgGenerator(repository, projections, options).generate()
+    grammar = PyiCFGGenerator(repository, projections, options).generate()
     output_file = command_line.output or default_output_file(
         api_module,
         command_line.normalize_chomsky_normal_form,

@@ -1,6 +1,6 @@
-# lib2cfg
+# api2cfg
 
-`lib2cfg` generates a context-free grammar of type-safe expressions from a library API.
+`api2cfg` generates a context-free grammar of type-safe expressions from a library API.
 
 ## Motivation
 
@@ -24,7 +24,7 @@ Let $\sigma$ be a resolved concrete term. We use two syntax-directed projections
 Both projections extend homomorphically over the term. For example:
 
 $$
-\Gamma(\texttt{x})=X,\ \Gamma(\texttt{y})=Y
+\Gamma\vdash \texttt{x}:X,\texttt{y}:Y
 \quad\Longrightarrow\quad
 \begin{aligned}
 \pi_{\Sigma}(\texttt{x.f(y)}) &= \texttt{ID . ID ( ID )},\\

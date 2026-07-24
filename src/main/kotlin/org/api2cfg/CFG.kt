@@ -1,4 +1,4 @@
-package org.lib2cfg
+package org.api2cfg
 
 enum class TargetLanguage {
   KOTLIN, JAVA;
@@ -9,7 +9,7 @@ enum class TargetLanguage {
   }
 }
 
-data class CfgCall(
+data class CFGCall(
   val result: TypeExpr,
   val receiver: TypeExpr?,
   val staticOwner: String?,
@@ -94,7 +94,7 @@ data class CFG(
     val DefaultStart: TypeExpr = TypeExpr.Applied("START")
 
     fun fromCalls(
-      calls: Iterable<CfgCall>,
+      calls: Iterable<CFGCall>,
       targetLanguage: TargetLanguage,
       includeNullableTypes: Boolean = false,
       start: TypeExpr = DefaultStart,
@@ -210,7 +210,7 @@ data class Production(val lhs: TypeExpr, val rhs: List<Symbol>) {
   }
 }
 
-private fun CfgCall.toProduction(): Production =
+private fun CFGCall.toProduction(): Production =
   Production.call(
     result = result,
     name = name,

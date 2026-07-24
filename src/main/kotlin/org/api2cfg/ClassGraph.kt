@@ -1,4 +1,4 @@
-package org.lib2cfg
+package org.api2cfg
 
 import io.github.classgraph.BaseTypeSignature
 import io.github.classgraph.ClassGraph
@@ -70,7 +70,7 @@ data class ClassGraphGeneratorOptions(
  * zero through three, invariant class types, type variables with upper bounds,
  * and a finite ground universe. Unsupported bytecode signatures are omitted.
  */
-class ClassGraphCfgGenerator(private val options: ClassGraphGeneratorOptions) {
+class ClassGraphCFGGenerator(private val options: ClassGraphGeneratorOptions) {
   fun generate(): GeneratedGrammar {
     val graph = ClassGraph()
       .enableClassInfo()
@@ -281,7 +281,7 @@ class ClassGraphCfgGenerator(private val options: ClassGraphGeneratorOptions) {
     groundTypes: List<TypeExpr>,
     subtypeIndex: SubtypeIndex,
     erasedSubtypeIndex: ErasedClassGraphSubtypeIndex,
-  ): List<CfgCall> {
+  ): List<CFGCall> {
     val types = listOfNotNull(pattern.result, pattern.receiver) + pattern.parameters
     val variables = types.flatMap { type -> type.variables() }.distinct().sorted()
     if (variables.size > options.maxTypeVariablesPerCallable) return emptyList()
@@ -301,7 +301,7 @@ class ClassGraphCfgGenerator(private val options: ClassGraphGeneratorOptions) {
         return@mapNotNull null
       }
 
-      CfgCall(
+      CFGCall(
         result = result,
         receiver = receiver,
         staticOwner = pattern.staticOwner,
@@ -514,7 +514,7 @@ private data class ClassGraphCommandLine(val packageName: String, val normalizeC
 }
 
 /**
- * Bytecode entry point: `org.lib2cfg.ClassGraphKt`.
+ * Bytecode entry point: `org.api2cfg.ClassGraphKt`.
  *
  * The Kotlin name is different from Main.kt's source-level `main`, while
  * @JvmName exposes the conventional JVM main method on this file facade.
@@ -526,7 +526,7 @@ fun classGraphMain(args: Array<String>) {
     packageName = commandLine.packageName,
     normalizeChomskyNormalForm = commandLine.normalizeChomskyNormalForm,
   )
-  val grammar = ClassGraphCfgGenerator(
+  val grammar = ClassGraphCFGGenerator(
     ClassGraphGeneratorOptions(
       packageName = commandLine.packageName,
       normalizeChomskyNormalForm = commandLine.normalizeChomskyNormalForm,

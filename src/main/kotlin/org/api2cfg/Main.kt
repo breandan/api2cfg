@@ -1,4 +1,4 @@
-package org.lib2cfg
+package org.api2cfg
 
 import java.io.File
 import java.lang.reflect.Modifier
@@ -44,7 +44,7 @@ fun main(args: Array<String>) {
     commandLine.emitParameterizedSignatures,
   )
   outputFile.parentFile?.mkdirs()
-  val grammar = CfgGenerator(options).generate()
+  val grammar = CFGGenerator(options).generate()
   Files.writeString(outputFile.toPath(), "${grammar.text}\n")
   println(
     "Wrote |P|=${grammar.productionCount}, |V|=${grammar.nonterminalCount}, |Σ|=${grammar.terminalCount} to ${outputFile.path}",
@@ -118,7 +118,7 @@ private fun <T, R> Iterable<T>.parallelFlatMap(transform: (T) -> Iterable<R>): L
 private fun <T> Iterable<T>.materializedCollection(): Collection<T> =
   if (this is Collection<*>) this as Collection<T> else toList()
 
-class CfgGenerator(private val options: GeneratorOptions) {
+class CFGGenerator(private val options: GeneratorOptions) {
   private val scanner = ClassPathPackageScanner()
   private lateinit var typeRenderer: TypeRenderer
   private val memberFunctionsByClass = ConcurrentHashMap<KClass<*>, List<KFunction<*>>>()
@@ -1682,7 +1682,7 @@ class ClassPathPackageScanner {
 
 class KotlinCompilerProbe(private val compilerCommand: String = "kotlinc") {
   fun isAssignable(actualType: String, expectedType: String): Boolean? {
-    val tempDir = Files.createTempDirectory("lib2cfg-probe-")
+    val tempDir = Files.createTempDirectory("api2cfg-probe-")
     return try {
       val source = tempDir.resolve("Probe.kt")
       Files.writeString(
