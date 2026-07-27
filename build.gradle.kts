@@ -6,9 +6,7 @@ plugins {
 group = "org.api2cfg"
 version = "1.0-SNAPSHOT"
 
-repositories {
-  mavenCentral()
-}
+repositories { mavenCentral() }
 
 dependencies {
   implementation(kotlin("reflect"))
@@ -16,15 +14,11 @@ dependencies {
   implementation("io.github.classgraph:classgraph:4.8.184")
 }
 
-kotlin {
-  jvmToolchain(21)
-}
+kotlin { jvmToolchain(21) }
 
 tasks.test { useJUnitPlatform() }
 
-application {
-  mainClass.set("org.api2cfg.MainKt")
-}
+application { mainClass.set("org.api2cfg.MainKt") }
 
 tasks.register<JavaExec>("runClassGraph") {
   group = "application"
