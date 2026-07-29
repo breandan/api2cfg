@@ -4,7 +4,7 @@
 
 ## Motivation
 
-We aim to be sound and complete w.r.t. respect to the surface grammar, $G_0$:
+`api2cfg` aims to be sound and complete with respect to the surface grammar $G_0$:
 
 ```text
 S    -> ID | ID ( ) | ID ( ARGS ) | S . S
@@ -13,103 +13,32 @@ ARGS -> S | S , S | S , S , S
 
 Here, $\mathtt{ID}$ may be any identifier. The fragment contains names, calls with zero through three arguments, and arbitrary member chaining.
 
-Let $e$ be a concrete surface term. We use two syntax-directed projections.
-The surface projection $\pi_{\Sigma}(e)$ replaces every
-identifier spelling by $\mathtt{ID}$ and preserves punctuation.
-
-An identifier spelling need not determine a unique binding or type. Treat the
-ambient environment as a finite relation among spellings, binding identities,
-and complete static types:
+Let $e$ be a surface expression. The surface projection $\pi_{\Sigma}(e)$ replaces every identifier by $\mathtt{ID}$ while preserving punctuation. Thus $e$ belongs to the supported fragment exactly when
 
 $$
-\Gamma\subseteq
-  \mathtt{ID}\times\mathsf{Binding}\times\mathsf{Type},
-\qquad
-\mathsf{Ty}_{\Gamma}(x)
-=\{\tau\mid\exists b.\ (x,b,\tau)\in\Gamma\}.
+\pi_{\Sigma}(e)\in\mathcal{L}(G_0).
 $$
 
-The binding identity is retained because two declarations may have the same
-spelling and type but different kinds or origins. An overload's type is its
-whole correlated signature, not independent sets of parameter and result
-types.
-
-Fix arbitrary environments $\Delta_{\texttt{api}}$ and $\Gamma$. Let
-$\mathcal{R}(e)$ be the set of legal resolved elaborations of $e$ under these
-environments. A resolved term $\sigma$ records the binding, overload and type
-instantiation, and static type selected at every identifier occurrence.
-Resolution is performed for the whole term according to the language's
-namespace, shadowing, overload, and typing rules; occurrence choices are not
-assumed to form an unrestricted Cartesian product.
-
-For a resolved term, $\pi_{\Gamma}(\sigma)$ replaces each context-bound
-identifier occurrence of selected type $\tau$ by $\langle\tau\rangle$, while
-preserving fixed API names and punctuation. It extends homomorphically over
-the term. The type-directed projection of unresolved surface syntax is the set
+An identifier may have more than one static type. For each identifier $x$, the ambient environment $\Gamma(x)$ is a finite set of complete types. In particular, a callable type keeps its parameter and result types together as one signature. A variable and function both named $\texttt{abc}$ can therefore be represented by
 
 $$
-\Pi_{\Gamma}(e)
-=\{\pi_{\Gamma}(\sigma)\mid
-  \sigma\in\mathcal{R}(e)\}.
+\Gamma(\texttt{abc})=\{\mathtt{Int},\,() \to \mathtt{Int}\}.
 $$
 
-For example, if $e=\texttt{x.f(y)}$ has a unique resolution in which
-$\texttt{x}:X$ and $\texttt{y}:Y$, then
+Likewise, if $\texttt{x}:C$ is also known statically to satisfy contracts $I_1$ and $I_2$, then $\Gamma(\texttt{x})$ may contain all three types. For each legal reading of $e$, replace every context-bound occurrence $x:\tau$ by the type slot $\langle\tau\rangle$, while preserving fixed API names and punctuation. We write $\Pi_{\Gamma}(e)$ for the set of forms obtained from all such readings. Choices are made per occurrence, but only combinations permitted by the source language's whole-term name and overload resolution are included. Both projections preserve the expression's structure; they change only its identifiers. For example, if $\Gamma(\texttt{x})=\{X\}$ and $\Gamma(\texttt{y})=\{Y\}$, then
 
 $$
 \begin{aligned}
-\pi_{\Sigma}(e) &= \texttt{ID . ID ( ID )},\\
-\Pi_{\Gamma}(e)
+\pi_{\Sigma}(\texttt{x.f(y)}) &= \texttt{ID . ID ( ID )},\\
+\Pi_{\Gamma}(\texttt{x.f(y)})
   &=\{\langle X\rangle \texttt{ . f ( }\langle Y\rangle \texttt{ )}\}.
 \end{aligned}
 $$
 
-If a function and a variable named $\texttt{abc}$ have types $F$ and $V$ in
-the same scope, then distinct bindings $b_f$ and $b_v$ give
+Different context names with a common admissible type therefore produce the same type slot, while fixed API names remain significant.
 
-$$
-(\texttt{abc},b_f,F),(\texttt{abc},b_v,V)\in\Gamma,
-\qquad
-\mathsf{Ty}_{\Gamma}(\texttt{abc})=\{F,V\}.
-$$
-
-Separate occurrences, such as those in $\texttt{pair(abc,abc())}$, may select
-different bindings when the language permits it; the spelling alone does not
-choose between them. Likewise, one concrete binding may admit the static
-types $C$, $I_1$, and $I_2$ when $C$ is known to satisfy both contracts.
-
-Thus $e$ matches the surface fragment exactly when
-$\pi_{\Sigma}(e)\in\mathcal{L}(G_0)$. For resolved terms, type-directed
-identifier equivalence remains equality under $\pi_{\Gamma}$:
-
-$$
-\sigma\cong_{\Gamma}\sigma'
-\quad\stackrel{\mathrm{def}}{\Longleftrightarrow}\quad
-\pi_{\Gamma}(\sigma)
-=\pi_{\Gamma}(\sigma').
-$$
-
-Unresolved surface terms are type-compatible when some pair of legal
-elaborations are equivalent:
-
-$$
-e\mathrel{\bowtie_{\Gamma}}e'
-\quad\stackrel{\mathrm{def}}{\Longleftrightarrow}\quad
-\Pi_{\Gamma}(e)
-\cap\Pi_{\Gamma}(e')
-\ne\varnothing.
-$$
-
-Compatibility is not generally transitive, so it is not itself an
-equivalence relation. Different names sharing an admissible type nevertheless
-match automatically, one or many occurrences at a time, while fixed API names
-remain significant.
-
-Let $G_{\texttt{api}}$ be the generated grammar. Write
-$\Delta_{\texttt{api}};\Gamma\vdash e:\tau$ when some
-$\sigma\in\mathcal{R}(e)$ has type $\tau$, and write $\langle\tau\rangle$ for
-the grammar nonterminal representing type $\tau$. The
-soundness-and-completeness target is:
+For a library typing environment $\Delta_{\texttt{api}}$, let
+$G_{\texttt{api}}$ be its generated grammar. Write $\Delta_{\texttt{api}};\Gamma\vdash e:\tau$ for ordinary typing against the library and ambient environments, and write $\langle\tau\rangle$ for the grammar nonterminal representing type $\tau$. The correctness target is
 
 $$
 \forall e,\tau.\quad
@@ -125,14 +54,7 @@ $$
 \right).
 $$
 
-The right-to-left direction is **soundness**; the left-to-right direction is
-**completeness**. A form
-$\varphi\in\Pi_{\Gamma}(e)$ may retain type nonterminals, so it is a
-sentential form rather than, in general, a terminal word in
-$\mathcal{L}(G_{\texttt{api}})$. Ordinary language membership requires
-continuing the derivation until every remaining type slot has been expanded.
-
-When runtime or static metadata is insufficient, a backend should preserve soundness by omitting uncertain productions rather than inventing types.
+The right-to-left direction is **soundness**; the left-to-right direction is **completeness**. The claim is relative to the source language's legal readings; the CFG is not itself a name or overload resolver. A projected form $\varphi$ may still contain type nonterminals, so it is a sentential form rather than necessarily a terminal word. When metadata is incomplete, a backend preserves soundness by omitting uncertain productions rather than inventing types.
 
 ## Backends
 
