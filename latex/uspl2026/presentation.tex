@@ -44,6 +44,7 @@
   BoldItalicFont=*-BoldItalic
 ]
 \usepackage{amsmath}
+\usepackage{amssymb}
 \usepackage{array}
 \usepackage{listings}
 
@@ -52,6 +53,19 @@
 \definecolor{grammarcodestr}{RGB}{118,87,105}
 \definecolor{grammarcodetokbg}{RGB}{225,227,230}
 \definecolor{grammardivider}{RGB}{190,194,200}
+\definecolor{apiink}{RGB}{34,48,68}
+\definecolor{apiblue}{RGB}{45,88,154}
+\definecolor{apiteal}{RGB}{36,117,112}
+\definecolor{apigreen}{RGB}{48,124,82}
+\definecolor{apiamber}{RGB}{166,105,24}
+\definecolor{apired}{RGB}{161,66,66}
+
+\setbeamercolor{apisurface}{fg=apiink,bg=apiblue!7}
+\setbeamercolor{apiprojection}{fg=apiink,bg=black!3}
+\setbeamercolor{apiguarantee}{fg=apiink,bg=apiteal!9}
+\setbeamercolor{apiruleblue}{fg=apiink,bg=apiblue!6}
+\setbeamercolor{apirulegreen}{fg=apiink,bg=apigreen!7}
+\setbeamercolor{apiwarning}{fg=apiink,bg=apiamber!10}
 
 \lstdefinestyle{grammarcpp}{
   language=C++,
@@ -66,11 +80,11 @@
 
 % A literal terminal in a grammar production.
 \ExplSyntaxOn
-\seq_new:N \l__api_gtok_parts_seq
-\cs_new_protected:Npn \api_gtok_highlight:n #1
+\seq_new:N \l__api_code_parts_seq
+\cs_new_protected:Npn \api_code_highlight:n #1
   {
-    \seq_set_split:Nnn \l__api_gtok_parts_seq { ~ } {#1}
-    \seq_map_indexed_inline:Nn \l__api_gtok_parts_seq
+    \seq_set_split:Nnn \l__api_code_parts_seq { ~ } {#1}
+    \seq_map_indexed_inline:Nn \l__api_code_parts_seq
       {
         \int_compare:nNnT {##1} > {1}
           {\hspace{\fontdimen2\font}}
@@ -87,12 +101,25 @@
           }
       }
   }
-\NewDocumentCommand{\gtok}{m}
-  {\mathord{\text{\ttfamily\api_gtok_highlight:n{#1}}}}
+\NewDocumentCommand{\code}{m}
+  {\mathord{\text{\ttfamily\api_code_highlight:n{#1}}}}
 \ExplSyntaxOff
 
 % An unhighlighted monospace label used in grammar-name subscripts.
 \newcommand{\gsub}[1]{\mathord{\text{\ttfamily #1}}}
+
+% A type-indexed expression nonterminal.  This is the slide-friendly
+% spelling of the README's type slot \langle\tau\rangle.
+\newcommand{\exprnt}[1]{\mathsf{E}\!\,\langle #1\rangle}
+
+% Beamer's sans-math setup centers accents on the glyph box, which leaves
+% hats visibly left of slanted Latin capitals.  Add a small optical skew;
+% reserve plain \widehat for wider expressions such as \widehat{\mathcal T}.
+\newcommand{\tstate}[1]{\skew{2}\widehat{#1}\,}
+
+% Compact labels for judgments and generated rules.
+\newcommand{\rulename}[1]{%
+  \textcolor{apiblue}{\text{\scriptsize\bfseries\sffamily #1}}}
 
 % Overlay-aware grammar row. \uncover reserves the row's space from
 % slide 1, so neither the code nor the visible mathematics moves.
@@ -106,7 +133,7 @@
 }
 
 \title{Compiling Typed APIs\\ into Context-Free Languages	}
-\author{Breandan Considine, \textcolor{black!30}{Clemente Pasti, Tim Viera}}
+\author{Breandan Considine, \textcolor{black!30}{Clemente Pasti, Tim Vieira}}
 \date{\today}
 
 \begin{document}
@@ -114,6 +141,14 @@
 % -------------------------------------------------
   \begin{frame}
     \titlepage
+  \end{frame}
+
+  \begin{frame}{Motivation}
+    \begin{itemize}
+      \item Construct a $\ell_\Gamma = \mathcal{L}(G_\Gamma)$ consisting of well-typed statements
+      \item No well-typed statement $\sigma \notin \ell_\Gamma$ or ill-typed statements $\err{\sigma} \in \ell_\Gamma$
+      \item For any $\sigma \in \Sigma^*$ such that $\sigma\tau \in \ell_\Gamma$, display $\tau$'s in shortlex order
+    \end{itemize}
   \end{frame}
 % -------------------------------------------------
 
@@ -202,12 +237,83 @@
     \end{figure}
   \end{frame}
 
-  \begin{frame}{Motivation}
-    \begin{itemize}
-      \item Construct a $\ell_\Gamma = \mathcal{L}(G_\Gamma)$ consisting of well-typed statements
-      \item No well-typed statement $\sigma \notin \ell_\Gamma$ or ill-typed statements $\err{\sigma} \in \ell_\Gamma$
-      \item For any $\sigma$ such that $\exists\tau. \sigma\tau \in \ell_\Gamma$, display $\tau$'s in shortlex order
-    \end{itemize}
+
+  \begin{frame}[t]{Correctness criterion: what must the CFG preserve?}
+    \vspace{0.2cm}
+    \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\textwidth]{apisurface}
+      {\small\bfseries\color{apiblue}Surface fragment $G'$}
+      \hfill
+      {\footnotesize e.g., names, invocation, member chains}
+
+      \vspace{0.4em}
+      \centering
+      \fontsize{10.0}{13.6}\selectfont
+      \hspace{0.1cm}$\displaystyle
+        S ::= E \texttt{;}
+        \:\:\:
+        E ::= \texttt{ID}\mid\texttt{ID()}\mid\texttt{ID(\,ARGS\,)}\mid E\texttt{.}E
+        \:\:\:
+        \mathtt{ARGS} ::= E\mid E\texttt{,}\,\texttt{ARGS}
+      $
+      \vspace{0.15em}
+    \end{beamercolorbox}
+
+    \vspace{-0.3em}
+    \begin{columns}[T,onlytextwidth]
+      \column{0.48\textwidth}
+        \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\linewidth]{apiprojection}
+          {\small\bfseries\color{apiblue}1. Surface projection $\pi_\Sigma$}
+
+          \vspace{0.1em}
+          \centering
+          {\scriptsize erase names but preserve punctuation}
+
+          \vspace{0.3em}
+          \resizebox{0.88\linewidth}{!}{$
+            \pi_\Sigma(\code{x.f(y)})=\texttt{ID.ID(ID)}
+          $}
+
+          \vspace{0.3em}
+          {\scriptsize checks that the shape belongs to $G_0$}
+        \end{beamercolorbox}
+      \column{0.48\textwidth}
+        \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\linewidth]{apiprojection}
+          {\small\bfseries\color{apiteal}2. Typed projection $\Pi_\Gamma$}
+
+          \vspace{0.1em}
+          \centering
+          {\scriptsize names $\to$ type slots; API names stay}
+
+          \vspace{0.3em}
+          \resizebox{0.88\linewidth}{!}{$
+            \Pi_\Gamma(\code{x.f(y)})\ni
+              \exprnt{\tstate{X}}\texttt{.f(}\exprnt{\tstate{Y}}\texttt{)}
+          $}
+
+          \vspace{0.3em}
+          {\scriptsize contains all and only well-typed terms}
+        \end{beamercolorbox}
+    \end{columns}
+
+    \vspace{0.4em}
+    \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\textwidth]{apiguarantee}
+      {\small\bfseries\color{apiteal}Correctness criterion}
+
+      \vspace{0.15em}
+
+      {\footnotesize For a target language $L$ with surface fragment $G'$, construct $G_\Gamma$ satisfying:}
+
+      \vspace{0.5em}
+      \hspace{0.6cm}\resizebox{0.91\linewidth}{!}{$
+        \pi_\Sigma(\sigma) \in \mathcal{L}(G')
+        \quad\Longleftrightarrow\quad
+        \Gamma \vdash \Pi_\Gamma(\sigma) \in \mathcal{L}(G_\Gamma)
+      $}
+
+      \vspace{0.4em}
+      {\footnotesize for all source code statements $\sigma$ accepted by the reference compiler for $L$.}
+
+    \end{beamercolorbox}
   \end{frame}
 
   \begin{frame}[t,fragile]{Grammar Modularization}
@@ -236,75 +342,324 @@
       & {\scriptsize\bfseries Grammar contribution} \\[0.25ex]
       \cline{1-1}\cline{2-2}
 
-      \lstinline!// Filetype: *.cpp!
-      & \grow<1->{G_{\gsub{C++}}\:\cup} \\
-
-      \lstinline!#include <string>!
-      & \grow<2->{G_{\gsub{<string>}}\:\cup} \\
-
-      \lstinline!#include <vector>!
-      & \grow<3->{G_{\gsub{<vector>}}\:\cup} \\
-
-      \lstinline!#include "org/fizz.hpp"!
-      & \grow<4->{G_{\gsub{org/fizz.hpp}}\:\cup} \\
-
-      \lstinline!#include "com/buzz.hpp"!
-      & \grow<5->{G_{\gsub{com/buzz.hpp}}\:\cup} \\
-
-      \lstinline!using std::string;!
-      & \grow<6->{%
-        \{\,\mathsf{Type} \to \gtok{string}\,\}\:\cup
+      \lstinline!// Filetype: *.cpp! & \grow<1->{G_{\gsub{C++}}\:\cup} \\
+      \lstinline!#include <string>! & \grow<2->{G_{\gsub{<string>}}\:\cup} \\
+      \lstinline!#include <vector>! & \grow<3->{G_{\gsub{<vector>}}\:\cup} \\
+      \lstinline!#include "org/fizz.hpp"! & \grow<4->{G_{\gsub{org/fizz.hpp}}\:\cup} \\
+      \lstinline!#include "com/buzz.hpp"! & \grow<5->{G_{\gsub{com/buzz.hpp}}\:\cup} \\
+      \lstinline!using std::string;! & \grow<6->{%
+        \{\,\mathsf{Type} \to \code{string}\,\}\:\cup
       } \\
-
-      \lstinline!// ...!
-      & \grow<7->{\cdots} \\
-
-      \lstinline!int fizz() { return 3; }!
-      & \grow<8->{%
-        \{\,\mathsf{Int}\to\gtok{fizz()},\;
-        \mathsf{S}\to\gtok{fizz();}\,\}\:\cup
+      \lstinline!// ...! & \grow<7->{\cdots} \\
+      \lstinline!int fizz() { return 3; }! & \grow<8->{%
+        \{\,\mathsf{Int}\to\code{fizz()},\;
+        \mathsf{S}\to\code{fizz();}\,\}\:\cup
       } \\
-
-      \lstinline!string buzz(string s) { return s; }!
-      & \grow<9->{%
+      \lstinline!string buzz(string s) { return s; }! & \grow<9->{%
         \{\,\mathsf{Str}\to
-        \gtok{buzz( }\mathsf{Str}\gtok{ )},\;
+        \code{buzz( }\mathsf{Str}\code{ )},\;
         \mathsf{S}\to
-        \gtok{buzz( }\mathsf{Str}\gtok{ );}\,\}\:\cup\hspace{-5cm}
+        \code{buzz( }\mathsf{Str}\code{ );}\,\}\:\cup\hspace{-5cm}
       } \\
-
-      \lstinline!// ...!
-      & \grow<10->{\cdots} \\
-
-      \lstinline!int main(int argc, char* args[]) {!
-      & \grow<11->{%
-        \{\,\mathsf{Int}\to \gtok{argc},
+      \lstinline!// ...! & \grow<10->{\cdots} \\
+      \lstinline!int main(int argc, char* args[]) {! & \grow<11->{%
+        \{\,\mathsf{Int}\to \code{argc},
         \,\mathsf{CharPtr}\to
-        \gtok{args[ }\mathsf{Int}\gtok{ ]}\,\}\:\cup
+        \code{args[ }\mathsf{Int}\code{ ]}\,\}\:\cup
       } \\
-
-      \lstinline!  string bang = "...";!
-      & \grow<12->{%
-        \{\,\mathsf{Str}\to\gtok{bang}\,\} \color{black!30}{\,\:\rightarrow G_\Gamma}
+      \lstinline!  string bang = "...";! & \grow<12->{%
+        \{\,\mathsf{Str}\to\code{bang}\,\} \color{black!30}{\,\:\rightarrow G_\Gamma}
       } \\
-
-      \lstinline!  !\codecursor
-      & \grow<13->{L(G_{\Gamma})} \\
-
-      \lstinline!}!
-      & \\
+      \lstinline!  !\codecursor & \grow<13->{\mathcal{L}(G_{\Gamma})} \\
+      \lstinline!}! & \\
     \end{tabular}
   \end{frame}
 
-  \begin{frame}{Monomorphization}
-    % TODO
+  \begin{frame}[t]{Monomorphization I: ground rules}
+    \vspace{-0.45em}
+    \begin{beamercolorbox}[rounded=true,sep=0.3em,wd=\textwidth]{apisurface}
+      \centering\scriptsize
+      \textcolor{apiblue}{\bfseries State $\to$ nonterminal;}\quad
+      API text $\to$ terminal;\quad validated AST node $\to$ production.
+    \end{beamercolorbox}
+
+    \vspace{0.4em}
+    \begin{columns}[T,onlytextwidth]
+      \column{0.485\textwidth}
+        \begin{beamercolorbox}[rounded=true,sep=0.35em,wd=\linewidth]{apiruleblue}
+          {\small\bfseries\color{apiblue}Monomorphic member call}
+
+          \vspace{0.05em}
+          \centering
+          \resizebox{0.82\linewidth}{!}{$\displaystyle
+            \frac{
+              \substack{
+                \Delta(\tstate{C}\!::\!f)=(\tstate{A})\to\tstate{R}\\[-0.1em]
+                \Delta;\Gamma\vdash e_0:\tstate{C}\quad
+                \Delta;\Gamma\vdash e_1:\tstate{A}
+              }
+            }{
+              \Delta;\Gamma\vdash e_0\mathtt{.f(}e_1\mathtt{)}:\tstate{R}
+            }
+          $}
+
+          \vspace{0.1em}
+          {\scriptsize becomes}
+          \[
+            \boxed{\exprnt{\tstate{R}}\to
+              \exprnt{\tstate{C}}\code{. f (}\exprnt{\tstate{A}}\code{)}}
+          \]
+          \vspace{-0.55em}
+          {\scriptsize\bfseries Example}\quad
+          {\fontsize{6.8}{8.2}\selectfont\ttfamily C c; A a; c.f(a);}
+        \end{beamercolorbox}
+      \column{0.485\textwidth}
+        \begin{beamercolorbox}[rounded=true,sep=0.35em,wd=\linewidth]{apirulegreen}
+          {\small\bfseries\color{apiteal}Resolved operator call}
+
+          \vspace{0.05em}
+          \centering
+          \resizebox{0.82\linewidth}{!}{$\displaystyle
+            \frac{
+              \substack{
+                \Delta;\Gamma\vdash e_1:\tstate{T}_1\quad
+                \Delta;\Gamma\vdash e_2:\tstate{T}_2\\[-0.1em]
+                \delta^{\Delta}_{+}(\tstate{T}_1,\tstate{T}_2)=\tstate{R}
+              }
+            }{
+              \Delta;\Gamma\vdash e_1\mathtt{+}e_2:\tstate{R}
+            }
+          $}
+
+          \vspace{0.1em}
+          {\scriptsize becomes}
+          \[
+            \boxed{\exprnt{\tstate{R}}\to
+              \exprnt{\tstate{T}_1}\code{+}\exprnt{\tstate{T}_2}}
+          \]
+          \vspace{-0.55em}
+          {\scriptsize\bfseries Example}\quad
+          {\fontsize{6.8}{8.2}\selectfont\ttfamily Vec u, v; u + v;}
+        \end{beamercolorbox}
+    \end{columns}
+
+    \vspace{0.05em}
+    \begin{beamercolorbox}[rounded=true,sep=0.2em,wd=\textwidth]{apiwarning}
+      \centering
+      \resizebox{0.92\linewidth}{!}{$
+        \mathrm{AddClosed}(T)\;\Longleftrightarrow\;
+          \mathrm{base}\!\left(\delta^{\Delta}_{+}(\tstate{T},\tstate{T})\right)=T
+        \quad\overset{\text{erase state}}{\Longrightarrow}\quad
+        \boxed{\exprnt{T}\to\exprnt{T}\code{+}\exprnt{T}}
+      $}
+
+      \vspace{0.02em}
+      {\tiny Type-level mnemonic only; $G_0^+$ preserves C++ precedence/left associativity,
+        and mixed states use $\delta_+^\Delta$.}
+    \end{beamercolorbox}
   \end{frame}
 
-  \begin{frame}{Covariance and contravariance}
-    % TODO
+  \begin{frame}[t]{Monomorphization II: subtype calls}
+    \vspace{-0.45em}
+    \begin{beamercolorbox}[rounded=true,sep=0.35em,wd=\textwidth]{apisurface}
+      \centering\scriptsize
+      $D<:_\Delta B$ is public, unambiguous inheritance;
+      whole-call resolution retains cv/ref/category state and conversions.
+    \end{beamercolorbox}
+
+    \vspace{0.4em}
+    \begin{columns}[T,onlytextwidth]
+      \column{0.47\textwidth}
+        \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\linewidth]{apiruleblue}
+          {\small\bfseries\color{apiblue}Resolve the subtype call}
+
+          \centering
+          \vspace{0.35em}
+          \resizebox{0.96\linewidth}{!}{$\displaystyle
+            \frac{
+              \substack{
+                D<:_\Delta B
+                \quad \Delta;\Gamma\vdash e:\tstate{D}\\[-0.1em]
+                \mathrm{resolve}_{\Delta}(f;\tstate{D})=((\tstate{B})\to\tstate{R})
+              }
+            }{
+              \Delta;\Gamma\vdash f(e):\tstate{R}
+            }\;\rulename{Inv$_{<:}$}
+          $}
+
+          \vspace{0.3em}
+          {\scriptsize\color{apiblue}
+            No global $e:B$ rule: invocation consumes the subtype fact.}
+
+          \vspace{0.35em}
+          {\fontsize{7.4}{8.8}\selectfont
+          \begin{tabular}{@{}l@{\hspace{0.7em}}>{\ttfamily}l@{}}
+            \bfseries Example & struct Animal \{\}; \\
+              & struct Dog : Animal \{\}; \\
+              & int age(const Animal\&); \\
+              & Dog d; age(d); \\
+          \end{tabular}}
+          \vspace{0.8em}
+        \end{beamercolorbox}
+      \column{0.49\textwidth}
+        \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\linewidth]{apirulegreen}
+          {\small\bfseries\color{apiteal}Emit the exact surface call}
+
+          \vspace{0.35em}
+          \centering
+          \resizebox{0.94\linewidth}{!}{$\displaystyle
+            \frac{
+              \mathrm{resolve}_{\Delta}(f;\tstate{D})=((\tstate{B})\to\tstate{R})
+            }{
+              \bigl(\exprnt{\tstate{R}}\to
+                \code{f (}\exprnt{\tstate{D}}\code{)}\bigr)\in P_{\mathrm{api},b}
+            }\;\rulename{Inv$_\varphi$}
+          $}
+
+          \vspace{0.35em}
+          {\scriptsize State hats are elided below.}
+          \[
+            \boxed{\exprnt{\mathtt{int}}\to
+              \code{age (}\exprnt{\mathtt{Dog}}\code{)}}
+          \]
+          \vspace{-0.2em}
+          \resizebox{0.84\linewidth}{!}{$
+            \begin{aligned}
+              \exprnt{\mathtt{int}}&\Rightarrow
+                \code{age (}\exprnt{\mathtt{Dog}}\code{)},\\[-0.05em]
+              \code{age (}\exprnt{\mathtt{Dog}}\code{)}
+                &\in\Pi_\Gamma(\texttt{age(d)}).
+            \end{aligned}
+          $}
+        \end{beamercolorbox}
+    \end{columns}
+
+    \vspace{0.05em}
+    \begin{beamercolorbox}[rounded=true,sep=0.2em,wd=\textwidth]{apiwarning}
+      \centering
+      {\scriptsize
+        \textbf{Whole-call resolution} preserves overloads, access,
+        cv/ref/category, and ambiguity.}
+
+      \vspace{0.05em}
+      {\scriptsize
+        $\mathtt{Dog}<:\mathtt{Animal}$ does not lift through
+        $\mathtt{vector}\langle\cdot\rangle$ (class-template invariance).}
+    \end{beamercolorbox}
   \end{frame}
 
-  \begin{frame}{Results: Size of generated CFGs}
-    % TODO
+  \begin{frame}[t]{Monomorphizing templates}
+    \vspace{-0.55em}
+    \begin{columns}[T,onlytextwidth]
+      \column{0.59\textwidth}
+        \begin{beamercolorbox}[rounded=true,sep=0.3em,wd=\linewidth]{apiruleblue}
+          {\small\bfseries\color{apiblue}Proposed C++ grounding}
+
+          \centering
+          \vspace{0.05em}
+          \resizebox{0.95\linewidth}{!}{$\displaystyle
+            \frac{
+              \substack{
+                f:\forall\bar\alpha.\,C(\bar\alpha)\Rightarrow
+                  (\bar\tau)\to\rho\in\Delta\\[-0.1em]
+                \operatorname{types}(f_\theta,\bar q,q_R)
+                  \subseteq\widehat{\mathcal{T}}_b
+                \quad C\theta\\[-0.1em]
+                \operatorname{oracle}_{\mathrm{C++}}
+                  (\mathtt{f(}\bar e:\bar q\mathtt{)})=q_R
+              }
+            }{
+              f_{\theta,\bar q}:(\bar q)\to q_R\in\Delta_b
+            }\;\rulename{Mono}
+          $}
+
+          \vspace{0.15em}
+          {\scriptsize emit}\quad
+          \resizebox{0.64\linewidth}{!}{$
+            \boxed{\exprnt{q_R}\to
+              \code{f (}\exprnt{q_1}\code{,}\ldots
+              \code{,}\exprnt{q_n}\code{)}}.
+          $}
+
+          \vspace{0.05em}
+          {\tiny $q=(T,\mathrm{cv/ref},\kappa)$ is a complete expression state.}
+        \end{beamercolorbox}
+      \column{0.38\textwidth}
+        \begin{beamercolorbox}[rounded=true,sep=0.3em,wd=\linewidth]{apiprojection}
+          {\small\bfseries\color{apiteal}Tiny C++ schema}
+
+          \vspace{0.25em}
+          {\fontsize{6.6}{8.0}\selectfont\ttfamily
+            template<class T>\\
+            \hspace*{0.9em}requires AddClosed<T>\\
+            T twice(T x) \{\\
+            \hspace*{0.9em}return x + x;\\
+            \}}
+
+          \vspace{0.25em}
+          {\fontsize{7.2}{8.6}\selectfont
+            $\begin{aligned}
+              \mathtt{twice}&:\forall T.\\[-0.15em]
+              &\mathrm{AddClosed}(T)\Rightarrow T\to T
+            \end{aligned}$}
+        \end{beamercolorbox}
+    \end{columns}
+
+    \vspace{0.25em}
+    \begin{beamercolorbox}[rounded=true,sep=0.3em,wd=\textwidth]{apirulegreen}
+      \centering
+      {\small\bfseries\color{apiteal}Validate exact surface calls; keep accepted rows}
+
+      \vspace{0.1em}
+      \renewcommand{\arraystretch}{1.0}
+      \setlength{\tabcolsep}{0.4em}
+      \fontsize{7.4}{8.8}\selectfont
+      \begin{tabular}{@{}>{\raggedright\arraybackslash}p{0.24\textwidth}
+                         >{\centering\arraybackslash}p{0.15\textwidth}
+                         >{\raggedright\arraybackslash}p{0.49\textwidth}@{}}
+        \textbf{Substitution} & \textbf{C++ oracle} & \textbf{Production (states elided)} \\
+        \hline
+        $T\mapsto$ \texttt{int} & \textcolor{apigreen}{accepted} &
+          $\exprnt{\mathtt{int}}\to\code{twice (}\exprnt{\mathtt{int}}\code{)}$ \\
+        $T\mapsto$ \texttt{string} & \textcolor{apigreen}{accepted} &
+          $\exprnt{\mathtt{string}}\to\code{twice (}\exprnt{\mathtt{string}}\code{)}$ \\
+        $T\mapsto$ \texttt{vector<int>} & \textcolor{apired}{rejected} &
+          \textcolor{black!48}{omitted: no closed \texttt{operator+}} \\
+      \end{tabular}
+    \end{beamercolorbox}
+
+    \vspace{0.12em}
+    \begin{beamercolorbox}[rounded=true,sep=0.18em,wd=\textwidth]{apiwarning}
+      \centering
+      {\scriptsize
+        $b=\langle\text{arity},\text{nesting},\text{subtype depth},|\widehat{\mathcal{T}}_b|\rangle$.\quad
+        \textcolor{apigreen}{exact-call oracle $\Rightarrow$ sound for this schema.}\\[0.05em]
+        \textcolor{apiblue}{Complete metadata + exhaustive in-bound calls $\Rightarrow$
+        complete for this schema in $(G_0^+,\widehat{\mathcal{T}}_b,b)$.}}
+    \end{beamercolorbox}
   \end{frame}
+
+
+\begin{frame}{Covariance and contravariance}
+% TODO: discuss [co/in/contra]variance, some good examples here: https://quuxplusone.github.io/blog/2019/01/20/covariance-and-contravariance/
+\end{frame}
+
+\begin{frame}{Results: Size of generated CFGs}
+    % TODO: discuss common APIs and the CFG sizes
+\end{frame}
+
+\begin{frame}{Evaluation}
+% TODO: discuss fresh names
+
+%    For a given residual grammar, precision measures the percent of uniform samples $x~L(G)$ accepted by the reference compiler and recall measures the number of ground truth samples $x* \in L(G)$ modulo fresh names. So, for example, suppose the ground truth single line statement is:
+%
+%for ( const auto & animal : animals ) introduce ( * animal , 2 ) ;
+%
+%Then, the generated residual language would be considered matching iff it accepted:
+%
+%for ( const auto & {fresh_id} : animals ) introduce ( * {fresh_id} , 0 ) ;
+%
+%assuming that animal is indeed fresh in the local context. All other names, including keywords, declared variables, external methods should match identically. For raw literals, I use a placeholder like "" or 0, which a user can later substitute.
+
+\end{frame}
 \end{document}
