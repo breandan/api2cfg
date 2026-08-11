@@ -66,6 +66,7 @@
 \setbeamercolor{apiruleblue}{fg=apiink,bg=apiblue!6}
 \setbeamercolor{apirulegreen}{fg=apiink,bg=apigreen!7}
 \setbeamercolor{apiwarning}{fg=apiink,bg=apiamber!10}
+\setbeamercolor{apieditor}{fg=apiink,bg=black!3}
 
 \lstdefinestyle{grammarcpp}{
   language=C++,
@@ -117,6 +118,14 @@
 % reserve plain \widehat for wider expressions such as \widehat{\mathcal T}.
 \newcommand{\tstate}[1]{\skew{2}\widehat{#1}\,}
 
+% Zero-width IDE caret with a remembered anchor for completion popups.
+\newcommand{\idecursor}[1]{%
+  \tikz[remember picture,baseline=-0.55ex]{%
+    \coordinate (#1);%
+    \draw[apiblue,line width=0.75pt] (0,-1.1ex) -- (0,1.20ex);%
+  }%
+}
+
 % Compact labels for judgments and generated rules.
 \newcommand{\rulename}[1]{%
   \textcolor{apiblue}{\text{\scriptsize\bfseries\sffamily #1}}}
@@ -143,12 +152,87 @@
     \titlepage
   \end{frame}
 
-  \begin{frame}{Motivation}
+  \begin{frame}[t,fragile]{Motivation: type-safe code completion}
+    \vspace{-0.4em}
+    {\small
     \begin{itemize}
+      \setlength{\itemsep}{0.18em}
       \item Construct a $\ell_\Gamma = \mathcal{L}(G_\Gamma)$ consisting of well-typed statements
       \item No well-typed statement $\sigma \notin \ell_\Gamma$ or ill-typed statements $\err{\sigma} \in \ell_\Gamma$
-      \item For any $\sigma \in \Sigma^*$ such that $\sigma\tau \in \ell_\Gamma$, display $\tau$'s in shortlex order
-    \end{itemize}
+      \item For any $\sigma \in \Sigma^*$ such that $\exists \tau.\sigma\tau \in \ell_\Gamma$, show $\tau$'s in shortlex order
+    \end{itemize}}
+
+    \vspace{-0.15em}
+    \onslide<2->
+    \begin{beamercolorbox}[rounded=true,sep=0pt,wd=\textwidth]{apieditor}
+      \lstset{
+        style=grammarcpp,
+        basicstyle=\ttfamily\fontsize{7.4}{8.6}\selectfont,
+        numbers=left,
+        numberstyle=\tiny\color{black!35},
+        numbersep=0.65em,
+        xleftmargin=2.55em,
+        xrightmargin=0.50em,
+        aboveskip=0.20em,
+        belowskip=0.06em,
+        emph={unique_ptr},
+        emphstyle=\bfseries\color{apiteal},
+        escapeinside={(*@}{@*)}
+      }
+\begin{lstlisting}
+#include <memory>
+long* codes(); double* groups();
+const char* text(); float* samples();
+std::unique_ptr<int> fresh(), parse(const char*);
+std::unique_ptr<int> average(float*), select(double&);
+std::unique_ptr<int> combine(const char*, long*);
+std::unique_ptr<int> schedule(const char*, long*, float*);
+
+int main(int argc, char** args) {
+  std::unique_ptr<int> b (*@\idecursor{motivation-cursor}@*)
+}
+\end{lstlisting}
+      \vspace{4.4em}
+    \end{beamercolorbox}
+    \onslide<1->
+
+    \begin{tikzpicture}[remember picture,overlay]
+      \only<3->{%
+        \node[
+          anchor=north west,
+          xshift=0.35em,
+          yshift=0.25em,
+          draw=black!24,
+          fill=white,
+          rounded corners=2pt,
+          inner sep=0.30em,
+          text=apiink
+        ] at (motivation-cursor) {%
+          \begin{minipage}{0.52\textwidth}
+            \fontsize{6.8}{8.0}\selectfont
+            \begingroup
+              \setlength{\fboxsep}{1.1pt}%
+              \colorbox{apiblue!12}{%
+                \makebox[\dimexpr\linewidth-2\fboxsep\relax][l]{%
+                  \strut{\ttfamily\bfseries\color{apiblue}= fresh();}%
+                }%
+              }%
+            \endgroup
+            \par\makebox[\linewidth][l]{\strut\ttfamily
+              = average(samples());}
+            \par\makebox[\linewidth][l]{\strut\ttfamily
+              = parse(text());}
+            \par\makebox[\linewidth][l]{\strut\ttfamily
+              = select(groups()[argc]);}
+            \par\makebox[\linewidth][l]{\strut\ttfamily
+              = combine(text(), codes());}
+            \par\makebox[\linewidth][l]{\strut\ttfamily
+              = schedule(text(), codes(), samples());}
+          \end{minipage}%
+        };
+      }
+    \end{tikzpicture}
+
   \end{frame}
 % -------------------------------------------------
 
