@@ -4,6 +4,22 @@
 
 \documentclass[11pt]{beamer}
 
+\usepackage{colortbl}
+\definecolor{apiink}{RGB}{34,48,68}
+\definecolor{apiblue}{RGB}{45,88,154}
+\definecolor{apiteal}{RGB}{36,117,112}
+\definecolor{apigreen}{RGB}{48,124,82}
+\definecolor{apiamber}{RGB}{166,105,24}
+\definecolor{apired}{RGB}{161,66,66}
+\setbeamercolor{apisurface}{fg=apiink,bg=apiblue!7}
+\setbeamercolor{apiprojection}{fg=apiink,bg=black!3}
+\setbeamercolor{apiguarantee}{fg=apiink,bg=apiteal!9}
+\setbeamercolor{apiwarning}{fg=apiink,bg=apiamber!10}
+\setbeamertemplate{navigation symbols}{}
+\setbeamertemplate{footline}{}
+\arrayrulecolor{black!20}
+\hypersetup{colorlinks=true,urlcolor=apiblue,linkcolor=apiblue}
+
 \usepackage{amsmath}
 \usepackage{pgfplots}
 \pgfplotsset{compat=1.18}
@@ -116,7 +132,7 @@
 % Beamer's sans-math setup centers accents on the glyph box, which leaves
 % hats visibly left of slanted Latin capitals.  Add a small optical skew;
 % reserve plain \widehat for wider expressions such as \widehat{\mathcal T}.
-\newcommand{\tstate}[1]{\skew{2}\widehat{#1}\,}
+\newcommand{\tstate}[1]{\skew{2}\widehat{#1}}
 
 % Zero-width IDE caret with a remembered anchor for completion popups.
 \newcommand{\idecursor}[1]{%
@@ -192,7 +208,6 @@ int main(int argc, char** args) {
   std::unique_ptr<int> b (*@\idecursor{motivation-cursor}@*)
 }
 \end{lstlisting}
-      \vspace{4.4em}
     \end{beamercolorbox}
     \onslide<1->
 
@@ -201,7 +216,7 @@ int main(int argc, char** args) {
         \node[
           anchor=north west,
           xshift=0.35em,
-          yshift=0.25em,
+          yshift=0.5em,
           draw=black!24,
           fill=white,
           rounded corners=2pt,
@@ -214,26 +229,116 @@ int main(int argc, char** args) {
               \setlength{\fboxsep}{1.1pt}%
               \colorbox{apiblue!12}{%
                 \makebox[\dimexpr\linewidth-2\fboxsep\relax][l]{%
-                  \strut{\ttfamily\bfseries\color{apiblue}= fresh();}%
+                  \strut{\ttfamily\bfseries\color{apiblue};}%
                 }%
               }%
             \endgroup
-            \par\makebox[\linewidth][l]{\strut\ttfamily
-              = average(samples());}
-            \par\makebox[\linewidth][l]{\strut\ttfamily
-              = parse(text());}
-            \par\makebox[\linewidth][l]{\strut\ttfamily
-              = select(groups()[argc]);}
-            \par\makebox[\linewidth][l]{\strut\ttfamily
-              = combine(text(), codes());}
-            \par\makebox[\linewidth][l]{\strut\ttfamily
-              = schedule(text(), codes(), samples());}
+            \par\makebox[\linewidth][l]{\strut\ttfamily = fresh();}
+            \par\makebox[\linewidth][l]{\strut\ttfamily = average(samples());}
+            \par\makebox[\linewidth][l]{\strut\ttfamily = parse(text());}
+            \par\makebox[\linewidth][l]{\strut\ttfamily = select(groups()[argc]);}
+            \par\makebox[\linewidth][l]{\strut\ttfamily = combine(text(), codes());}
+            \par\makebox[\linewidth][l]{\strut\ttfamily = schedule(text(), codes(), samples());}
           \end{minipage}%
         };
       }
     \end{tikzpicture}
-
   \end{frame}
+
+  \begin{frame}[t]{Existing work on type-safe code completion}
+    \newcommand{\yes}{\begingroup\setlength{\fboxsep}{0.85pt}\colorbox{apigreen!13}{\makebox[1.20em][c]{\textcolor{apigreen}{\bfseries\checkmark}}}\endgroup}
+    \newcommand{\maybe}{\begingroup\setlength{\fboxsep}{0.85pt}\colorbox{apiamber!14}{\makebox[1.20em][c]{\textcolor{apiamber}{\bfseries$\sim$}}}\endgroup}
+    \newcommand{\no}{\begingroup\setlength{\fboxsep}{0.85pt}\colorbox{black!5}{\makebox[1.20em][c]{\textcolor{black!36}{\bfseries--}}}\endgroup}
+    \newcommand{\gen}{\begingroup\setlength{\fboxsep}{0.85pt}\colorbox{apiblue!10}{\makebox[2.00em][c]{\textcolor{apiblue}{\bfseries gen}}}\endgroup}
+    \newcommand{\post}{\begingroup\setlength{\fboxsep}{0.85pt}\colorbox{apiteal!10}{\makebox[2.00em][c]{\textcolor{apiteal}{\bfseries filt}}}\endgroup}
+
+    \noindent\hspace*{-0.66cm}%
+    \begin{minipage}{\dimexpr\textwidth+1.32cm\relax}
+      {\fontsize{6}{6.65}\selectfont
+        \begin{beamercolorbox}[rounded=true,sep=0.28em,wd=\linewidth]{apisurface}
+      \textbf{Legend.}\enspace
+      \yes\ by construction\quad
+      \gen\ generation-time \quad
+      \post\ post-generation\quad
+      \maybe\ partial / empirical\quad
+      \no\ absent / not claimed
+        \end{beamercolorbox}}
+
+    \vspace{0.12em}
+    \begin{beamercolorbox}[rounded=true,sep=0.22em,wd=\linewidth]{apiprojection}
+      \hspace{-0.3cm}
+      \setlength{\tabcolsep}{1pt}
+      \renewcommand{\arraystretch}{1.09}
+      {\fontsize{6.3}{6.65}\selectfont
+        \begin{tabular}{@{}L{0.170\linewidth}*{7}{C{0.112\linewidth}}@{}}
+          \rowcolor{black!2}
+          \textbf{Lens} &
+          \multicolumn{2}{c}{\cellcolor{apiteal!10}\textbf{Type-directed search}} &
+          \cellcolor{apiblue!8}\textbf{Spec-driven} &
+          \multicolumn{2}{c}{\cellcolor{apiblue!8}\textbf{Learned completion}} &
+          \multicolumn{2}{c}{\cellcolor{apiamber!11}\textbf{Constrained decoding}} \\
+          \hline
+          \rowcolor{black!4}
+          \textbf{Feature} &
+          \href{https://doi.org/10.1145/2254064.2254098}{\textbf{Perelman'12}} &
+          \href{https://doi.org/10.1145/2491956.2462192}{\textbf{Gvero'13}} &
+          \href{https://doi.org/10.1145/3527329}{\textbf{Pelsmaeker'22}} &
+          \href{https://doi.org/10.1145/2594291.2594321}{\textbf{Raychev'14}} &
+          \href{https://arxiv.org/pdf/2405.08704}{\textbf{Semenkin'24}} &
+          \href{https://arxiv.org/pdf/2402.17988}{\textbf{Melcer'24}} &
+          \href{https://doi.org/10.1145/3729274}{\textbf{M\"undler'25}} \\
+          \hline
+          Language & C\# & Scala & Statix DSL & Java & Python+JVM+JS & Python 3 & TypeScript \\
+          Output unit & expression & expression & fragment & call sequence & full line & FIM span & function \\
+          Query form & partial expr & typed hole & caret & holes & left prefix & FIM context & prompt \\
+          Candidate set & type graph & typed terms & Statix terms & API traces & LLM output & parser states & typed tokens \\
+          Ranking signal & type distance & usage priors & solver order & n-gram/RNN & local LM & host LM & host LM \\
+          Fill model & hole & hole & cursor & cursor & cursor & FIM & prefix \\
+          Learned signal & \no & \maybe & \no & \yes & \yes & \yes & \yes \\
+          Filter timing & search & search & solver & rank only & \post & \gen & \gen \\
+          Syntax safe & \yes & \yes & \yes & \maybe & \post & \gen & \gen \\
+          Type safe & \yes & \yes & \yes & \maybe & \no & \no & \gen \\
+          Statement-scale & \no & \no & \maybe & \maybe & \yes & \yes & \yes \\
+          Parametricity & \no & \no & \yes & \no & \no & \maybe & \maybe \\
+          Candidate complete & \maybe & \yes & \yes & \no & \no & \no & \no \\
+          Usable tool? & VS proto & Eclipse & Spoofax & prototype & IntelliJ Platform & parser & Git repo \\
+          Public code/tool &
+          \no &
+          \href{https://github.com/ikuraj/scala-ide-insynth-integration}{code} &
+          \href{https://zenodo.org/records/6367565}{artifact} &
+          \no &
+          \href{https://plugins.jetbrains.com/plugin/14823-full-line-code-completion}{plugin} &
+          \href{https://github.com/amazon-science/incremental-parsing}{code} &
+          \href{https://github.com/eth-sri/type-constrained-code-generation}{code} \\
+        \end{tabular}}
+    \end{beamercolorbox}
+
+    \vspace{0.11em}
+    \begin{beamercolorbox}[rounded=true,sep=0.26em,wd=\linewidth]{apiwarning}
+      {\fontsize{8}{7}\selectfont
+      \textcolor{apiamber}{\bfseries Gap.}
+      Prior work tends to trade off probabilistic ranking, statement-scale completion, and
+      formal type guarantees but does not enumerate a ranked language of complete typed statements.}
+    \end{beamercolorbox}
+
+    \vspace{0.08em}
+    {\fontsize{4.75}{5.30}\selectfont\color{black!57}
+      \begin{minipage}[t]{0.332\linewidth}
+        \href{https://doi.org/10.1145/2254064.2254098}{[1] Perelman et al., PLDI'12}\par
+        \href{https://doi.org/10.1145/2491956.2462192}{[2] Gvero et al., PLDI'13} / \href{https://github.com/ikuraj/scala-ide-insynth-integration}{code}\par
+        \href{https://doi.org/10.1145/3527329}{[3] Pelsmaeker et al., OOPSLA'22} / \href{https://zenodo.org/records/6367565}{artifact}
+      \end{minipage}\hfill
+      \begin{minipage}[t]{0.332\linewidth}
+        \href{https://doi.org/10.1145/2594291.2594321}{[4] Raychev et al., PLDI'14} / \href{https://www.sri.inf.ethz.ch/research/plml}{BigCode}\par
+        \href{https://arxiv.org/pdf/2405.08704}{[5] Semenkin et al., arXiv:2405.08704} / \href{https://plugins.jetbrains.com/plugin/14823-full-line-code-completion}{plugin}
+      \end{minipage}\hfill
+      \begin{minipage}[t]{0.332\linewidth}
+        \href{https://arxiv.org/pdf/2402.17988}{[6] Melcer et al., arXiv:2402.17988} / \href{https://github.com/amazon-science/incremental-parsing}{code}\par
+        \href{https://doi.org/10.1145/3729274}{[7] M\"undler et al., PLDI'25} / \href{https://github.com/eth-sri/type-constrained-code-generation}{code}
+      \end{minipage}}
+    \end{minipage}
+  \end{frame}
+
 % -------------------------------------------------
 
   \begin{frame}{How long are typical source code statements?}
@@ -248,7 +353,7 @@ int main(int argc, char** args) {
           ytick={0,20,40,60,80},
           ylabel={Mean lexical tokens},
           ylabel style={font=\small},
-          symbolic x coords={Java,Kotlin,C,C++,C\#,Rust},
+          symbolic x coords={Java,Kotlin,C,C++,C\#,Rust,Go},
           xtick=data,
           xticklabel style={font=\small},
           yticklabel style={font=\small},
@@ -298,6 +403,7 @@ int main(int argc, char** args) {
             (C++,    10.530586) +- (0,0.526006)
             (C\#,    12.413997) +- (0,1.753571)
             (Rust,   36.094937) +- (0,25.740138)
+            (Go,      9.169018) +- (0,0.688426)
           };
 
 % Number of sampled files.
@@ -313,17 +419,68 @@ int main(int argc, char** args) {
           at (axis cs:Rust,0) [yshift=-18pt] {$n=100$};
           \node[font=\scriptsize, text=black!65, anchor=north]
           at (axis cs:C\#,0) [yshift=-18pt] {$n=100$};
+          \node[font=\scriptsize, text=black!65, anchor=north]
+          at (axis cs:Go,0) [yshift=-18pt] {$n=35$};
+        \end{axis}
+      \end{tikzpicture}
+
+      \caption{Whiskers are 95\% CIs over sampled files. Statements are Tree-sitter statement nodes with comments and whitespace ignored. Samples are random GitHub files $>20$kb; per-language sample sizes are shown below.}
+    \end{figure}
+  \end{frame}
+
+  \begin{frame}{How large are programming language grammars?}
+    \begin{figure}
+      \hspace{-1cm} \begin{tikzpicture}
+        \begin{axis}[
+          width=\textwidth,
+        height=0.60\textheight,
+        ymin=0,
+        ymax=5000,
+        ytick={0,1000,2000,3000,4000,5000},
+        ylabel={$|G|$},
+        ylabel style={font=\small},
+        symbolic x coords={Java,Kotlin,C,Cpp,CSharp,Rust,Go},
+        xtick=data,
+        xticklabels={Java,Kotlin,C,C++,C\#,Rust,Go},
+        xticklabel style={font=\small},
+        yticklabel style={font=\small,/pgf/number format/1000 sep={,}},
+        scaled y ticks=false,
+        axis x line*=bottom,
+        axis y line*=left,
+        axis line style={black!55},
+        tick style={black!55},
+        ymajorgrids=true,
+        grid style={black!10},
+        tick align=outside,
+        bar width=9mm,
+        enlarge x limits=0.10,
+        ]
+
+          \addplot+[
+          ybar,
+          fill=blue!28!gray,
+          draw=blue!45!black,
+          line width=0.45pt,
+          ] coordinates {
+            (Java,1987)
+            (Kotlin,1854)
+            (C,2563)
+            (Cpp,4689)
+            (CSharp,3525)
+            (Rust,3086)
+            (Go,1424)
+          };
 
         \end{axis}
       \end{tikzpicture}
 
-      \caption{Whiskers are 95\% CIs over sampled files. Statements are Tree-sitter statement nodes with comments and whitespace ignored. Sample size is 100 random GitHub files per language $>20$kb.}
+      \caption{Grammar size is computed from the Tree-sitter reference CFGs, where $|G|$ is defined as $\sum_{w\in V}\sum_{(w\rightarrow \sigma) \in P}|w\sigma|$.}
     \end{figure}
   \end{frame}
 
-
   \begin{frame}[t]{Correctness criterion: what must the CFG preserve?}
     \vspace{0.2cm}
+    \visible<1->{%
     \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\textwidth]{apisurface}
       {\small\bfseries\color{apiblue}Surface fragment $G'$}
       \hfill
@@ -341,10 +498,12 @@ int main(int argc, char** args) {
       $
       \vspace{0.15em}
     \end{beamercolorbox}
+    }
 
     \vspace{-0.3em}
     \begin{columns}[T,onlytextwidth]
       \column{0.48\textwidth}
+        \visible<2->{%
         \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\linewidth]{apiprojection}
           {\small\bfseries\color{apiblue}1. Surface projection $\pi_\Sigma$}
 
@@ -360,7 +519,9 @@ int main(int argc, char** args) {
           \vspace{0.3em}
           {\scriptsize checks that the shape belongs to $G_0$}
         \end{beamercolorbox}
+        }
       \column{0.48\textwidth}
+        \visible<3->{%
         \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\linewidth]{apiprojection}
           {\small\bfseries\color{apiteal}2. Typed projection $\Pi_\Gamma$}
 
@@ -371,362 +532,509 @@ int main(int argc, char** args) {
           \vspace{0.3em}
           \resizebox{0.88\linewidth}{!}{$
             \Pi_\Gamma(\code{x.f(y)})\ni
-              \exprnt{\tstate{X}}\texttt{.f(}\exprnt{\tstate{Y}}\texttt{)}
+              \exprnt{X\,}\texttt{.f(}\exprnt{Y\,}\texttt{)}
           $}
 
           \vspace{0.3em}
           {\scriptsize contains all and only well-typed terms}
         \end{beamercolorbox}
+        }
     \end{columns}
 
     \vspace{0.4em}
+    \visible<4->{%
     \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\textwidth]{apiguarantee}
       {\small\bfseries\color{apiteal}Correctness criterion}
 
       \vspace{0.15em}
 
-      {\footnotesize For a target language $L$ with surface fragment $G'$, construct $G_\Gamma$ satisfying:}
+      {\footnotesize For a target language $L$ with surface fragment $G'$, construct $G_\Gamma$ satisfying}
 
       \vspace{0.5em}
       \hspace{0.6cm}\resizebox{0.91\linewidth}{!}{$
         \pi_\Sigma(\sigma) \in \mathcal{L}(G')
         \quad\Longleftrightarrow\quad
-        \Gamma \vdash \Pi_\Gamma(\sigma) \in \mathcal{L}(G_\Gamma)
+        \Gamma \vdash \Pi_\Gamma(\sigma) \subset \mathcal{L}(G_\Gamma)
       $}
 
       \vspace{0.4em}
-      {\footnotesize for all source code statements $\sigma$ accepted by the reference compiler for $L$.}
+      {\footnotesize for all and only source statements $\sigma$ accepted by a reference compiler for $L$.}
 
     \end{beamercolorbox}
+    }
   \end{frame}
 
-  \begin{frame}[t,fragile]{Grammar Modularization}
+  \begin{frame}[t,fragile]{Grammar modularization}
     \lstset{style=grammarcpp}
-    \setlength{\tabcolsep}{0pt}
-    \renewcommand{\arraystretch}{0.95}
-    \fontsize{8.0}{9.2}\selectfont
-    \newcommand{\codecursor}{%
-      \makebox[0pt][l]{%
-        \smash{\raisebox{-0.18ex}{\rule{0.55pt}{3ex}}}%
-      }%
+    \newcommand{\codecursor}{{%
+      \ttfamily\fontsize{7.4}{8.6}\selectfont
+      \idecursor{modularization-cursor}%
+    }}
+    % Both sides use the same baseline grid: each production therefore sits
+    % directly across from the source line that contributes it.
+    \newcommand{\contextnumber}[1]{%
+      \makebox[1.35em][r]{\fontsize{5.4}{12.2}\selectfont\color{black!35}#1}%
+      \hspace{0.45em}%
     }
-    \hspace*{-0.06\textwidth}%
-    \begin{tabular}{@{}
-        >{\raggedright\arraybackslash
-      \leavevmode\lower1.5ex\hbox\bgroup}
-      p{0.55\textwidth}
-        <{\egroup}
-      @{\hspace{0.012\textwidth}%
-      {\color{grammardivider}\vrule width 0.45pt}%
-      \hspace{0.012\textwidth}}
-        >{\raggedright\arraybackslash}p{0.55\textwidth}
-      @{}
+    \newcommand{\mindent}[1]{%
+      \noindent\hspace*{-0.3cm}\hspace*{-0.45em}%
+      \makebox[\linewidth][l]{\smash{#1}}\strut\par
     }
-      \multicolumn{1}{@{}l}{\scriptsize\bfseries C++ context}
-      & {\scriptsize\bfseries Grammar contribution} \\[0.25ex]
-      \cline{1-1}\cline{2-2}
 
-      \lstinline!// Filetype: *.cpp! & \grow<1->{G_{\gsub{C++}}\:\cup} \\
-      \lstinline!#include <string>! & \grow<2->{G_{\gsub{<string>}}\:\cup} \\
-      \lstinline!#include <vector>! & \grow<3->{G_{\gsub{<vector>}}\:\cup} \\
-      \lstinline!#include "org/fizz.hpp"! & \grow<4->{G_{\gsub{org/fizz.hpp}}\:\cup} \\
-      \lstinline!#include "com/buzz.hpp"! & \grow<5->{G_{\gsub{com/buzz.hpp}}\:\cup} \\
-      \lstinline!using std::string;! & \grow<6->{%
-        \{\,\mathsf{Type} \to \code{string}\,\}\:\cup
-      } \\
-      \lstinline!// ...! & \grow<7->{\cdots} \\
-      \lstinline!int fizz() { return 3; }! & \grow<8->{%
-        \{\,\mathsf{Int}\to\code{fizz()},\;
-        \mathsf{S}\to\code{fizz();}\,\}\:\cup
-      } \\
-      \lstinline!string buzz(string s) { return s; }! & \grow<9->{%
-        \{\,\mathsf{Str}\to
-        \code{buzz( }\mathsf{Str}\code{ )},\;
-        \mathsf{S}\to
-        \code{buzz( }\mathsf{Str}\code{ );}\,\}\:\cup\hspace{-5cm}
-      } \\
-      \lstinline!// ...! & \grow<10->{\cdots} \\
-      \lstinline!int main(int argc, char* args[]) {! & \grow<11->{%
-        \{\,\mathsf{Int}\to \code{argc},
-        \,\mathsf{CharPtr}\to
-        \code{args[ }\mathsf{Int}\code{ ]}\,\}\:\cup
-      } \\
-      \lstinline!  string bang = "...";! & \grow<12->{%
-        \{\,\mathsf{Str}\to\code{bang}\,\} \color{black!30}{\,\:\rightarrow G_\Gamma}
-      } \\
-      \lstinline!  !\codecursor & \grow<13->{\mathcal{L}(G_{\Gamma})} \\
-      \lstinline!}! & \\
-    \end{tabular}
-  \end{frame}
-
-  \begin{frame}[t]{Monomorphization I: ground rules}
-    \vspace{-0.45em}
-    \begin{beamercolorbox}[rounded=true,sep=0.3em,wd=\textwidth]{apisurface}
-      \centering\scriptsize
-      \textcolor{apiblue}{\bfseries State $\to$ nonterminal;}\quad
-      API text $\to$ terminal;\quad validated AST node $\to$ production.
-    \end{beamercolorbox}
-
-    \vspace{0.4em}
+    \vspace{-0.15em}
     \begin{columns}[T,onlytextwidth]
-      \column{0.485\textwidth}
-        \begin{beamercolorbox}[rounded=true,sep=0.35em,wd=\linewidth]{apiruleblue}
-          {\small\bfseries\color{apiblue}Monomorphic member call}
+      \hspace{-0.5cm}\column{0.50\textwidth}
+        {\scriptsize\bfseries C++ context}
 
-          \vspace{0.05em}
-          \centering
-          \resizebox{0.82\linewidth}{!}{$\displaystyle
-            \frac{
-              \substack{
-                \Delta(\tstate{C}\!::\!f)=(\tstate{A})\to\tstate{R}\\[-0.1em]
-                \Delta;\Gamma\vdash e_0:\tstate{C}\quad
-                \Delta;\Gamma\vdash e_1:\tstate{A}
-              }
-            }{
-              \Delta;\Gamma\vdash e_0\mathtt{.f(}e_1\mathtt{)}:\tstate{R}
-            }
-          $}
-
-          \vspace{0.1em}
-          {\scriptsize becomes}
-          \[
-            \boxed{\exprnt{\tstate{R}}\to
-              \exprnt{\tstate{C}}\code{. f (}\exprnt{\tstate{A}}\code{)}}
-          \]
-          \vspace{-0.55em}
-          {\scriptsize\bfseries Example}\quad
-          {\fontsize{6.8}{8.2}\selectfont\ttfamily C c; A a; c.f(a);}
+        \vspace{0.18em}
+        \begingroup
+        \setlength{\parindent}{0pt}
+        \begin{beamercolorbox}[rounded=true,sep=0.35em,wd=\linewidth,vmode]{apieditor}
+          \begingroup
+          \lstset{%
+            style=grammarcpp,
+            basicstyle=\ttfamily\fontsize{6.4}{12.2}\selectfont
+          }
+          \fontsize{6.4}{12.2}\selectfont
+          \setlength{\parindent}{0pt}
+          \setlength{\parskip}{0pt}
+          \contextnumber{1}\lstinline!// Filetype: *.cpp!\strut\par
+          \contextnumber{2}\lstinline!#include <string>!\strut\par
+          \contextnumber{3}\lstinline!#include <vector>!\strut\par
+          \contextnumber{4}\lstinline!#include "org/fizz.hpp"!\strut\par
+          \contextnumber{5}\lstinline!#include "com/buzz.hpp"!\strut\par
+          \contextnumber{6}\lstinline!using std::string;!\strut\par
+          \contextnumber{7}\lstinline!// ...!\strut\par
+          \contextnumber{8}\lstinline!int fizz() { return 3; }!\strut\par
+          \contextnumber{9}\lstinline!string buzz(string s) { return s; }!\strut\par
+          \contextnumber{10}\lstinline!// ...!\strut\par
+          \contextnumber{11}\lstinline!int main(int argc, char* args[]) {!\strut\par
+          \contextnumber{12}\lstinline!  string bang = "...";!\strut\par
+          \contextnumber{13}\lstinline!  !\codecursor\strut\par
+          \contextnumber{14}\lstinline!}!\strut\par
+          \endgroup
         \end{beamercolorbox}
-      \column{0.485\textwidth}
-        \begin{beamercolorbox}[rounded=true,sep=0.35em,wd=\linewidth]{apirulegreen}
-          {\small\bfseries\color{apiteal}Resolved operator call}
+        \endgroup
 
-          \vspace{0.05em}
-          \centering
-          \resizebox{0.82\linewidth}{!}{$\displaystyle
-            \frac{
-              \substack{
-                \Delta;\Gamma\vdash e_1:\tstate{T}_1\quad
-                \Delta;\Gamma\vdash e_2:\tstate{T}_2\\[-0.1em]
-                \delta^{\Delta}_{+}(\tstate{T}_1,\tstate{T}_2)=\tstate{R}
-              }
-            }{
-              \Delta;\Gamma\vdash e_1\mathtt{+}e_2:\tstate{R}
-            }
-          $}
-
-          \vspace{0.1em}
-          {\scriptsize becomes}
-          \[
-            \boxed{\exprnt{\tstate{R}}\to
-              \exprnt{\tstate{T}_1}\code{+}\exprnt{\tstate{T}_2}}
-          \]
-          \vspace{-0.55em}
-          {\scriptsize\bfseries Example}\quad
-          {\fontsize{6.8}{8.2}\selectfont\ttfamily Vec u, v; u + v;}
-        \end{beamercolorbox}
-    \end{columns}
-
-    \vspace{0.05em}
-    \begin{beamercolorbox}[rounded=true,sep=0.2em,wd=\textwidth]{apiwarning}
-      \centering
-      \resizebox{0.92\linewidth}{!}{$
-        \mathrm{AddClosed}(T)\;\Longleftrightarrow\;
-          \mathrm{base}\!\left(\delta^{\Delta}_{+}(\tstate{T},\tstate{T})\right)=T
-        \quad\overset{\text{erase state}}{\Longrightarrow}\quad
-        \boxed{\exprnt{T}\to\exprnt{T}\code{+}\exprnt{T}}
-      $}
-
-      \vspace{0.02em}
-      {\tiny Type-level mnemonic only; $G_0^+$ preserves C++ precedence/left associativity,
-        and mixed states use $\delta_+^\Delta$.}
-    \end{beamercolorbox}
-  \end{frame}
-
-  \begin{frame}[t]{Monomorphization II: subtype calls}
-    \vspace{-0.45em}
-    \begin{beamercolorbox}[rounded=true,sep=0.35em,wd=\textwidth]{apisurface}
-      \centering\scriptsize
-      $D<:_\Delta B$ is public, unambiguous inheritance;
-      whole-call resolution retains cv/ref/category state and conversions.
-    \end{beamercolorbox}
-
-    \vspace{0.4em}
-    \begin{columns}[T,onlytextwidth]
       \column{0.47\textwidth}
-        \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\linewidth]{apiruleblue}
-          {\small\bfseries\color{apiblue}Resolve the subtype call}
+        {\scriptsize\hspace*{-0.3cm}\hspace*{-0.38em}\bfseries Grammar contribution}
 
-          \centering
-          \vspace{0.35em}
-          \resizebox{0.96\linewidth}{!}{$\displaystyle
-            \frac{
-              \substack{
-                D<:_\Delta B
-                \quad \Delta;\Gamma\vdash e:\tstate{D}\\[-0.1em]
-                \mathrm{resolve}_{\Delta}(f;\tstate{D})=((\tstate{B})\to\tstate{R})
-              }
-            }{
-              \Delta;\Gamma\vdash f(e):\tstate{R}
-            }\;\rulename{Inv$_{<:}$}
-          $}
-
-          \vspace{0.3em}
-          {\scriptsize\color{apiblue}
-            No global $e:B$ rule: invocation consumes the subtype fact.}
-
-          \vspace{0.35em}
-          {\fontsize{7.4}{8.8}\selectfont
-          \begin{tabular}{@{}l@{\hspace{0.7em}}>{\ttfamily}l@{}}
-            \bfseries Example & struct Animal \{\}; \\
-              & struct Dog : Animal \{\}; \\
-              & int age(const Animal\&); \\
-              & Dog d; age(d); \\
-          \end{tabular}}
-          \vspace{0.8em}
-        \end{beamercolorbox}
-      \column{0.49\textwidth}
-        \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\linewidth]{apirulegreen}
-          {\small\bfseries\color{apiteal}Emit the exact surface call}
-
-          \vspace{0.35em}
-          \centering
-          \resizebox{0.94\linewidth}{!}{$\displaystyle
-            \frac{
-              \mathrm{resolve}_{\Delta}(f;\tstate{D})=((\tstate{B})\to\tstate{R})
-            }{
-              \bigl(\exprnt{\tstate{R}}\to
-                \code{f (}\exprnt{\tstate{D}}\code{)}\bigr)\in P_{\mathrm{api},b}
-            }\;\rulename{Inv$_\varphi$}
-          $}
-
-          \vspace{0.35em}
-          {\scriptsize State hats are elided below.}
-          \[
-            \boxed{\exprnt{\mathtt{int}}\to
-              \code{age (}\exprnt{\mathtt{Dog}}\code{)}}
-          \]
-          \vspace{-0.2em}
-          \resizebox{0.84\linewidth}{!}{$
-            \begin{aligned}
-              \exprnt{\mathtt{int}}&\Rightarrow
-                \code{age (}\exprnt{\mathtt{Dog}}\code{)},\\[-0.05em]
-              \code{age (}\exprnt{\mathtt{Dog}}\code{)}
-                &\in\Pi_\Gamma(\texttt{age(d)}).
-            \end{aligned}
-          $}
-        \end{beamercolorbox}
+        \vspace{0.18em}
+        \begingroup
+        \fontsize{6.6}{12.2}\selectfont
+        \setlength{\parindent}{0pt}
+        \setlength{\parskip}{0pt}
+        \vspace{1.38em}
+        \mindent{\grow<1->{G_{\gsub{C++}}\:\cup}}
+        \mindent{\grow<2->{G_{\gsub{<string>}}\:\cup}}
+        \mindent{\grow<3->{G_{\gsub{<vector>}}\:\cup}}
+        \mindent{\grow<4->{G_{\gsub{org/fizz.hpp}}\:\cup}}
+        \mindent{\grow<5->{G_{\gsub{com/buzz.hpp}}\:\cup}}
+        \mindent{\grow<6->{%
+          \{\,\mathsf{Type} \to \code{string}\,\}\:\cup
+        }}
+        \mindent{\grow<7->{\cdots}}
+        \mindent{\grow<8->{%
+          \{\,\mathsf{Int}\to\code{fizz()},\;
+          \mathsf{S}\to\code{fizz();}\,\}\:\cup
+        }}
+        \mindent{\grow<9->{%
+          \{\,\mathsf{Str}\to
+          \code{buzz( }\mathsf{Str}\code{ )},\;
+          \mathsf{S}\to
+          \code{buzz( }\mathsf{Str}\code{ );}\,\}\:\cup\hspace{-5cm}
+        }}
+        \mindent{\grow<10->{\cdots}}
+        \mindent{\grow<11->{%
+          \{\,\mathsf{Int}\to \code{argc},
+          \,\mathsf{CharPtr}\to
+          \code{args[ }\mathsf{Int}\code{ ]}\,\}\:\cup
+        }}
+        \mindent{\grow<12->{%
+          \{\,\mathsf{Str}\to\code{bang}\,\} \color{black!30}{\,\:\rightarrow G_\Gamma}
+        }}
+        \mindent{\grow<13->{\mathcal{L}(G_{\Gamma})}}
+        \mindent{}
+        \endgroup
     \end{columns}
-
-    \vspace{0.05em}
-    \begin{beamercolorbox}[rounded=true,sep=0.2em,wd=\textwidth]{apiwarning}
-      \centering
-      {\scriptsize
-        \textbf{Whole-call resolution} preserves overloads, access,
-        cv/ref/category, and ambiguity.}
-
-      \vspace{0.05em}
-      {\scriptsize
-        $\mathtt{Dog}<:\mathtt{Animal}$ does not lift through
-        $\mathtt{vector}\langle\cdot\rangle$ (class-template invariance).}
-    \end{beamercolorbox}
   \end{frame}
 
-  \begin{frame}[t]{Monomorphizing templates}
-    \vspace{-0.55em}
-    \begin{columns}[T,onlytextwidth]
-      \column{0.59\textwidth}
-        \begin{beamercolorbox}[rounded=true,sep=0.3em,wd=\linewidth]{apiruleblue}
-          {\small\bfseries\color{apiblue}Proposed C++ grounding}
+  \begin{frame}[t,fragile]{Nominal typing judgements}
+    \vspace{0.2cm}
+    \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\textwidth]{apisurface}
+      {\small\bfseries\color{apiblue}Context}
+      \hfill
+      {\footnotesize $\Gamma$ contains all declarations visible at the cursor}
 
-          \centering
-          \vspace{0.05em}
-          \resizebox{0.95\linewidth}{!}{$\displaystyle
-            \frac{
-              \substack{
-                f:\forall\bar\alpha.\,C(\bar\alpha)\Rightarrow
-                  (\bar\tau)\to\rho\in\Delta\\[-0.1em]
-                \operatorname{types}(f_\theta,\bar q,q_R)
-                  \subseteq\widehat{\mathcal{T}}_b
-                \quad C\theta\\[-0.1em]
-                \operatorname{oracle}_{\mathrm{C++}}
-                  (\mathtt{f(}\bar e:\bar q\mathtt{)})=q_R
-              }
-            }{
-              f_{\theta,\bar q}:(\bar q)\to q_R\in\Delta_b
-            }\;\rulename{Mono}
-          $}
+      \vspace{0.25em}
+      \centering
+      {\fontsize{10.2}{12.8}\selectfont $\Gamma\vdash e:T$}
+      \qquad
+      {\footnotesize C++ accepts $e$ and gives it the concrete type $T$.}
+    \end{beamercolorbox}
+
+    \vspace{0.3em}
+    \begin{columns}[T,onlytextwidth]
+      \column{0.48\textwidth}
+        \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\linewidth,vmode]{apieditor}
+          {\small\bfseries\color{apiblue}C++ program}
 
           \vspace{0.15em}
-          {\scriptsize emit}\quad
-          \resizebox{0.64\linewidth}{!}{$
-            \boxed{\exprnt{q_R}\to
-              \code{f (}\exprnt{q_1}\code{,}\ldots
-              \code{,}\exprnt{q_n}\code{)}}.
-          $}
-
-          \vspace{0.05em}
-          {\tiny $q=(T,\mathrm{cv/ref},\kappa)$ is a complete expression state.}
+          \lstset{%
+            style=grammarcpp,
+            basicstyle=\ttfamily\fontsize{6.6}{7.3}\selectfont,
+            aboveskip=0.1em,
+            belowskip=0.05em
+          }
+\begin{lstlisting}
+struct Meter {
+  int read(int n) { return n + 1; }
+};
+int main() {
+  Meter m;
+  int n = 2;
+  int x = m.read(n);
+  return x + x;
+}
+\end{lstlisting}
         \end{beamercolorbox}
-      \column{0.38\textwidth}
-        \begin{beamercolorbox}[rounded=true,sep=0.3em,wd=\linewidth]{apiprojection}
-          {\small\bfseries\color{apiteal}Tiny C++ schema}
+
+      \column{0.49\textwidth}
+        \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\linewidth]{apiguarantee}
+          {\small\bfseries\color{apiteal}Embedding}
 
           \vspace{0.25em}
-          {\fontsize{6.6}{8.0}\selectfont\ttfamily
-            template<class T>\\
-            \hspace*{0.9em}requires AddClosed<T>\\
-            T twice(T x) \{\\
-            \hspace*{0.9em}return x + x;\\
-            \}}
-
-          \vspace{0.25em}
-          {\fontsize{7.2}{8.6}\selectfont
-            $\begin{aligned}
-              \mathtt{twice}&:\forall T.\\[-0.15em]
-              &\mathrm{AddClosed}(T)\Rightarrow T\to T
-            \end{aligned}$}
+          \centering
+          {\fontsize{8.0}{10.0}\selectfont
+          $\displaystyle
+            \begin{gathered}
+              \Gamma\vdash\mathtt{m.read(n)}:\mathtt{int}\\[-0.1em]
+              \Downarrow\\[-0.15em]
+              \exprnt{\mathtt{int}}\to
+                \exprnt{\mathtt{Meter}}\code{.read(}
+                \exprnt{\mathtt{int}}\code{)}\\[0.5em]
+              \Gamma\vdash\mathtt{x+x}:\mathtt{int}\\[-0.1em]
+              \Downarrow\\[-0.15em]
+              \exprnt{\mathtt{int}}\to
+                \exprnt{\mathtt{int}}\:\code{+}\:\exprnt{\mathtt{int}}
+            \end{gathered}
+          $}
         \end{beamercolorbox}
     \end{columns}
 
     \vspace{0.25em}
-    \begin{beamercolorbox}[rounded=true,sep=0.3em,wd=\textwidth]{apirulegreen}
-      \centering
-      {\small\bfseries\color{apiteal}Validate exact surface calls; keep accepted rows}
-
+    \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\textwidth]{apiguarantee}
+      {\small\bfseries\color{apiteal}Embedding}
       \vspace{0.1em}
-      \renewcommand{\arraystretch}{1.0}
-      \setlength{\tabcolsep}{0.4em}
-      \fontsize{7.4}{8.8}\selectfont
-      \begin{tabular}{@{}>{\raggedright\arraybackslash}p{0.24\textwidth}
-                         >{\centering\arraybackslash}p{0.15\textwidth}
-                         >{\raggedright\arraybackslash}p{0.49\textwidth}@{}}
-        \textbf{Substitution} & \textbf{C++ oracle} & \textbf{Production (states elided)} \\
-        \hline
-        $T\mapsto$ \texttt{int} & \textcolor{apigreen}{accepted} &
-          $\exprnt{\mathtt{int}}\to\code{twice (}\exprnt{\mathtt{int}}\code{)}$ \\
-        $T\mapsto$ \texttt{string} & \textcolor{apigreen}{accepted} &
-          $\exprnt{\mathtt{string}}\to\code{twice (}\exprnt{\mathtt{string}}\code{)}$ \\
-        $T\mapsto$ \texttt{vector<int>} & \textcolor{apired}{rejected} &
-          \textcolor{black!48}{omitted: no closed \texttt{operator+}} \\
-      \end{tabular}
-    \end{beamercolorbox}
-
-    \vspace{0.12em}
-    \begin{beamercolorbox}[rounded=true,sep=0.18em,wd=\textwidth]{apiwarning}
-      \centering
-      {\scriptsize
-        $b=\langle\text{arity},\text{nesting},\text{subtype depth},|\widehat{\mathcal{T}}_b|\rangle$.\quad
-        \textcolor{apigreen}{exact-call oracle $\Rightarrow$ sound for this schema.}\\[0.05em]
-        \textcolor{apiblue}{Complete metadata + exhaustive in-bound calls $\Rightarrow$
-        complete for this schema in $(G_0^+,\widehat{\mathcal{T}}_b,b)$.}}
+      {\scriptsize Substitute locally bound names with typed slots.}
     \end{beamercolorbox}
   \end{frame}
 
+  \begin{frame}[t,fragile]{Subtyping: tracking inheritance}
+    \vspace{0.2cm}
+    \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\textwidth]{apisurface}
+      {\small\bfseries\color{apiblue}Derived-to-base call}
+      \hfill
+      {\fontsize{9.4}{11.5}\selectfont
+        $\mathtt{Dog}<:\mathtt{Animal}$}
 
-\begin{frame}{Covariance and contravariance}
-% TODO: discuss [co/in/contra]variance, some good examples here: https://quuxplusone.github.io/blog/2019/01/20/covariance-and-contravariance/
-\end{frame}
+      \vspace{0.1em}
+      {\scriptsize \texttt{Dog} publicly inherits \texttt{Animal}, so \texttt{d}
+      may be passed to \texttt{age} as an \texttt{Animal}.}
+    \end{beamercolorbox}
+
+    \vspace{0.3em}
+    \begin{columns}[T,onlytextwidth]
+      \column{0.49\textwidth}
+        \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\linewidth,vmode]{apieditor}
+          {\small\bfseries\color{apiblue}C++ program}
+
+          \vspace{0.1em}
+          \lstset{%
+            style=grammarcpp,
+            basicstyle=\ttfamily\fontsize{6.7}{7.6}\selectfont,
+            aboveskip=0.1em,
+            belowskip=0.05em
+          }
+\begin{lstlisting}
+struct Animal {};
+struct Dog : Animal {};
+int age(Animal) { return 7; }
+int main() {
+  Dog d;
+  int x = age(d);
+  return x;
+}
+\end{lstlisting}
+        \end{beamercolorbox}
+
+      \column{0.48\textwidth}
+        \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\linewidth]{apiguarantee}
+          {\small\bfseries\color{apiteal}Embedding}
+
+          \vspace{0.55em}
+          \centering
+          {\fontsize{9.3}{11.8}\selectfont
+          $\displaystyle
+            \begin{gathered}
+              \Gamma\vdash\mathtt{age}:\mathtt{Animal}\rightarrow\mathtt{int}\\[-0.05em]
+              \Downarrow\\[-0.1em]
+              \exprnt{\mathtt{int}}\to
+                \code{age(}\exprnt{\mathtt{Dog}}\code{)}\\
+              \exprnt{\mathtt{int}}\to
+              \code{age(}\exprnt{\mathtt{Animal}}\code{)}
+            \end{gathered}
+          $}
+
+          \vspace{0.45em}
+          {\scriptsize \texttt{age} is contravariant in the input.}
+        \end{beamercolorbox}
+    \end{columns}
+
+    \vspace{0.25em}
+    \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\textwidth]{apiwarning}
+      {\small\bfseries\color{apiamber}Keep the check local}
+
+      \vspace{0.1em}
+      {\scriptsize Only track well-scoped subtypes and embed each subtype monomorphically.}
+    \end{beamercolorbox}
+  \end{frame}
+
+  \begin{frame}[t,fragile]{Templates: try concrete types, keep valid rules}
+    \vspace{0.2cm}
+    \begin{columns}[T,onlytextwidth]
+      \column{0.49\textwidth}
+        \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\linewidth,vmode]{apieditor}
+          {\small\bfseries\color{apiblue}C++ program}
+
+          \vspace{0.1em}
+          \lstset{%
+            style=grammarcpp,
+            basicstyle=\ttfamily\fontsize{6.1}{7.0}\selectfont,
+            aboveskip=0.1em,
+            belowskip=0.05em
+          }
+\begin{lstlisting}
+#include <string>
+#include <vector>
+using std::string;
+template<class T>
+T twice(T x) { return x + x; }
+int main() {
+  int i = 2; int n = twice(i);
+  string h = "ha"; string s = twice(h);
+  return n != 4 || s != "haha";
+}
+\end{lstlisting}
+        \end{beamercolorbox}
+
+      \column{0.48\textwidth}
+        \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\linewidth]{apiprojection}
+          {\small\bfseries\color{apiblue}Try three concrete types}
+
+          \vspace{0.45em}
+          {\footnotesize
+          \begin{tabular}{@{}l@{\hspace{0.8em}}l@{}}
+            \texttt{int} & \textcolor{apigreen}{\checkmark\ accepted}\\[0.35em]
+            \texttt{std::string} & \textcolor{apigreen}{\checkmark\ accepted}\\[0.35em]
+            \texttt{std::vector<int>} & \textcolor{apired}{$\times$ rejected}\\
+          \end{tabular}}
+
+          \vspace{0.55em}
+          {\scriptsize The vector case fails because \texttt{x + x}
+          is not defined for vectors.}
+        \end{beamercolorbox}
+    \end{columns}
+
+    \vspace{0.3em}
+    \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\textwidth]{apiguarantee}
+      {\small\bfseries\color{apiteal}Keep the successful rules}
+
+      \vspace{0.3em}
+      \centering
+      {\fontsize{7.6}{9.8}\selectfont
+      $\displaystyle
+        \begin{aligned}
+          \Gamma\vdash\mathtt{twice(i)}:\mathtt{int}
+            &\;\Longrightarrow\;
+            \exprnt{\mathtt{int}}\to
+              \code{twice(}\exprnt{\mathtt{int}}\code{)}\\[0.4em]
+          \Gamma\vdash\mathtt{twice(h)}:\gsub{std::string}
+            &\;\Longrightarrow\;
+            \exprnt{\gsub{std::string}}\to
+              \code{twice(}\exprnt{\gsub{std::string}}\code{)}
+        \end{aligned}
+      $}
+    \end{beamercolorbox}
+
+    \vspace{0.25em}
+    \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\textwidth]{apiguarantee}
+      \begin{minipage}[t]{0.45\linewidth}
+        {\scriptsize\textcolor{apigreen}{\bfseries Sound:}
+        every kept rule compiles.}
+      \end{minipage}
+      \hfill
+      \begin{minipage}[t]{0.52\linewidth}
+        {\scriptsize\textcolor{apiblue}{\bfseries Complete within this set:}
+        all three were tried.}
+      \end{minipage}
+    \end{beamercolorbox}
+  \end{frame}
+
+%  \begin{frame}[t,fragile]{Covariance and contravariance}
+%    \newcommand{\admits}{\mathrel{\leadsto_\Delta}}
+%
+%    \vspace{0.1cm}
+%    \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\textwidth]{apisurface}
+%      {\small\bfseries\color{apiblue}C++ admissibility---not nominal subtyping}
+%
+%      \vspace{0.3em}
+%      \centering
+%      {\fontsize{9.4}{12.0}\selectfont
+%      $\displaystyle
+%        q\admits q'
+%        \quad\Longleftrightarrow\quad
+%        \operatorname{accepts}_{\mathrm{C++}}(q\text{ where }q'\text{ is required})
+%      $}
+%
+%    \end{beamercolorbox}
+%
+%    \vspace{0.25em}
+%    \begin{columns}[T,onlytextwidth]
+%      \column{0.45\textwidth}
+%        \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\linewidth,vmode]{apieditor}
+%          {\small\bfseries\color{apiblue}Actual callable}
+%
+%          \vspace{0.2em}
+%          \lstset{%
+%            style=grammarcpp,
+%            basicstyle=\ttfamily\fontsize{6.7}{8.2}\selectfont,
+%            aboveskip=0.1em,
+%            belowskip=0.05em
+%          }
+%\begin{lstlisting}
+%struct Animal {};
+%struct Dog : Animal {};
+%Dog* rescue(Animal*);
+%\end{lstlisting}
+%
+%          \vspace{0.25em}
+%          \centering
+%          {\footnotesize $\mathtt{Animal*}\to\mathtt{Dog*}$}
+%        \end{beamercolorbox}
+%
+%      \column{0.52\textwidth}
+%        \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\linewidth]{apiguarantee}
+%          {\small\bfseries\color{apiteal}Required callable slot}
+%
+%          \vspace{0.35em}
+%          \centering
+%          {\fontsize{8.8}{11.4}\selectfont
+%          $\displaystyle
+%            \begin{gathered}
+%              \underbrace{A'\admits A}_{\text{contravariant input}}
+%              \qquad
+%              \underbrace{R\admits R'}_{\text{covariant result}}\\[0.1em]
+%              \Longrightarrow\quad
+%              \operatorname{fits}_\Delta(A\to R,\,A'\to R')
+%            \end{gathered}
+%          $}
+%
+%          \vspace{0.25em}
+%          {\fontsize{6.6}{8.1}\selectfont\ttfamily
+%            using Slot = std::function<Animal*(Dog*)>;\\
+%            Slot h = rescue; \textit{// accepted}}
+%        \end{beamercolorbox}
+%    \end{columns}
+%
+%    \vspace{0.25em}
+%    \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\textwidth]{apiwarning}
+%      {\small\bfseries\color{apiamber}C++ caveat}
+%      \hfill
+%      {\footnotesize callable compatibility $\neq$ function-pointer subtyping}
+%
+%      \vspace{0.2em}
+%      {\scriptsize \texttt{std::function} validates this wrapper construction.
+%      The CFG likewise emits only the exact contexts accepted by C++.}
+%    \end{beamercolorbox}
+%  \end{frame}
+
+  \begin{frame}[t,fragile]{Class templates: invariant by default}
+    \vspace{0.2cm}
+    \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\textwidth]{apisurface}
+      {\small\bfseries\color{apiblue}Subtyping does not lift automatically}
+
+      \vspace{0.35em}
+      \centering
+      {\fontsize{10.0}{13.0}\selectfont
+      $\displaystyle
+        \mathtt{Dog}<:\mathtt{Animal}
+        \quad\nRightarrow\quad
+        F\langle\mathtt{Dog}\rangle<:F\langle\mathtt{Animal}\rangle
+      $}
+
+      \vspace{0.2em}
+      {\scriptsize Class templates may optionally a constrained converting constructor.}
+    \end{beamercolorbox}
+
+    \vspace{0.35em}
+    \begin{columns}[T,onlytextwidth]
+      \column{0.49\textwidth}
+        \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\linewidth]{apiguarantee}
+          {\small\bfseries\color{apiteal}API-provided covariance}
+
+          \vspace{0.45em}
+          \lstset{%
+            style=grammarcpp,
+            basicstyle=\ttfamily\fontsize{6.4}{8.0}\selectfont,
+            aboveskip=0.1em,
+            belowskip=0.05em
+          }
+\begin{lstlisting}
+std::shared_ptr<Dog> pd;
+std::shared_ptr<Animal> pa = pd;
+// accepted
+\end{lstlisting}
+
+          \vspace{0.35em}
+          {\scriptsize \texttt{shared\_ptr} explicitly supplies the conversion.}
+        \end{beamercolorbox}
+
+      \column{0.48\textwidth}
+        \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\linewidth]{apiprojection}
+          {\small\bfseries\color{apiblue}Invariant specialization}
+
+          \vspace{0.45em}
+          \lstset{%
+            style=grammarcpp,
+            basicstyle=\ttfamily\fontsize{6.4}{8.0}\selectfont,
+            aboveskip=0.1em,
+            belowskip=0.05em
+          }
+\begin{lstlisting}
+std::vector<Dog*> ds;
+std::vector<Animal*> as = ds;
+// rejected
+\end{lstlisting}
+
+          \vspace{0.35em}
+          {\scriptsize The two \texttt{vector} specializations are unrelated.}
+        \end{beamercolorbox}
+    \end{columns}
+
+    \vspace{0.35em}
+    \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\textwidth]{apiguarantee}
+      {\small\bfseries\color{apiteal}CFG consequence}
+      \hfill
+      {\footnotesize enumerate ground states; validate exact contexts}
+
+      \vspace{0.2em}
+      {\scriptsize Never infer that $F\langle D\rangle$ converts to
+      $F\langle B\rangle$ merely from $D<:B$.
+      Emit a rule only when the C++ API supplies and accepts that conversion.}
+    \end{beamercolorbox}
+  \end{frame}
+
 
 \begin{frame}{Results: Size of generated CFGs}
     % TODO: discuss common APIs and the CFG sizes
