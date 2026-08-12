@@ -188,7 +188,7 @@
     \begin{itemize}
       \setlength{\itemsep}{0.18em}
       \item Construct a $\ell_\Gamma = \mathcal{L}(G_\Gamma)$ consisting of well-typed statements
-      \item No well-typed statement $\sigma \notin \ell_\Gamma$ or ill-typed statements $\err{\sigma} \in \ell_\Gamma$
+      \item No ill-typed statements $\err{\sigma} \in \ell_\Gamma$ or well-typed statements $\sigma \notin \ell_\Gamma$
       \item For any $\sigma \in \Sigma^*$ such that $\exists \tau.\sigma\tau \in \ell_\Gamma$, show $\tau$'s in shortlex order
     \end{itemize}}
 
@@ -259,7 +259,7 @@ int main(int argc, char** args) {
     \end{tikzpicture}
   \end{frame}
 
-  \begin{frame}[t]{Existing work on type-safe code completion}
+  \begin{frame}[t]{Prior work on type-safe code completion}
     \newcommand{\yes}{\begingroup\setlength{\fboxsep}{0.85pt}\colorbox{apigreen!13}{\makebox[1.20em][c]{\textcolor{apigreen}{\bfseries\checkmark}}}\endgroup}
     \newcommand{\maybe}{\begingroup\setlength{\fboxsep}{0.85pt}\colorbox{apiamber!14}{\makebox[1.20em][c]{\textcolor{apiamber}{\bfseries$\sim$}}}\endgroup}
     \newcommand{\no}{\begingroup\setlength{\fboxsep}{0.85pt}\colorbox{black!5}{\makebox[1.20em][c]{\textcolor{black!36}{\bfseries--}}}\endgroup}
@@ -268,27 +268,25 @@ int main(int argc, char** args) {
 
     \noindent\hspace*{-0.66cm}%
     \begin{minipage}{\dimexpr\textwidth+1.32cm\relax}
-      {\fontsize{6}{6.65}\selectfont
+      {\fontsize{6.2}{6.65}\selectfont
         \begin{beamercolorbox}[rounded=true,sep=0.28em,wd=\linewidth]{apisurface}
-      \textbf{Legend.}\enspace
-      \yes\ by construction\quad
-      \gen\ generation-time \quad
-      \post\ post-generation\quad
-      \maybe\ partial / empirical\quad
-      \no\ absent / not claimed
-        \end{beamercolorbox}}
+      \hspace{0.1cm}\textbf{Legend}\enspace
+      \yes\ by construction\:
+      \gen\ generation-time \:
+      \post\ post-generation\:
+      \maybe\ partial / empirical\:
+      \no\ absent / unclaimed\end{beamercolorbox}}
 
     \vspace{0.12em}
     \begin{beamercolorbox}[rounded=true,sep=0.22em,wd=\linewidth]{apiprojection}
-      \hspace{-0.3cm}
+      \hspace{-0.25cm}
       \setlength{\tabcolsep}{1pt}
       \renewcommand{\arraystretch}{1.09}
-      {\fontsize{6.3}{6.65}\selectfont
-        \begin{tabular}{@{}L{0.170\linewidth}*{7}{C{0.112\linewidth}}@{}}
+      {\fontsize{6.5}{9.3}\selectfont
+        \begin{tabular}{@{}L{0.140\linewidth}*{7}{C{0.112\linewidth}}@{}}
           \rowcolor{black!2}
           \textbf{Lens} &
-          \multicolumn{2}{c}{\cellcolor{apiteal!10}\textbf{Type-directed search}} &
-          \cellcolor{apiblue!8}\textbf{Spec-driven} &
+          \multicolumn{3}{c}{\cellcolor{apiteal!10}\textbf{Type-directed search}} &
           \multicolumn{2}{c}{\cellcolor{apiblue!8}\textbf{Learned completion}} &
           \multicolumn{2}{c}{\cellcolor{apiamber!11}\textbf{Constrained decoding}} \\
           \hline
@@ -296,27 +294,27 @@ int main(int argc, char** args) {
           \textbf{Feature} &
           \href{https://doi.org/10.1145/2254064.2254098}{\textbf{Perelman'12}} &
           \href{https://doi.org/10.1145/2491956.2462192}{\textbf{Gvero'13}} &
-          \href{https://doi.org/10.1145/3527329}{\textbf{Pelsmaeker'22}} &
+          \href{https://doi.org/10.1145/3527329}{\makebox[\linewidth][c]{\hspace*{-2.5pt}\textbf{Pelsmaeker'22}}} &
           \href{https://doi.org/10.1145/2594291.2594321}{\textbf{Raychev'14}} &
           \href{https://arxiv.org/pdf/2405.08704}{\textbf{Semenkin'24}} &
           \href{https://arxiv.org/pdf/2402.17988}{\textbf{Melcer'24}} &
           \href{https://doi.org/10.1145/3729274}{\textbf{M\"undler'25}} \\
           \hline
-          Language & C\# & Scala & Statix DSL & Java & Python+JVM+JS & Python 3 & TypeScript \\
+          Language & C\# & Scala & Statix DSL & Java & Py+JVM+JS & Python 3 & TypeScript \\
           Output unit & expression & expression & fragment & call sequence & full line & FIM span & function \\
-          Query form & partial expr & typed hole & caret & holes & left prefix & FIM context & prompt \\
-          Candidate set & type graph & typed terms & Statix terms & API traces & LLM output & parser states & typed tokens \\
-          Ranking signal & type distance & usage priors & solver order & n-gram/RNN & local LM & host LM & host LM \\
-          Fill model & hole & hole & cursor & cursor & cursor & FIM & prefix \\
+          Query format & partial expr & typed hole & cursor & holes & left prefix & FIM context & prompt \\
+          Core theory & bespoke & STLC & SDF3/Statix & bespoke & \no & CSL quotient & prefix FSA \\
+          Ranking metric & type distance & usage priors & solver order & n-gram/RNN & LLM & LLM & LLM \\
+%          Fill model & hole & hole & cursor & cursor & cursor & FIM & prefix \\
           Learned signal & \no & \maybe & \no & \yes & \yes & \yes & \yes \\
           Filter timing & search & search & solver & rank only & \post & \gen & \gen \\
           Syntax safe & \yes & \yes & \yes & \maybe & \post & \gen & \gen \\
           Type safe & \yes & \yes & \yes & \maybe & \no & \no & \gen \\
           Statement-scale & \no & \no & \maybe & \maybe & \yes & \yes & \yes \\
           Parametricity & \no & \no & \yes & \no & \no & \maybe & \maybe \\
-          Candidate complete & \maybe & \yes & \yes & \no & \no & \no & \no \\
-          Usable tool? & VS proto & Eclipse & Spoofax & prototype & IntelliJ Platform & parser & Git repo \\
-          Public code/tool &
+%          Completeness & \maybe & \yes & \yes & \no & \no & \no & \no \\
+          Usable tool & VS Code & Eclipse & Spoofax & Slang & JetBrains & Git repo & Git repo \\
+          Public URL &
           \no &
           \href{https://github.com/ikuraj/scala-ide-insynth-integration}{code} &
           \href{https://zenodo.org/records/6367565}{artifact} &
@@ -330,26 +328,25 @@ int main(int argc, char** args) {
     \vspace{0.11em}
     \begin{beamercolorbox}[rounded=true,sep=0.26em,wd=\linewidth]{apiwarning}
       {\fontsize{8}{7}\selectfont
-      \textcolor{apiamber}{\bfseries Gap.}
-      Prior work tends to trade off probabilistic ranking, statement-scale completion, and
-      formal type guarantees but does not enumerate a ranked language of complete typed statements.}
+      \textcolor{apiamber}{\bfseries Gap}
+      Prior work tends to trade off probabilistic ranking, completion length, and type safety but does not guarantee exact enumeration over a ranked language of well-typed statements.}
     \end{beamercolorbox}
 
-    \vspace{0.08em}
-    {\fontsize{4.75}{5.30}\selectfont\color{black!57}
-      \begin{minipage}[t]{0.332\linewidth}
-        \href{https://doi.org/10.1145/2254064.2254098}{[1] Perelman et al., PLDI'12}\par
-        \href{https://doi.org/10.1145/2491956.2462192}{[2] Gvero et al., PLDI'13} / \href{https://github.com/ikuraj/scala-ide-insynth-integration}{code}\par
-        \href{https://doi.org/10.1145/3527329}{[3] Pelsmaeker et al., OOPSLA'22} / \href{https://zenodo.org/records/6367565}{artifact}
-      \end{minipage}\hfill
-      \begin{minipage}[t]{0.332\linewidth}
-        \href{https://doi.org/10.1145/2594291.2594321}{[4] Raychev et al., PLDI'14} / \href{https://www.sri.inf.ethz.ch/research/plml}{BigCode}\par
-        \href{https://arxiv.org/pdf/2405.08704}{[5] Semenkin et al., arXiv:2405.08704} / \href{https://plugins.jetbrains.com/plugin/14823-full-line-code-completion}{plugin}
-      \end{minipage}\hfill
-      \begin{minipage}[t]{0.332\linewidth}
-        \href{https://arxiv.org/pdf/2402.17988}{[6] Melcer et al., arXiv:2402.17988} / \href{https://github.com/amazon-science/incremental-parsing}{code}\par
-        \href{https://doi.org/10.1145/3729274}{[7] M\"undler et al., PLDI'25} / \href{https://github.com/eth-sri/type-constrained-code-generation}{code}
-      \end{minipage}}
+%    \vspace{0.08em}
+%    {\fontsize{4.75}{5.30}\selectfont\color{black!57}
+%      \begin{minipage}[t]{0.332\linewidth}
+%        \href{https://doi.org/10.1145/2254064.2254098}{[1] Perelman et al., PLDI'12}\par
+%        \href{https://doi.org/10.1145/2491956.2462192}{[2] Gvero et al., PLDI'13} / \href{https://github.com/ikuraj/scala-ide-insynth-integration}{code}\par
+%        \href{https://doi.org/10.1145/3527329}{[3] Pelsmaeker et al., OOPSLA'22} / \href{https://zenodo.org/records/6367565}{artifact}
+%      \end{minipage}\hfill
+%      \begin{minipage}[t]{0.332\linewidth}
+%        \href{https://doi.org/10.1145/2594291.2594321}{[4] Raychev et al., PLDI'14} / \href{https://www.sri.inf.ethz.ch/research/plml}{BigCode}\par
+%        \href{https://arxiv.org/pdf/2405.08704}{[5] Semenkin et al., arXiv:2405.08704} / \href{https://plugins.jetbrains.com/plugin/14823-full-line-code-completion}{plugin}
+%      \end{minipage}\hfill
+%      \begin{minipage}[t]{0.332\linewidth}
+%        \href{https://arxiv.org/pdf/2402.17988}{[6] Melcer et al., arXiv:2402.17988} / \href{https://github.com/amazon-science/incremental-parsing}{code}\par
+%        \href{https://doi.org/10.1145/3729274}{[7] M\"undler et al., PLDI'25} / \href{https://github.com/eth-sri/type-constrained-code-generation}{code}
+%      \end{minipage}}
     \end{minipage}
   \end{frame}
 
@@ -394,6 +391,7 @@ int main(int argc, char** args) {
 
           \addplot+[
           ybar,
+          mark=none,
           fill=blue!28!gray,
           draw=blue!45!black,
           line width=0.45pt,
@@ -472,6 +470,7 @@ int main(int argc, char** args) {
 
           \addplot+[
           ybar,
+          mark=none,
           fill=blue!28!gray,
           draw=blue!45!black,
           line width=0.45pt,
