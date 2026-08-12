@@ -62,6 +62,8 @@
 \usepackage{amsmath}
 \usepackage{amssymb}
 \usepackage{array}
+\newcolumntype{L}[1]{>{\raggedright\arraybackslash}p{#1}}
+\newcolumntype{C}[1]{>{\centering\arraybackslash}p{#1}}
 \usepackage{listings}
 
 \definecolor{grammarcodekw}{RGB}{74,92,126}
@@ -134,11 +136,23 @@
 % reserve plain \widehat for wider expressions such as \widehat{\mathcal T}.
 \newcommand{\tstate}[1]{\skew{2}\widehat{#1}}
 
-% Zero-width IDE caret with a remembered anchor for completion popups.
+% Zero-width IDE box cursor with a remembered anchor for completion popups.
 \newcommand{\idecursor}[1]{%
   \tikz[remember picture,baseline=-0.55ex]{%
     \coordinate (#1);%
-    \draw[apiblue,line width=0.75pt] (0,-1.1ex) -- (0,1.20ex);%
+    \node[
+      overlay,
+      anchor=base west,
+      inner sep=0pt,
+      outer sep=0pt,
+      text=apiblue
+    ] at (0,-0.66ex) {%
+      \begingroup
+        \contourlength{0.08pt}%
+        \scalebox{0.82}[1.26]{\contour{apiblue}{\(\square\)}}%
+      \endgroup
+    };%
+    \path (0,-1.1ex) -- (0,1.20ex);%
   }%
 }
 
@@ -205,7 +219,7 @@ std::unique_ptr<int> combine(const char*, long*);
 std::unique_ptr<int> schedule(const char*, long*, float*);
 
 int main(int argc, char** args) {
-  std::unique_ptr<int> b (*@\idecursor{motivation-cursor}@*)
+  std::unique_ptr<int> b(*@\idecursor{motivation-cursor}@*)
 }
 \end{lstlisting}
     \end{beamercolorbox}
@@ -215,7 +229,7 @@ int main(int argc, char** args) {
       \only<3->{%
         \node[
           anchor=north west,
-          xshift=0.35em,
+          xshift=0.6em,
           yshift=0.5em,
           draw=black!24,
           fill=white,
@@ -403,7 +417,7 @@ int main(int argc, char** args) {
             (C++,    10.530586) +- (0,0.526006)
             (C\#,    12.413997) +- (0,1.753571)
             (Rust,   36.094937) +- (0,25.740138)
-            (Go,      9.169018) +- (0,0.688426)
+            (Go,      9.410997) +- (0,0.401325)
           };
 
 % Number of sampled files.
@@ -420,7 +434,7 @@ int main(int argc, char** args) {
           \node[font=\scriptsize, text=black!65, anchor=north]
           at (axis cs:C\#,0) [yshift=-18pt] {$n=100$};
           \node[font=\scriptsize, text=black!65, anchor=north]
-          at (axis cs:Go,0) [yshift=-18pt] {$n=35$};
+          at (axis cs:Go,0) [yshift=-18pt] {$n=100$};
         \end{axis}
       \end{tikzpicture}
 
