@@ -20,9 +20,13 @@
 \arrayrulecolor{black!20}
 \hypersetup{colorlinks=true,urlcolor=apiblue,linkcolor=apiblue}
 
+\usepackage{mathtools}
 \usepackage{amsmath}
 \usepackage{pgfplots}
+\usepackage{pgfplotstable}
+\usepgfplotslibrary{fillbetween}
 \pgfplotsset{compat=1.18}
+\usetikzlibrary{shapes.callouts}
 
 \usepackage[normalem]{ulem}
 \usepackage{graphicx}
@@ -171,6 +175,18 @@
   }%
 }
 
+% A partial table rule whose endpoint follows the current Beamer overlay.
+\makeatletter
+\newcommand{\priorworkprogressrule}{%
+  \ifcase\beamer@slideinframe\relax
+  \or\cline{1-1}%
+  \or\cline{1-4}%
+  \or\cline{1-6}%
+  \else\cline{1-7}%
+  \fi
+}
+\makeatother
+
 \title{Compiling Typed APIs\\ into Context-Free Languages	}
 \author{Breandan Considine, \textcolor{black!30}{Clemente Pasti, Tim Vieira}}
 \date{\today}
@@ -256,6 +272,41 @@ int main(int argc, char** args) {
           \end{minipage}%
         };
       }
+      \only<4>{%
+        \node[
+          rectangle callout,
+          callout relative pointer={(0.70em,0)},
+          callout pointer width=1.04em,
+          anchor=south west,
+          xshift=1.1cm,
+          yshift=0.67cm,
+          draw=apiteal!46,
+          fill=apiteal!6,
+          line width=0.45pt,
+          rounded corners=2pt,
+          inner xsep=0.55em,
+          inner ysep=0.52em,
+          text=apiink
+        ] (shortlex-note) at (current page.south west) {%
+          \begin{minipage}{3.8cm}
+            \fontsize{7}{8}\selectfont
+            \hspace{1.35em}{\bfseries Why shortlex order?}
+            \par\vspace{0.39em}
+            \textcolor{apiteal}{\bfseries--}\enspace Parsimonious abduction\\[-0.10em]
+            \textcolor{apiteal}{\bfseries--}\enspace Bounded-delay enumeration\\[-0.10em]
+            \textcolor{apiteal}{\bfseries--}\enspace Efficient rank and unrank queries
+          \end{minipage}%
+        };
+        \node[
+          circle,
+          draw=apiblue!35,
+          fill=apiblue!10,
+          text=apiblue,
+          line width=0.35pt,
+          font=\fontsize{6.5}{6.5}\selectfont\bfseries,
+          inner sep=1.35pt
+        ] at ([xshift=0.73em,yshift=-0.75em]shortlex-note.north west) {?};
+      }
     \end{tikzpicture}
   \end{frame}
 
@@ -280,57 +331,64 @@ int main(int argc, char** args) {
     \vspace{0.12em}
     \begin{beamercolorbox}[rounded=true,sep=0.22em,wd=\linewidth]{apiprojection}
       \hspace{-0.25cm}
-      \setlength{\tabcolsep}{1pt}
+      \setlength{\tabcolsep}{1.4pt}
       \renewcommand{\arraystretch}{1.09}
-      {\fontsize{6.5}{9.3}\selectfont
-        \begin{tabular}{@{}L{0.140\linewidth}*{7}{C{0.112\linewidth}}@{}}
+      {\fontsize{7.7}{9.8}\selectfont
+        \begin{tabular}{@{}
+          L{0.140\linewidth}<{\onslide+<2->}
+          *{2}{C{0.130\linewidth}}
+          C{0.130\linewidth}<{\onslide+<3->}
+          C{0.130\linewidth}
+          C{0.130\linewidth}<{\onslide+<4->}
+          C{0.130\linewidth}<{\onslide}
+        @{}}
           \rowcolor{black!2}
-          \textbf{Lens} &
-          \multicolumn{3}{c}{\cellcolor{apiteal!10}\textbf{Type-directed search}} &
-          \multicolumn{2}{c}{\cellcolor{apiblue!8}\textbf{Learned completion}} &
-          \multicolumn{2}{c}{\cellcolor{apiamber!11}\textbf{Constrained decoding}} \\
-          \hline
+          \textbf{Category} &
+          \multicolumn{3}{c}{\only<2->{\cellcolor{apiteal!10}}\visible<2->{\textbf{Type-directed search}}} &
+          \multicolumn{2}{c}{\only<3->{\cellcolor{apiblue!8}}\visible<3->{\textbf{Learned completion}}} &
+          \multicolumn{1}{c<{\onslide}}{\only<4->{\cellcolor{apiamber!11}}\visible<4->{\textbf{Constrained}}} \\
+          \priorworkprogressrule
           \rowcolor{black!4}
-          \textbf{Feature} &
+          \textbf{Literature} &
           \href{https://doi.org/10.1145/2254064.2254098}{\textbf{Perelman'12}} &
           \href{https://doi.org/10.1145/2491956.2462192}{\textbf{Gvero'13}} &
           \href{https://doi.org/10.1145/3527329}{\makebox[\linewidth][c]{\hspace*{-2.5pt}\textbf{Pelsmaeker'22}}} &
           \href{https://doi.org/10.1145/2594291.2594321}{\textbf{Raychev'14}} &
           \href{https://arxiv.org/pdf/2405.08704}{\textbf{Semenkin'24}} &
-          \href{https://arxiv.org/pdf/2402.17988}{\textbf{Melcer'24}} &
           \href{https://doi.org/10.1145/3729274}{\textbf{M\"undler'25}} \\
-          \hline
-          Language & C\# & Scala & Statix DSL & Java & Py+JVM+JS & Python 3 & TypeScript \\
-          Output unit & expression & expression & fragment & call sequence & full line & FIM span & function \\
-          Query format & partial expr & typed hole & cursor & holes & left prefix & FIM context & prompt \\
-          Core theory & bespoke & STLC & SDF3/Statix & bespoke & \no & CSL quotient & prefix FSA \\
-          Ranking metric & type distance & usage priors & solver order & n-gram/RNN & LLM & LLM & LLM \\
-%          Fill model & hole & hole & cursor & cursor & cursor & FIM & prefix \\
-          Learned signal & \no & \maybe & \no & \yes & \yes & \yes & \yes \\
-          Filter timing & search & search & solver & rank only & \post & \gen & \gen \\
-          Syntax safe & \yes & \yes & \yes & \maybe & \post & \gen & \gen \\
-          Type safe & \yes & \yes & \yes & \maybe & \no & \no & \gen \\
-          Statement-scale & \no & \no & \maybe & \maybe & \yes & \yes & \yes \\
-          Parametricity & \no & \no & \yes & \no & \no & \maybe & \maybe \\
-%          Completeness & \maybe & \yes & \yes & \no & \no & \no & \no \\
-          Usable tool & VS Code & Eclipse & Spoofax & Slang & JetBrains & Git repo & Git repo \\
+          \priorworkprogressrule
+          Language & C\# & Scala & Statix DSL & Java & Py+JVM+JS & TypeScript \\
+          Output unit & expression & expression & fragment & call sequence & full line & function \\
+          Query format & partial expr & typed hole & cursor & holes & left prefix & prompt \\
+          Core theory & bespoke & STLC & SDF3/Statix & bespoke & \no & prefix FSA \\
+          Ranking & type distance & usage priors & solver order & RNN & LLM & LLM \\
+%          Fill model & hole & hole & cursor & cursor & cursor & prefix \\
+          Learning & \no & \maybe & \no & \yes & \yes & \yes \\
+          Filter timing & search & search & solver & rank only & \post & \gen \\
+          Syntax safe & \yes & \yes & \yes & \maybe & \post & \gen \\
+          Type safe & \yes & \yes & \yes & \maybe & \no & \gen \\
+          Statements & \no & \no & \maybe & \maybe & \yes & \yes \\
+          Parametricity & \no & \no & \yes & \no & \no & \maybe \\
+%          Completeness & \maybe & \yes & \yes & \no & \no & \no \\
+          Usable tool & VS Code & Eclipse & Spoofax & Slang & JetBrains & Git repo \\
           Public URL &
           \no &
           \href{https://github.com/ikuraj/scala-ide-insynth-integration}{code} &
           \href{https://zenodo.org/records/6367565}{artifact} &
           \no &
           \href{https://plugins.jetbrains.com/plugin/14823-full-line-code-completion}{plugin} &
-          \href{https://github.com/amazon-science/incremental-parsing}{code} &
           \href{https://github.com/eth-sri/type-constrained-code-generation}{code} \\
         \end{tabular}}
     \end{beamercolorbox}
 
     \vspace{0.11em}
+    \visible<5->{%
     \begin{beamercolorbox}[rounded=true,sep=0.26em,wd=\linewidth]{apiwarning}
-      {\fontsize{8}{7}\selectfont
+      {\fontsize{8.7}{6}\selectfont
       \textcolor{apiamber}{\bfseries Gap}
-      Prior work tends to trade off probabilistic ranking, completion length, and type safety but does not guarantee exact enumeration over a ranked language of well-typed statements.}
+      Prior work tends to trade off probabilistic ranking, completion length, and type safety but does not guarantee bounded-delay enumeration for all and only well-typed statements.}
     \end{beamercolorbox}
+    }
 
 %    \vspace{0.08em}
 %    {\fontsize{4.75}{5.30}\selectfont\color{black!57}
@@ -344,8 +402,7 @@ int main(int argc, char** args) {
 %        \href{https://arxiv.org/pdf/2405.08704}{[5] Semenkin et al., arXiv:2405.08704} / \href{https://plugins.jetbrains.com/plugin/14823-full-line-code-completion}{plugin}
 %      \end{minipage}\hfill
 %      \begin{minipage}[t]{0.332\linewidth}
-%        \href{https://arxiv.org/pdf/2402.17988}{[6] Melcer et al., arXiv:2402.17988} / \href{https://github.com/amazon-science/incremental-parsing}{code}\par
-%        \href{https://doi.org/10.1145/3729274}{[7] M\"undler et al., PLDI'25} / \href{https://github.com/eth-sri/type-constrained-code-generation}{code}
+%        \href{https://doi.org/10.1145/3729274}{[6] M\"undler et al., PLDI'25} / \href{https://github.com/eth-sri/type-constrained-code-generation}{code}
 %      \end{minipage}}
     \end{minipage}
   \end{frame}
@@ -364,7 +421,7 @@ int main(int argc, char** args) {
           ytick={0,20,40,60,80},
           ylabel={Mean lexical tokens},
           ylabel style={font=\small},
-          symbolic x coords={Java,Kotlin,C,C++,C\#,Rust,Go},
+          symbolic x coords={Java,Kotlin,C,C++,C\#,Rust,Go,Scala},
           xtick=data,
           xticklabel style={font=\small},
           yticklabel style={font=\small},
@@ -416,6 +473,7 @@ int main(int argc, char** args) {
             (C\#,    12.413997) +- (0,1.753571)
             (Rust,   36.094937) +- (0,25.740138)
             (Go,      9.410997) +- (0,0.401325)
+            (Scala,  12.579831) +- (0,1.162650)
           };
 
 % Number of sampled files.
@@ -433,6 +491,7 @@ int main(int argc, char** args) {
           at (axis cs:C\#,0) [yshift=-18pt] {$n=100$};
           \node[font=\scriptsize, text=black!65, anchor=north]
           at (axis cs:Go,0) [yshift=-18pt] {$n=100$};
+          \node[font=\scriptsize, text=black!65, anchor=north] at (axis cs:Scala,0) [yshift=-18pt] {$n=100$};
         \end{axis}
       \end{tikzpicture}
 
@@ -451,9 +510,9 @@ int main(int argc, char** args) {
         ytick={0,1000,2000,3000,4000,5000},
         ylabel={$|G|$},
         ylabel style={font=\small},
-        symbolic x coords={Java,Kotlin,C,Cpp,CSharp,Rust,Go},
+        symbolic x coords={Java,Kotlin,C,Cpp,CSharp,Rust,Go,Scala},
         xtick=data,
-        xticklabels={Java,Kotlin,C,C++,C\#,Rust,Go},
+        xticklabels={Java,Kotlin,C,C++,C\#,Rust,Go,Scala},
         xticklabel style={font=\small},
         yticklabel style={font=\small,/pgf/number format/1000 sep={,}},
         scaled y ticks=false,
@@ -482,12 +541,13 @@ int main(int argc, char** args) {
             (CSharp,3525)
             (Rust,3086)
             (Go,1424)
+            (Scala,3840)
           };
 
         \end{axis}
       \end{tikzpicture}
 
-      \caption{Grammar size is computed from the Tree-sitter reference CFGs, where $|G|$ is defined as $\sum_{w\in V}\sum_{(w\rightarrow \sigma) \in P}|w\sigma|$.}
+      \caption{C++ is a syntactically feature-rich language. Grammar size calculated from Tree-sitter reference CFGs, where $|G|\coloneqq\sum\limits_{\mathclap{\substack{w\,\in V\\(w\,\rightarrow\,\sigma)\in P}}}|w\sigma|$.}
     \end{figure}
   \end{frame}
 
@@ -673,7 +733,16 @@ int main(int argc, char** args) {
   \end{frame}
 
   \begin{frame}[t,fragile]{Nominal typing judgements}
-    \vspace{0.2cm}
+    % Box grid used from this slide onward. Rounded beamer boxes paint 4bp
+    % beyond their nominal width; reserving that bleed here keeps the visible
+    % edges on one grid and leaves a true \boxgridgap between paired boxes.
+    \gdef\boxgridgap{0.8em}
+    \gdef\boxgridcolumn{\dimexpr.5\textwidth-4bp-.4em\relax}
+    \gdef\boxgridrowgap{0.3em}
+    \gdef\boxgridtopskip{0.15cm}
+
+    \vspace{\boxgridtopskip}
+    \nointerlineskip
     \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\textwidth]{apisurface}
       {\small\bfseries\color{apiblue}Context}
       \hfill
@@ -686,9 +755,10 @@ int main(int argc, char** args) {
       {\footnotesize C++ accepts $e$ and gives it the concrete type $T$.}
     \end{beamercolorbox}
 
-    \vspace{0.3em}
-    \begin{columns}[T,onlytextwidth]
-      \column{0.48\textwidth}
+    \vspace{\boxgridrowgap}
+    \nointerlineskip
+    \begin{columns}[t,onlytextwidth]
+      \column{\boxgridcolumn}
         \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\linewidth,vmode]{apieditor}
           {\small\bfseries\color{apiblue}C++ program}
 
@@ -712,8 +782,8 @@ int main() {
 \end{lstlisting}
         \end{beamercolorbox}
 
-      \column{0.49\textwidth}
-        \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\linewidth]{apiguarantee}
+      \column{\boxgridcolumn}
+        \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\linewidth,vmode]{apiguarantee}
           {\small\bfseries\color{apiteal}Embedding}
 
           \vspace{0.25em}
@@ -735,7 +805,8 @@ int main() {
         \end{beamercolorbox}
     \end{columns}
 
-    \vspace{0.25em}
+    \vspace{\boxgridrowgap}
+    \nointerlineskip
     \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\textwidth]{apiguarantee}
       {\small\bfseries\color{apiteal}Embedding}
       \vspace{0.1em}
@@ -744,7 +815,8 @@ int main() {
   \end{frame}
 
   \begin{frame}[t,fragile]{Subtyping: tracking inheritance}
-    \vspace{0.2cm}
+    \vspace{\boxgridtopskip}
+    \nointerlineskip
     \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\textwidth]{apisurface}
       {\small\bfseries\color{apiblue}Derived-to-base call}
       \hfill
@@ -756,9 +828,10 @@ int main() {
       may be passed to \texttt{age} as an \texttt{Animal}.}
     \end{beamercolorbox}
 
-    \vspace{0.3em}
-    \begin{columns}[T,onlytextwidth]
-      \column{0.49\textwidth}
+    \vspace{\boxgridrowgap}
+    \nointerlineskip
+    \begin{columns}[t,onlytextwidth]
+      \column{\boxgridcolumn}
         \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\linewidth,vmode]{apieditor}
           {\small\bfseries\color{apiblue}C++ program}
 
@@ -779,10 +852,11 @@ int main() {
   return x;
 }
 \end{lstlisting}
+          \vspace{0.35em}
         \end{beamercolorbox}
 
-      \column{0.48\textwidth}
-        \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\linewidth]{apiguarantee}
+      \column{\boxgridcolumn}
+        \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\linewidth,vmode]{apiguarantee}
           {\small\bfseries\color{apiteal}Embedding}
 
           \vspace{0.55em}
@@ -804,9 +878,10 @@ int main() {
         \end{beamercolorbox}
     \end{columns}
 
-    \vspace{0.25em}
+    \vspace{\boxgridrowgap}
+    \nointerlineskip
     \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\textwidth]{apiwarning}
-      {\small\bfseries\color{apiamber}Keep the check local}
+      {\small\bfseries\color{apiamber}Scoped subtype inclusion}
 
       \vspace{0.1em}
       {\scriptsize Only track well-scoped subtypes and embed each subtype monomorphically.}
@@ -814,9 +889,10 @@ int main() {
   \end{frame}
 
   \begin{frame}[t,fragile]{Templates: try concrete types, keep valid rules}
-    \vspace{0.2cm}
-    \begin{columns}[T,onlytextwidth]
-      \column{0.49\textwidth}
+    \vspace{\boxgridtopskip}
+    \nointerlineskip
+    \begin{columns}[t,onlytextwidth]
+      \column{\boxgridcolumn}
         \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\linewidth,vmode]{apieditor}
           {\small\bfseries\color{apiblue}C++ program}
 
@@ -841,13 +917,13 @@ int main() {
 \end{lstlisting}
         \end{beamercolorbox}
 
-      \column{0.48\textwidth}
-        \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\linewidth]{apiprojection}
+      \column{\boxgridcolumn}
+        \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\linewidth,vmode]{apiprojection}
           {\small\bfseries\color{apiblue}Try three concrete types}
 
           \vspace{0.45em}
           {\footnotesize
-          \begin{tabular}{@{}l@{\hspace{0.8em}}l@{}}
+          \begin{tabular}{@{}l@{\hspace{0.6em}}l@{}}
             \texttt{int} & \textcolor{apigreen}{\checkmark\ accepted}\\[0.35em]
             \texttt{std::string} & \textcolor{apigreen}{\checkmark\ accepted}\\[0.35em]
             \texttt{std::vector<int>} & \textcolor{apired}{$\times$ rejected}\\
@@ -856,12 +932,15 @@ int main() {
           \vspace{0.55em}
           {\scriptsize The vector case fails because \texttt{x + x}
           is not defined for vectors.}
+
+          \vspace{0.8em}
         \end{beamercolorbox}
     \end{columns}
 
-    \vspace{0.3em}
+    \vspace{\boxgridrowgap}
+    \nointerlineskip
     \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\textwidth]{apiguarantee}
-      {\small\bfseries\color{apiteal}Keep the successful rules}
+      {\small\bfseries\color{apiteal}Filter successful rules}
 
       \vspace{0.3em}
       \centering
@@ -880,7 +959,8 @@ int main() {
       $}
     \end{beamercolorbox}
 
-    \vspace{0.25em}
+    \vspace{\boxgridrowgap}
+    \nointerlineskip
     \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\textwidth]{apiguarantee}
       \begin{minipage}[t]{0.45\linewidth}
         {\scriptsize\textcolor{apigreen}{\bfseries Sound:}
@@ -973,7 +1053,8 @@ int main() {
 %  \end{frame}
 
   \begin{frame}[t,fragile]{Class templates: invariant by default}
-    \vspace{0.2cm}
+    \vspace{\boxgridtopskip}
+    \nointerlineskip
     \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\textwidth]{apisurface}
       {\small\bfseries\color{apiblue}Subtyping does not lift automatically}
 
@@ -987,13 +1068,14 @@ int main() {
       $}
 
       \vspace{0.2em}
-      {\scriptsize Class templates may optionally a constrained converting constructor.}
+      {\scriptsize Class templates may optionally provide a constrained converting constructor.}
     \end{beamercolorbox}
 
-    \vspace{0.35em}
-    \begin{columns}[T,onlytextwidth]
-      \column{0.49\textwidth}
-        \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\linewidth]{apiguarantee}
+    \vspace{\boxgridrowgap}
+    \nointerlineskip
+    \begin{columns}[t,onlytextwidth]
+      \column{\boxgridcolumn}
+        \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\linewidth,vmode]{apiguarantee}
           {\small\bfseries\color{apiteal}API-provided covariance}
 
           \vspace{0.45em}
@@ -1013,8 +1095,8 @@ std::shared_ptr<Animal> pa = pd;
           {\scriptsize \texttt{shared\_ptr} explicitly supplies the conversion.}
         \end{beamercolorbox}
 
-      \column{0.48\textwidth}
-        \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\linewidth]{apiprojection}
+      \column{\boxgridcolumn}
+        \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\linewidth,vmode]{apiprojection}
           {\small\bfseries\color{apiblue}Invariant specialization}
 
           \vspace{0.45em}
@@ -1035,7 +1117,8 @@ std::vector<Animal*> as = ds;
         \end{beamercolorbox}
     \end{columns}
 
-    \vspace{0.35em}
+    \vspace{\boxgridrowgap}
+    \nointerlineskip
     \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\textwidth]{apiguarantee}
       {\small\bfseries\color{apiteal}CFG consequence}
       \hfill
@@ -1048,14 +1131,11 @@ std::vector<Animal*> as = ds;
     \end{beamercolorbox}
   \end{frame}
 
-
-\begin{frame}{Results: Size of generated CFGs}
-    % TODO: discuss common APIs and the CFG sizes
-\end{frame}
-
-\begin{frame}{Evaluation}
-% TODO: discuss fresh names
-
+\begin{frame}[t,fragile]{Experimental Design Prospectus}
+% TODO: briefly discuss fresh names
+% Collect a dataset of fully standalone C++ files that compile cleanly by themselves
+% then measure precision and recall on whole statements
+%
 %    For a given residual grammar, precision measures the percent of uniform samples $x~L(G)$ accepted by the reference compiler and recall measures the number of ground truth samples $x* \in L(G)$ modulo fresh names. So, for example, suppose the ground truth single line statement is:
 %
 %for ( const auto & animal : animals ) introduce ( * animal , 2 ) ;
@@ -1066,5 +1146,276 @@ std::vector<Animal*> as = ds;
 %
 %assuming that animal is indeed fresh in the local context. All other names, including keywords, declared variables, external methods should match identically. For raw literals, I use a placeholder like "" or 0, which a user can later substitute.
 
+  \vspace{\boxgridtopskip}
+  \nointerlineskip
+  \begin{columns}[T,onlytextwidth]
+    \column{\boxgridcolumn}
+      \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\linewidth,vmode]{apisurface}
+        {\small\bfseries\color{apiblue}Dataset \& unit}
+
+        \vspace{0.1em}
+        {\scriptsize
+        \begin{itemize}
+          \setlength{\itemsep}{0.24em}
+          \setlength{\parskip}{0pt}
+          \item Standalone \texttt{.cpp} files; each compiles in isolation
+          \item Hold out one whole statement at its original site
+          \item Build $G_\Gamma$ from context $\Gamma$
+        \end{itemize}}
+
+        \vspace{1.65em}
+      \end{beamercolorbox}
+
+    \column{\boxgridcolumn}
+      \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\linewidth,vmode]{apiprojection}
+        {\small\bfseries\color{apiblue}Whole-statement measures}
+
+        \vspace{0.35em}
+        {\scriptsize
+        \textcolor{apigreen}{\bfseries Precision}\enspace
+        reference-compiler acceptance rate of token-bounded uniform samples
+        from $\mathcal L(G_\Gamma)$.
+
+        \vspace{0.55em}
+        \textcolor{apiblue}{\bfseries Recall}\enspace
+        fraction of whole statements admitted after fresh-name/literal normalization.}
+      \end{beamercolorbox}
+  \end{columns}
+
+  \vspace{\boxgridgap}
+  \nointerlineskip
+  \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\textwidth]{apiwarning}
+    {\small\bfseries\color{apiamber}Name and literal normalization}
+
+    \vspace{0.35em}
+    \begin{minipage}[t]{0.48\linewidth}
+      \vspace{0pt}
+      {\scriptsize\bfseries\color{apiblue}Held-out statement $x^*$}
+      \lstset{%
+        style=grammarcpp,
+        basicstyle=\ttfamily\fontsize{5.7}{6.9}\selectfont,
+        emph={animal},
+        emphstyle=\bfseries\color{apiblue},
+        aboveskip=0.25em,
+        belowskip=0em
+      }
+\begin{lstlisting}
+for (const auto& animal : animals)
+  introduce(*animal, 2);
+\end{lstlisting}
+    \end{minipage}
+    \hfill
+    \begin{minipage}[t]{0.48\linewidth}
+      \vspace{0pt}
+      {\scriptsize\bfseries\color{apiteal}Normalized form admitted by $G_\Gamma$}
+      \lstset{%
+        style=grammarcpp,
+        basicstyle=\ttfamily\fontsize{5.7}{6.9}\selectfont,
+        emph={fresh_id},
+        emphstyle=\bfseries\color{apiteal},
+        aboveskip=0.25em,
+        belowskip=0em
+      }
+\begin{lstlisting}
+for (const auto& {fresh_id} : animals)
+  introduce(*{fresh_id}, 0);
+\end{lstlisting}
+    \end{minipage}
+
+    \vspace{0.4em}
+    {\scriptsize
+    \textcolor{apiamber}{\bfseries Fresh-name handling (capture-avoiding).}
+    Only a binder introduced by the held-out statement, fresh relative to
+    $\Gamma$, and all its bound uses may map to \texttt{\{fresh\_id\}}.
+    Keywords and contextual/API names stay exact; literals canonicalize to
+    \texttt{0} or \texttt{""}.}
+  \end{beamercolorbox}
 \end{frame}
+
+\begin{frame}{Evaluation: Mock Results}
+  % Let t = (distance - 1) / 79.  The mean is the normalized integral
+  % of the everywhere-positive derivative
+  %   d/dt log10(mu) propto 0.28
+  %     + 3.60 exp(-((t - 0.10)/0.105)^2)
+  %     + 1.75 exp(-((t - 0.54)/0.115)^2)
+  %     + 0.95 exp(-((t - 0.84)/0.085)^2).
+  % Thus log10(mu) rises monotonically from 1 to 7, but its slope has
+  % pronounced smooth changes.  Bounds are symmetric in log-rank with
+  % half-width 1 + t decades: [10^(log10(mu)-1-t), 10^(log10(mu)+1+t)].
+  \pgfplotstableread[row sep=\\]{
+    distance mean        lower       upper\\
+     1              10        1.000         100\\
+     5          34.337        3.056         385.825\\
+     9         214.295       16.973        2705.690\\
+    13        1312.520       92.514       18621.100\\
+    17        4347.370      272.706       69304.000\\
+    21        7675.770      428.506      137495.000\\
+    25        9923.610      493.029      199741.000\\
+    29       12029.300      531.876      272064.000\\
+    33       15837.600      623.198      402488.000\\
+    37       26130.500      915.066      746182.000\\
+    41       58910.500     1835.960     1890260.000\\
+    45      160686.000     4456.720     5793480.000\\
+    49      395855.000     9771.060    16037300.000\\
+    53      723766.000    15899.000    32947800.000\\
+    57     1028740.000    20111.600    52622100.000\\
+    61     1393350.000    24241.900    80085600.000\\
+    65     2215660.000    34306.500   143097000.000\\
+    69     4059790.000    55942.800   294621000.000\\
+    73     6647980.000    81526.300   542104000.000\\
+    77     8778280.000    95804.100   804331000.000\\
+    80    10000000.000   100000.000  1000000000.000\\
+  }\mockrankdata
+
+  \vspace{-0.45em}
+  \centering
+  \begin{tikzpicture}
+    \begin{axis}[
+      width=0.96\textwidth,
+      height=0.69\textheight,
+      xmin=1,
+      xmax=80,
+      x dir=reverse,
+      xtick={1,20,40,60,80},
+      xlabel={Distance from the last token},
+      xlabel style={font=\small},
+      xticklabel style={font=\small},
+      ymode=log,
+      log basis y=10,
+      ymin=1,
+      ymax=1e9,
+      ytick={1,1e1,1e2,1e3,1e4,1e5,1e6,1e7,1e8,1e9},
+      yticklabels={$10^0$,$10^1$,$10^2$,$10^3$,$10^4$,$10^5$,$10^6$,$10^7$,$10^8$,$10^9$},
+      ylabel={$\operatorname{rank}(\tau'\mid\sigma)$},
+      ylabel style={font=\small},
+      yticklabel style={font=\small},
+      axis x line*=bottom,
+      axis y line*=left,
+      axis line style={black!55},
+      tick style={black!55},
+      ymajorgrids=true,
+      grid style={black!10},
+      tick align=outside,
+      legend style={
+        at={(0.98,0.97)},
+        anchor=north east,
+        draw=black!15,
+        fill=white,
+        fill opacity=0.92,
+        text opacity=1,
+        font=\scriptsize,
+      },
+      legend cell align=left,
+    ]
+      \addplot[
+        name path=mock-upper,
+        draw=none,
+        smooth,
+        tension=0.35,
+        forget plot,
+      ] table[
+        x=distance,
+        y=upper,
+      ] {\mockrankdata};
+
+      \addplot[
+        name path=mock-lower,
+        draw=none,
+        smooth,
+        tension=0.35,
+        forget plot,
+      ] table[
+        x=distance,
+        y=lower,
+      ] {\mockrankdata};
+
+      \addplot[
+        fill=apiteal!28,
+        fill opacity=0.72,
+        draw=none,
+      ] fill between[of=mock-upper and mock-lower];
+      \addlegendentry{$\pm1\,\mathrm{SD}$ in log rank}
+
+      \addplot[
+        color=apiblue,
+        very thick,
+        smooth,
+        tension=0.35,
+        mark=*,
+        mark size=1.25pt,
+        mark options={
+          fill=white,
+          draw=apiblue,
+          line width=0.45pt,
+        },
+      ] table[x=distance,y=mean] {\mockrankdata};
+      \addlegendentry{Average rank}
+    \end{axis}
+  \end{tikzpicture}
+
+  \vspace{-0.55em}
+  {\scriptsize\color{black!60}
+    At each prefix cutoff of a statement $\sigma\tau'$, $\sigma$ is observed and
+    $\tau'$ held out; the curve shows mean rank and variance. Registered-report target; simulated values only.}
+\end{frame}
+
+  \begin{frame}[t]{Future work}
+    \vspace{\boxgridtopskip}
+    \nointerlineskip
+    \begin{columns}[t,onlytextwidth]
+      \column{\boxgridcolumn}
+        \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\linewidth,vmode]{apisurface}
+          {\small\bfseries\color{apiblue}Scale \& validate}
+
+          \vspace{0.1em}
+          {\scriptsize
+          \begin{itemize}
+            \setlength{\itemsep}{0.26em}
+            \setlength{\parskip}{0pt}
+            \item Move from standalone files to full libraries and repository-scale corpora
+            \item Compiler-check samples; report coverage, precision/recall, time, and memory
+          \end{itemize}}
+        \end{beamercolorbox}
+
+      \column{\boxgridcolumn}
+        \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\linewidth,vmode]{apiprojection}
+          {\small\bfseries\color{apiblue}Add expressivity and coverage}
+
+          \vspace{0.1em}
+          {\scriptsize
+          \begin{itemize}
+            \setlength{\itemsep}{0.26em}
+            \setlength{\parskip}{0pt}
+            \item Add fields, operators, conversions, variadics, and larger arities
+            \item Target more languages; explore DCGs for binders and richer type constraints
+          \end{itemize}}
+
+          \vspace{1.0em}
+        \end{beamercolorbox}
+    \end{columns}
+
+    \vspace{\boxgridrowgap}
+    \nointerlineskip
+    \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\textwidth]{apiguarantee}
+      {\small\bfseries\color{apiteal}Smarter generation}
+
+      \vspace{0.1em}
+      {\scriptsize
+      \begin{itemize}
+        \setlength{\itemsep}{0.26em}
+        \setlength{\parskip}{0pt}
+        \item Materialize only productions reachable from the current prefix; quotient symmetric states
+        \item Among CFG-admitted completions, use corpus or model scores to put likely continuations first
+      \end{itemize}}
+    \end{beamercolorbox}
+
+    \vspace{\boxgridrowgap}
+    \nointerlineskip
+    \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\textwidth]{apiwarning}
+      {\scriptsize
+      \textcolor{apiamber}{\bfseries Performance optimizations}\\
+      \textbf{Lazy construction}: can we generate the same bounded language with less memory?\\
+      \textbf{Reranking}: can we generate the same valid candidates with a lower held-out rank?}
+    \end{beamercolorbox}
+  \end{frame}
 \end{document}
