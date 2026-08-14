@@ -741,6 +741,9 @@ int main(int argc, char** args) {
     \gdef\boxgridcolumn{\dimexpr(\textwidth-\boxgridgap-8bp)/2\relax}
     \gdef\boxgridrowgap{0.3em}
     \gdef\boxgridtopskip{0.15cm}
+    % Beamer's [T] columns raise the row; compensate so the visible gap remains
+    % exactly \boxgridgap while retaining true top-border alignment.
+    \gdef\boxgridcolumnoffset{0.45em}
 
     \vspace{\boxgridtopskip}
     \nointerlineskip
@@ -753,12 +756,13 @@ int main(int argc, char** args) {
       \centering
       {\fontsize{10.2}{12.8}\selectfont $\Gamma\vdash e:T$}
       \qquad
-      {\footnotesize \CC accepts $e$ and gives it the concrete type $T$.}
+      {\footnotesize \CC accepts $e$ and assigns the concrete type $T$.}
     \end{beamercolorbox}
 
     \vspace{\boxgridgap}
+    \vspace{\boxgridcolumnoffset}
     \nointerlineskip
-    \begin{columns}[t,onlytextwidth]
+    \begin{columns}[T,onlytextwidth]
       \column{\boxgridcolumn}
         \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\linewidth,vmode]{apieditor}
           {\small\bfseries\color{apiblue}\CC program}
@@ -772,13 +776,13 @@ int main(int argc, char** args) {
             belowskip=0.05em
           }
 \begin{lstlisting}
-struct Meter {
+struct Tag {
   int read(int n) {
     return n + 1;
   }
 };
 int main() {
-  Meter m;
+  Tag m;
   int n = 2;
   int x = m.read(n);
   return x + x;
@@ -790,22 +794,24 @@ int main() {
         \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\linewidth,vmode]{apiguarantee}
           {\small\bfseries\color{apiteal}Embedding}
 
-          \vspace{0.25em}
+          \vspace{1.2em}
           \centering
-          {\fontsize{8.0}{10.0}\selectfont
+          {\fontsize{9.0}{10.0}\selectfont
           $\displaystyle
             \begin{gathered}
               \Gamma\vdash\mathtt{m.read(n)}:\mathtt{int}\\[-0.1em]
               \Downarrow\\[-0.15em]
               \exprnt{\mathtt{int}}\to
-                \exprnt{\mathtt{Meter}}\code{.read(}
-                \exprnt{\mathtt{int}}\code{)}\\[0.5em]
+                \exprnt{\mathtt{Tag}}\code{.read(}
+                \exprnt{\mathtt{int}}\code{)}\vspace{0.8em}\\[0.5em]
               \Gamma\vdash\mathtt{x+x}:\mathtt{int}\\[-0.1em]
               \Downarrow\\[-0.15em]
               \exprnt{\mathtt{int}}\to
                 \exprnt{\mathtt{int}}\:\code{+}\:\exprnt{\mathtt{int}}
             \end{gathered}
           $}
+
+          \vspace{1em}
         \end{beamercolorbox}
     \end{columns}
 
@@ -833,8 +839,9 @@ int main() {
     \end{beamercolorbox}
 
     \vspace{\boxgridgap}
+    \vspace{\boxgridcolumnoffset}
     \nointerlineskip
-    \begin{columns}[t,onlytextwidth]
+    \begin{columns}[T,onlytextwidth]
       \column{\boxgridcolumn}
         \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\linewidth,vmode]{apieditor}
           {\small\bfseries\color{apiblue}\CC program}
@@ -864,7 +871,7 @@ int main() {
         \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\linewidth,vmode]{apiguarantee}
           {\small\bfseries\color{apiteal}Embedding}
 
-          \vspace{0.55em}
+          \vspace{1.15em}
           \centering
           {\fontsize{9.3}{11.8}\selectfont
           $\displaystyle
@@ -878,7 +885,7 @@ int main() {
             \end{gathered}
           $}
 
-          \vspace{1.2em}
+          \vspace{1.35em}
         \end{beamercolorbox}
     \end{columns}
 
@@ -894,6 +901,7 @@ int main() {
 
   \begin{frame}[t,fragile]{Overload resolution}
     \vspace{\boxgridtopskip}
+    \vspace{\boxgridcolumnoffset}
     \nointerlineskip
     \begin{columns}[T,onlytextwidth]
       \column{\boxgridcolumn}
@@ -922,7 +930,7 @@ int o = f(d); // ambiguous
 
       \column{\boxgridcolumn}
         \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\linewidth,vmode]{apiprojection}
-          {\small\bfseries\color{apiblue}\CC resolves whole calls}
+          {\small\bfseries\color{apiblue}\CC resolution fails}
 
           \vspace{0.35em}
           \centering
@@ -931,24 +939,26 @@ int o = f(d); // ambiguous
           \qquad
           $\mathtt{f(B)}:\mathtt{D}\to\mathtt{B}$}
 
-          \vspace{0.35em}
+          \vspace{0.5em}
           {\footnotesize Both candidates are viable by conversion but unresolvable.}
 
-          \vspace{0.35em}
-          {\fontsize{7.8}{9.8}\selectfont
+          \vspace{0.7em}
+          {\fontsize{9}{9.8}\selectfont
           $\displaystyle
             \operatorname{resolve}_{\Gamma}\big(\code{f(d)}\big) = \:\:?$}
+
+          \vspace{0.7em}
         \end{beamercolorbox}
     \end{columns}
 
     \vspace{\boxgridgap}
     \nointerlineskip
     \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\textwidth]{apiwarning}
-      {\small\bfseries\color{apiamber}Local subtype closure is unsound}
+      {\small\bfseries\color{apiamber}Caveat: local subtype closure is unsound}
 
-      \vspace{0.2em}
+      \vspace{0.5em}
       \centering
-      {\fontsize{7.4}{9.4}\selectfont
+      {\fontsize{9}{9.4}\selectfont
       $\displaystyle
         \left.
         \begin{aligned}
@@ -962,15 +972,15 @@ int o = f(d); // ambiguous
           \code{f(}\exprnt{\mathtt D}\code{)}$
       }
 
-      \vspace{0.2em}
+      \vspace{0.5em}
       \raggedright
-      {\footnotesize Local subtype expansion derives
+      {\footnotesize Local subtype closure derives
       \texttt{f(}$\exprnt{\mathtt D}$\texttt{)}, but \CC rejects $\code{f(d)}$ as ambiguous.}
 
       \vspace{0.2em}
       {\footnotesize\textcolor{apiteal}{\bfseries Resolve before lowering.}
       Emit a ground call production only when the exact call has a unique best
-      viable function; ambiguous calls emit no production.}
+      viable function; ambiguous calls yield no productions.}
     \end{beamercolorbox}
   \end{frame}
 
@@ -981,7 +991,7 @@ int o = f(d); // ambiguous
       {\small\bfseries\color{apiblue}Subtype setup}
       \hfill
 
-      \vspace{0.8em}
+      \vspace{0.1em}
       \lstset{%
         style=grammarcpp,
         basicstyle=\ttfamily\fontsize{8}{8}\selectfont,
@@ -998,8 +1008,9 @@ A a; A_ a_;
     \end{beamercolorbox}
 
     \vspace{\boxgridgap}
+    \vspace{\boxgridcolumnoffset}
     \nointerlineskip
-    \begin{columns}[t,onlytextwidth]
+    \begin{columns}[T,onlytextwidth]
       \column{\boxgridcolumn}
         \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\linewidth,vmode]{apiprojection}
           {\small\bfseries\color{apiblue}Input position: contravariant}
@@ -1012,7 +1023,8 @@ A a; A_ a_;
           \texttt{g(a);}\enspace\textcolor{apired}{\scriptsize Error}}
 
           \vspace{0.55em}
-          {\footnotesize An \texttt{A\_} value may be passed to a \texttt{A} parameter but not vis versa.}
+          {\footnotesize An \texttt{A\_} value may be passed to a \texttt{A} parameter but not vice versa.}
+
         \end{beamercolorbox}
 
       \column{\boxgridcolumn}
@@ -1025,20 +1037,43 @@ A a; A_ a_;
           \texttt{B \ b \ = g(a\_);}\par
           \textcolor{apired}{$\times$}\enspace
           \texttt{B\_ b\_ = f(a);}\enspace
-          \textcolor{apired}{\scriptsize Error}\par
-          \vphantom{\texttt{g(a);}}}
+          \textcolor{apired}{\scriptsize Error}}
 
           \vspace{0.55em}
           {\footnotesize A \texttt{B\_} result may widen to \texttt{B}; a
           \texttt{B} result cannot narrow to \texttt{B\_}.}
 
-          \vspace{1.35em}
+          \vspace{0.08em}
         \end{beamercolorbox}
     \end{columns}
+
+    \vspace{\boxgridgap}
+    \nointerlineskip
+    \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\textwidth]{apiguarantee}
+      {\small\bfseries\color{apiteal}Embedding}
+      \hfill
+      {\footnotesize $\mathsf I\langle T\,\rangle$: admissible as an initializer of $T$}
+
+      \vspace{0.4em}
+      \centering
+      {\footnotesize
+      $\displaystyle
+        \exprnt{\mathtt B}\to
+          \code{f(}\exprnt{\mathtt A}\code{)}
+          \:\:\big|\:\: \code{f(}\exprnt{\mathtt{A_{<:}}}\code{)}
+        \quad
+        \exprnt{\mathtt{B_{<:}}}\to
+          \code{g(}\exprnt{\mathtt{A_{<:}}}\code{)}
+        \quad
+        \mathsf I\langle\mathtt B\rangle\to
+          \exprnt{\mathtt B} \:\:\big|\:\: \exprnt{\mathtt{B_{<:}}}
+      $}
+    \end{beamercolorbox}
   \end{frame}
 
   \begin{frame}[t,fragile]{Template handling}
     \vspace{\boxgridtopskip}
+    \vspace{\boxgridcolumnoffset}
     \nointerlineskip
     \begin{columns}[T,onlytextwidth]
       \column{\boxgridcolumn}
@@ -1085,7 +1120,7 @@ int main() {
           {\footnotesize The vector case fails because \texttt{x+x}
           is not defined for vectors.}
 
-          \vspace{2.1em}
+          \vspace{2.95em}
         \end{beamercolorbox}
     \end{columns}
 
@@ -1098,7 +1133,7 @@ int main() {
       \centering
       {\fontsize{7.6}{9.8}\selectfont
       $\displaystyle
-        \Gamma\vdash\mathtt{twice(q)}:\gsub{std::string}
+        \Gamma\vdash\mathtt{twice(s)}:\gsub{std::string}
           \;\Rightarrow\;
           \exprnt{\gsub{std::string}}\to
             \code{twice(}\exprnt{\gsub{std::string}}\code{)}
@@ -1191,12 +1226,10 @@ std::vector<Animal> as = ds;
     \nointerlineskip
     \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\textwidth]{apiguarantee}
       {\small\bfseries\color{apiteal}CFG generation}
-      \hfill
-      {\footnotesize enumerate ground states; validate exact contexts}
 
       \vspace{0.2em}
       {\footnotesize Cannot infer that $F\langle D\rangle$ converts to
-      $F\langle B\rangle$ merely from $D<:B$. Emit a rule only when the \CC API supplies and accepts that conversion.}
+      $F\langle B\rangle$ from $D<:B$ alone. Emit a rule only when \CC library supplies and accepts a specific conversion.}
     \end{beamercolorbox}
   \end{frame}
 
@@ -1220,34 +1253,36 @@ std::vector<Animal> as = ds;
   \begin{columns}[T,onlytextwidth]
     \column{\boxgridcolumn}
       \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\linewidth,vmode]{apisurface}
-        {\small\bfseries\color{apiblue}Dataset \& unit}
+        {\small\bfseries\color{apiblue}Dataset}
 
         \vspace{0.1em}
         {\footnotesize
         \begin{itemize}
           \setlength{\itemsep}{0.24em}
           \setlength{\parskip}{0pt}
-          \item Standalone \texttt{.cpp} files; each compiles in isolation
-          \item Hold out one whole statement at its original site
+          \item Dataset of standalone \texttt{.cpp} files; each compiles cleanly
+          \item Hold out one whole statement at its original location
           \item Build $G_\Gamma$ from context $\Gamma$
+          \item Try to reconstruct from LTR tokenwise unmasking
         \end{itemize}}
 
-        \vspace{1.45em}
+        \vspace{-0.35em}
       \end{beamercolorbox}
 
     \column{\boxgridcolumn}
       \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\linewidth,vmode]{apiprojection}
         {\small\bfseries\color{apiblue}Whole-statement measures}
 
-        \vspace{0.35em}
+        \vspace{0.55em}
         {\footnotesize
         \textcolor{apigreen}{\bfseries Precision}\enspace
         reference-compiler acceptance rate of token-bounded uniform samples
         from $\mathcal L(G_\Gamma)$.
 
-        \vspace{0.55em}
+        \vspace{0.65em}
         \textcolor{apiblue}{\bfseries Recall}\enspace
         fraction of whole statements admitted after fresh-name/literal normalization.}
+        \vspace{0.25em}
       \end{beamercolorbox}
   \end{columns}
 
@@ -1262,7 +1297,7 @@ std::vector<Animal> as = ds;
       {\scriptsize\bfseries\color{apiblue}Held-out statement $x^*$}
       \lstset{%
         style=grammarcpp,
-        basicstyle=\ttfamily\fontsize{5.7}{6.9}\selectfont,
+        basicstyle=\ttfamily\fontsize{6.3}{6.9}\selectfont,
         emph={animal},
         emphstyle=\bfseries\color{apiblue},
         aboveskip=0.25em,
@@ -1279,7 +1314,7 @@ for (const auto& animal : animals)
       {\scriptsize\bfseries\color{apiteal}Normalized form admitted by $G_\Gamma$}
       \lstset{%
         style=grammarcpp,
-        basicstyle=\ttfamily\fontsize{5.7}{6.9}\selectfont,
+        basicstyle=\ttfamily\fontsize{6.3}{6.9}\selectfont,
         emph={fresh_id},
         emphstyle=\bfseries\color{apiteal},
         aboveskip=0.25em,
@@ -1422,10 +1457,9 @@ for (const auto& {fresh_id} : animals)
     \end{axis}
   \end{tikzpicture}
 
-  \vspace{-0.55em}
   {\scriptsize\color{black!60}
     At each prefix cutoff of a statement $\sigma\tau'$, $\sigma$ is observed and
-    $\tau'$ held out; the curve shows mean rank and variance. Registered-report target; simulated values only.}
+    $\tau'$ held out; the curve shows mean rank and variance. Hypothetical rank curve: simulated values only.}
 \end{frame}
 
   \begin{frame}[t]{Future work}
@@ -1470,7 +1504,7 @@ for (const auto& {fresh_id} : animals)
       {\small\bfseries\color{apiteal}Smarter generation}
 
       \vspace{0.1em}
-      {\scriptsize
+      {\footnotesize
       \begin{itemize}
         \setlength{\itemsep}{0.3em}
         \setlength{\parskip}{0pt}
@@ -1486,7 +1520,7 @@ for (const auto& {fresh_id} : animals)
       {\small\bfseries\color{apiamber}Performance optimizations}
 
       \vspace{0.1em}
-      {\scriptsize
+      {\footnotesize
       \begin{itemize}
         \setlength{\itemsep}{0.3em}
         \setlength{\parskip}{0pt}

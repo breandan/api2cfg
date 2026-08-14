@@ -8,7 +8,7 @@ Typical use:
     export GITHUB_TOKEN=ghp_...   # strongly recommended; unauthenticated limits are too low
     python measure_statement_lengths_cache_recovery.py \
         --out-dir stmtlen-study \
-        --languages java,kotlin,python,cpp,c,javascript,typescript,rust,go,csharp \
+        --languages java,kotlin,scala,python,cpp,c,javascript,typescript,rust,go,csharp \
         --min-files 100 \
         --min-bytes 20000 \
         --strategy repo-tree \
@@ -105,7 +105,7 @@ DEFAULT_API_VERSION = os.environ.get("GITHUB_API_VERSION", "2022-11-28")
 DEFAULT_MAX_BYTES = 1_000_000
 
 # Increment this when the statement-extraction or cache format changes.
-SCRIPT_VERSION = "2026-08-08-cache-inventory-v1"
+SCRIPT_VERSION = "2026-08-12-scala-v1"
 PARSE_CACHE_SCHEMA = 5
 LOCAL_INVENTORY_SCHEMA = 1
 
@@ -114,6 +114,7 @@ LOCAL_INVENTORY_SCHEMA = 1
 CODE_SEARCH_ANCHORS: dict[str, list[str]] = {
     "java": ["class", "return", "public", "if", "for", "new"],
     "kotlin": ["fun", "val", "var", "return", "if", "class"],
+    "scala": ["def", "val", "var", "class", "object", "import"],
     "python": ["def", "return", "import", "if", "for", "self"],
     "cpp": ["return", "include", "class", "if", "for", "std"],
     "c": ["return", "include", "if", "for", "struct", "static"],
@@ -245,6 +246,85 @@ BODY_OR_BLOCK_TYPES = {
     "initializer_list",  # avoids huge initializer declarations dominating
 }
 
+# Scala's grammar exposes expressions directly in statement positions rather than wrapping them
+# in an ``expression_statement`` node. These sets let the traversal distinguish a standalone
+# expression such as ``println(x)`` from the same expression inside an argument or initializer.
+SCALA_EXPRESSION_TYPES = {
+    "ascription_expression",
+    "assignment_expression",
+    "boolean_literal",
+    "call_expression",
+    "character_literal",
+    "do_while_expression",
+    "field_expression",
+    "floating_point_literal",
+    "for_expression",
+    "generic_function",
+    "identifier",
+    "if_expression",
+    "infix_expression",
+    "instance_expression",
+    "integer_literal",
+    "interpolated_string_expression",
+    "lambda_expression",
+    "macro_body",
+    "match_expression",
+    "method_value",
+    "null_literal",
+    "operator_identifier",
+    "parenthesized_expression",
+    "postfix_expression",
+    "prefix_expression",
+    "quote_expression",
+    "return_expression",
+    "splice_expression",
+    "string",
+    "throw_expression",
+    "try_expression",
+    "tuple_expression",
+    "unit",
+    "while_expression",
+    "wildcard",
+    "xml_expression",
+}
+
+SCALA_STATEMENT_CONTAINERS = {
+    "block",
+    "compilation_unit",
+    "early_defs",
+    "enum_body",
+    "extension_definition",
+    "indented_block",
+    "refinement",
+    "structural_type",
+    "template_body",
+    "with_template_body",
+}
+
+SCALA_BODY_OR_BLOCK_TYPES = SCALA_STATEMENT_CONTAINERS - {"compilation_unit"}
+
+SCALA_STATEMENT_BODY_FIELDS = {
+    "case_clause": {"body"},
+    "do_while_expression": {"body"},
+    "for_expression": {"body"},
+    "if_expression": {"alternative", "consequence"},
+    "match_expression": {"body"},
+    "try_expression": {"body"},
+    "while_expression": {"body"},
+}
+
+# Function definitions are not themselves measurements, but their expression body is a statement
+# position that must still be analyzed. Braced and indented bodies are handled as containers.
+SCALA_DEFINITION_BODY_FIELDS = {"function_definition": {"body"}}
+
+# These grammar nodes leave their expression body unnamed. Other expression children either have
+# a field (for example a lambda's parameters) or are not valid children of these parent types.
+SCALA_UNFIELDED_STATEMENT_BODY_PARENTS = {"finally_clause", "lambda_expression"}
+
+SCALA_CASE_BODY_TYPES = {"case_block", "indented_cases"}
+
+SCALA_LITERAL_ATOMS = {"floating_point_literal", "interpolated_string_expression"}
+
 
 @dataclass(frozen=True)
 class LangSpec:
@@ -300,6 +380,24 @@ LANGS: dict[str, LangSpec] = {
                 "control_statement",
                 "loop_statement",
                 "jump_expression",
+            }
+        ),
+    ),
+    "scala": LangSpec(
+        "scala",
+        "Scala",
+        "Scala",
+        "scala",
+        (".scala",),
+        frozenset(
+            {
+                "export_declaration",
+                "given_definition",
+                "import_declaration",
+                "val_declaration",
+                "val_definition",
+                "var_declaration",
+                "var_definition",
             }
         ),
     ),
@@ -1285,17 +1383,104 @@ def sample_files(
     return [rec for key in selected_keys for rec in final.get(key, [])]
 
 
-def is_statement_node(node_type: str, spec: LangSpec) -> bool:
+def is_body_or_block_type(node_type: str, spec: LangSpec) -> bool:
+    return node_type in BODY_OR_BLOCK_TYPES or (
+        spec.key == "scala" and node_type in SCALA_BODY_OR_BLOCK_TYPES
+    )
+
+
+def is_scala_expression_statement(
+        parent_type: str | None,
+        field_name: str | None,
+        parent_is_statement: bool,
+        parent_statement_body_context: str | None,
+) -> bool:
+    return is_scala_statement_slot(
+        parent_type,
+        field_name,
+        parent_is_statement,
+        parent_statement_body_context,
+    )
+
+
+def is_scala_statement_slot(
+        parent_type: str | None,
+        field_name: str | None,
+        parent_is_statement: bool,
+        parent_statement_body_context: str | None,
+) -> bool:
+    if parent_type in SCALA_STATEMENT_CONTAINERS:
+        return True
+    if field_name in SCALA_DEFINITION_BODY_FIELDS.get(parent_type or "", set()):
+        return True
+    if parent_is_statement and field_name in SCALA_STATEMENT_BODY_FIELDS.get(
+            parent_type or "", set()
+    ):
+        return True
+    if parent_is_statement and (
+        parent_type in SCALA_UNFIELDED_STATEMENT_BODY_PARENTS
+        and field_name is None
+    ):
+        return True
+    if parent_statement_body_context == "catch":
+        return field_name in {None, "body"}
+    if parent_statement_body_context == "finally":
+        return field_name is None
+    return False
+
+
+def is_statement_node(
+        node_type: str,
+        spec: LangSpec,
+        *,
+        parent_type: str | None = None,
+        field_name: str | None = None,
+        parent_is_statement: bool = False,
+        parent_statement_body_context: str | None = None,
+) -> bool:
     if node_type in EXCLUDED_DECLARATION_TYPES:
         return False
     if node_type in spec.statement_types:
         return True
+    if spec.key == "scala" and node_type == "case_clause":
+        return parent_statement_body_context == "case"
+    if spec.key == "scala" and node_type in SCALA_EXPRESSION_TYPES:
+        return is_scala_expression_statement(
+            parent_type,
+            field_name,
+            parent_is_statement,
+            parent_statement_body_context,
+        )
     # Conservative fallback for grammars with explicit *_statement nodes.
-    return node_type.endswith("_statement") and node_type not in BODY_OR_BLOCK_TYPES
+    return node_type.endswith("_statement") and not is_body_or_block_type(node_type, spec)
 
 
 def child_count(node: Any) -> int:
     return int(getattr(node, "child_count", 0))
+
+
+def scala_statement_body_context(
+        node_type: str,
+        parent_type: str | None,
+        field_name: str | None,
+        parent_is_statement: bool,
+        parent_statement_body_context: str | None,
+) -> str | None:
+    if node_type in SCALA_CASE_BODY_TYPES and is_scala_statement_slot(
+            parent_type,
+            field_name,
+            parent_is_statement,
+            parent_statement_body_context,
+    ):
+        return "case"
+    if parent_is_statement and parent_type == "try_expression":
+        if node_type == "catch_clause":
+            return "catch"
+        if node_type == "finally_clause":
+            return "finally"
+    if parent_statement_body_context == "catch" and node_type in SCALA_CASE_BODY_TYPES:
+        return "case"
+    return None
 
 
 def _advance_cursor_after_subtree(cursor: Any) -> bool:
@@ -1321,17 +1506,71 @@ def token_count_for_node(node: Any, spec: LangSpec, *, root_statement: Any | Non
     total = 0
     cursor = node.walk()
     is_root = True
+    ancestor_types: list[str] = []
+    ancestor_is_statement: list[bool] = []
+    ancestor_statement_body_contexts: list[str | None] = []
 
     while True:
         cur = cursor.node
         node_type = cur.type
+        depth = int(cursor.depth)
+        del ancestor_types[depth:]
+        del ancestor_is_statement[depth:]
+        del ancestor_statement_body_contexts[depth:]
+        parent_type = ancestor_types[-1] if ancestor_types else None
+        parent_is_statement = ancestor_is_statement[-1] if ancestor_is_statement else False
+        parent_statement_body_context = (
+            ancestor_statement_body_contexts[-1]
+            if ancestor_statement_body_contexts
+            else None
+        )
+        field_name = cursor.field_name
+        current_is_statement = is_root or is_statement_node(
+            node_type,
+            spec,
+            parent_type=parent_type,
+            field_name=field_name,
+            parent_is_statement=parent_is_statement,
+            parent_statement_body_context=parent_statement_body_context,
+        )
+        current_statement_body_context = (
+            scala_statement_body_context(
+                node_type,
+                parent_type,
+                field_name,
+                parent_is_statement,
+                parent_statement_body_context,
+            )
+            if spec.key == "scala"
+            else None
+        )
+        current_is_statement_slot = spec.key == "scala" and is_scala_statement_slot(
+            parent_type,
+            field_name,
+            parent_is_statement,
+            parent_statement_body_context,
+        )
         prune = False
 
         if node_type in EXTRA_OR_COMMENT_TYPES or node_type == "ERROR":
             prune = True
-        elif not is_root and (node_type in BODY_OR_BLOCK_TYPES or is_statement_node(node_type, spec)):
+        elif not is_root and (
+                is_body_or_block_type(node_type, spec)
+                or current_is_statement
+                or current_statement_body_context == "case"
+                or (
+                    current_is_statement_slot
+                    and (
+                        bool(getattr(cur, "is_named", False))
+                        or field_name is not None
+                        or node_type == ";"
+                    )
+                )
+        ):
             prune = True
-        elif node_type in LITERAL_ATOMS:
+        elif node_type in LITERAL_ATOMS or (
+                spec.key == "scala" and node_type in SCALA_LITERAL_ATOMS
+        ):
             total += 1
             prune = True
         elif child_count(cur) == 0:
@@ -1340,6 +1579,9 @@ def token_count_for_node(node: Any, spec: LangSpec, *, root_statement: Any | Non
             prune = True
 
         if not prune and cursor.goto_first_child():
+            ancestor_types.append(node_type)
+            ancestor_is_statement.append(current_is_statement)
+            ancestor_statement_body_contexts.append(current_statement_body_context)
             is_root = False
             continue
 
@@ -1355,12 +1597,49 @@ def iter_statement_nodes(node: Any, spec: LangSpec) -> Iterator[Any]:
     reducing the number and lifetime of Python Node wrappers in the native-parser worker.
     """
     cursor = node.walk()
+    ancestor_types: list[str] = []
+    ancestor_is_statement: list[bool] = []
+    ancestor_statement_body_contexts: list[str | None] = []
     while True:
         cur = cursor.node
-        if is_statement_node(cur.type, spec):
+        depth = int(cursor.depth)
+        del ancestor_types[depth:]
+        del ancestor_is_statement[depth:]
+        del ancestor_statement_body_contexts[depth:]
+        parent_type = ancestor_types[-1] if ancestor_types else None
+        parent_is_statement = ancestor_is_statement[-1] if ancestor_is_statement else False
+        parent_statement_body_context = (
+            ancestor_statement_body_contexts[-1]
+            if ancestor_statement_body_contexts
+            else None
+        )
+        field_name = cursor.field_name
+        current_is_statement = is_statement_node(
+            cur.type,
+            spec,
+            parent_type=parent_type,
+            field_name=field_name,
+            parent_is_statement=parent_is_statement,
+            parent_statement_body_context=parent_statement_body_context,
+        )
+        current_statement_body_context = (
+            scala_statement_body_context(
+                cur.type,
+                parent_type,
+                field_name,
+                parent_is_statement,
+                parent_statement_body_context,
+            )
+            if spec.key == "scala"
+            else None
+        )
+        if current_is_statement:
             yield cur
 
         if cursor.goto_first_child():
+            ancestor_types.append(cur.type)
+            ancestor_is_statement.append(current_is_statement)
+            ancestor_statement_body_contexts.append(current_statement_body_context)
             continue
         if not _advance_cursor_after_subtree(cursor):
             return
