@@ -101,6 +101,9 @@
   columns=fullflexible
 }
 
+\newcommand{\CC}{C\nolinebreak\hspace{-.05em}\raisebox{.4ex}{\tiny\bf +}\nolinebreak\hspace{-.10em}\raisebox{.4ex}{\tiny\bf +}}
+\def\CC{{C\nolinebreak[4]\hspace{-.05em}\raisebox{.4ex}{\tiny\bf ++}}\,}
+
 % A literal terminal in a grammar production.
 \ExplSyntaxOn
 \seq_new:N \l__api_code_parts_seq
@@ -422,6 +425,7 @@ int main(int argc, char** args) {
           ylabel={Mean lexical tokens},
           ylabel style={font=\small},
           symbolic x coords={Java,Kotlin,C,C++,C\#,Rust,Go,Scala},
+          xticklabels={Java,Kotlin,C,\CC,C\#,Rust,Go,Scala},
           xtick=data,
           xticklabel style={font=\small},
           yticklabel style={font=\small},
@@ -512,7 +516,7 @@ int main(int argc, char** args) {
         ylabel style={font=\small},
         symbolic x coords={Java,Kotlin,C,Cpp,CSharp,Rust,Go,Scala},
         xtick=data,
-        xticklabels={Java,Kotlin,C,C++,C\#,Rust,Go,Scala},
+        xticklabels={Java,Kotlin,C,\CC,C\#,Rust,Go,Scala},
         xticklabel style={font=\small},
         yticklabel style={font=\small,/pgf/number format/1000 sep={,}},
         scaled y ticks=false,
@@ -547,7 +551,7 @@ int main(int argc, char** args) {
         \end{axis}
       \end{tikzpicture}
 
-      \caption{C++ is a syntactically feature-rich language. Grammar size calculated from Tree-sitter reference CFGs, where $|G|\coloneqq\sum\limits_{\mathclap{\substack{w\,\in V\\(w\,\rightarrow\,\sigma)\in P}}}|w\sigma|$.}
+      \caption{\CC is a syntactically feature-rich language. Grammar size calculated from Tree-sitter reference CFGs, where $|G|\coloneqq\sum\limits_{\mathclap{\substack{w\,\in V\\(w\,\rightarrow\,\sigma)\in P}}}|w\sigma|$.}
     \end{figure}
   \end{frame}
 
@@ -657,7 +661,7 @@ int main(int argc, char** args) {
     \vspace{-0.15em}
     \begin{columns}[T,onlytextwidth]
       \hspace{-0.5cm}\column{0.50\textwidth}
-        {\scriptsize\bfseries C++ context}
+        {\scriptsize\bfseries \CC context}
 
         \vspace{0.18em}
         \begingroup
@@ -726,18 +730,15 @@ int main(int argc, char** args) {
         \mindent{\grow<12->{%
           \{\,\mathsf{Str}\to\code{bang}\,\} \color{black!30}{\,\:\rightarrow G_\Gamma}
         }}
-        \mindent{\grow<13->{\mathcal{L}(G_{\Gamma})}}
+        \mindent{\grow<13->{\Gamma \vdash \mathcal{L}(G_{\Gamma})}}
         \mindent{}
         \endgroup
     \end{columns}
   \end{frame}
 
   \begin{frame}[t,fragile]{Nominal typing judgements}
-    % Box grid used from this slide onward. Rounded beamer boxes paint 4bp
-    % beyond their nominal width; reserving that bleed here keeps the visible
-    % edges on one grid and leaves a true \boxgridgap between paired boxes.
-    \gdef\boxgridgap{0.8em}
-    \gdef\boxgridcolumn{\dimexpr.5\textwidth-4bp-.4em\relax}
+    \gdef\boxgridgap{0.5em}
+    \gdef\boxgridcolumn{\dimexpr(\textwidth-\boxgridgap-8bp)/2\relax}
     \gdef\boxgridrowgap{0.3em}
     \gdef\boxgridtopskip{0.15cm}
 
@@ -752,26 +753,29 @@ int main(int argc, char** args) {
       \centering
       {\fontsize{10.2}{12.8}\selectfont $\Gamma\vdash e:T$}
       \qquad
-      {\footnotesize C++ accepts $e$ and gives it the concrete type $T$.}
+      {\footnotesize \CC accepts $e$ and gives it the concrete type $T$.}
     \end{beamercolorbox}
 
-    \vspace{\boxgridrowgap}
+    \vspace{\boxgridgap}
     \nointerlineskip
     \begin{columns}[t,onlytextwidth]
       \column{\boxgridcolumn}
         \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\linewidth,vmode]{apieditor}
-          {\small\bfseries\color{apiblue}C++ program}
+          {\small\bfseries\color{apiblue}\CC program}
 
           \vspace{0.15em}
           \lstset{%
             style=grammarcpp,
-            basicstyle=\ttfamily\fontsize{6.6}{7.3}\selectfont,
+            basicstyle=\ttfamily\fontsize{8}{7.3}\selectfont,
+            xleftmargin=0.8em,
             aboveskip=0.1em,
             belowskip=0.05em
           }
 \begin{lstlisting}
 struct Meter {
-  int read(int n) { return n + 1; }
+  int read(int n) {
+    return n + 1;
+  }
 };
 int main() {
   Meter m;
@@ -805,16 +809,16 @@ int main() {
         \end{beamercolorbox}
     \end{columns}
 
-    \vspace{\boxgridrowgap}
+    \vspace{\boxgridgap}
     \nointerlineskip
     \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\textwidth]{apiguarantee}
       {\small\bfseries\color{apiteal}Embedding}
       \vspace{0.1em}
-      {\scriptsize Substitute locally bound names with typed slots.}
+      {\footnotesize Substitute locally bound names with typed slots.}
     \end{beamercolorbox}
   \end{frame}
 
-  \begin{frame}[t,fragile]{Subtyping: tracking inheritance}
+  \begin{frame}[t,fragile]{Subtyping rules}
     \vspace{\boxgridtopskip}
     \nointerlineskip
     \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\textwidth]{apisurface}
@@ -824,21 +828,22 @@ int main() {
         $\mathtt{Dog}<:\mathtt{Animal}$}
 
       \vspace{0.1em}
-      {\scriptsize \texttt{Dog} publicly inherits \texttt{Animal}, so \texttt{d}
+      {\footnotesize \texttt{Dog} publicly inherits \texttt{Animal}, so \texttt{d}
       may be passed to \texttt{age} as an \texttt{Animal}.}
     \end{beamercolorbox}
 
-    \vspace{\boxgridrowgap}
+    \vspace{\boxgridgap}
     \nointerlineskip
     \begin{columns}[t,onlytextwidth]
       \column{\boxgridcolumn}
         \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\linewidth,vmode]{apieditor}
-          {\small\bfseries\color{apiblue}C++ program}
+          {\small\bfseries\color{apiblue}\CC program}
 
           \vspace{0.1em}
           \lstset{%
             style=grammarcpp,
-            basicstyle=\ttfamily\fontsize{6.7}{7.6}\selectfont,
+            basicstyle=\ttfamily\fontsize{8}{7.6}\selectfont,
+            xleftmargin=0.8em,
             aboveskip=0.1em,
             belowskip=0.05em
           }
@@ -873,33 +878,178 @@ int main() {
             \end{gathered}
           $}
 
-          \vspace{0.45em}
-          {\scriptsize \texttt{age} is contravariant in the input.}
+          \vspace{1.2em}
         \end{beamercolorbox}
     \end{columns}
 
-    \vspace{\boxgridrowgap}
+    \vspace{\boxgridgap}
     \nointerlineskip
     \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\textwidth]{apiwarning}
       {\small\bfseries\color{apiamber}Scoped subtype inclusion}
 
       \vspace{0.1em}
-      {\scriptsize Only track well-scoped subtypes and embed each subtype monomorphically.}
+      {\footnotesize Only track well-scoped subtypes and embed each subtype monomorphically.}
     \end{beamercolorbox}
   \end{frame}
 
-  \begin{frame}[t,fragile]{Templates: try concrete types, keep valid rules}
+  \begin{frame}[t,fragile]{Overload resolution}
     \vspace{\boxgridtopskip}
+    \nointerlineskip
+    \begin{columns}[T,onlytextwidth]
+      \column{\boxgridcolumn}
+        \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\linewidth,vmode]{apieditor}
+          {\small\bfseries\color{apiblue}Ambiguous candidates}
+
+          \vspace{0.15em}
+          \lstset{%
+            style=grammarcpp,
+            basicstyle=\ttfamily\fontsize{8}{8.0}\selectfont,
+            xleftmargin=0.8em,
+            aboveskip=0.1em,
+            belowskip=0.05em
+          }
+          \vspace{0.6em}
+\begin{lstlisting}
+struct A {}; struct B {};
+struct D : A, B {};
+int f(A); int f(B);
+D d; A a; B b;
+int n = f(a);
+int m = f(b);
+int o = f(d); // ambiguous
+\end{lstlisting}
+        \end{beamercolorbox}
+
+      \column{\boxgridcolumn}
+        \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\linewidth,vmode]{apiprojection}
+          {\small\bfseries\color{apiblue}\CC resolves whole calls}
+
+          \vspace{0.35em}
+          \centering
+          {\fontsize{8.1}{10.2}\selectfont
+          $\mathtt{f(A)}:\mathtt{D}\to\mathtt{A}$
+          \qquad
+          $\mathtt{f(B)}:\mathtt{D}\to\mathtt{B}$}
+
+          \vspace{0.35em}
+          {\footnotesize Both candidates are viable by conversion but unresolvable.}
+
+          \vspace{0.35em}
+          {\fontsize{7.8}{9.8}\selectfont
+          $\displaystyle
+            \operatorname{resolve}_{\Gamma}\big(\code{f(d)}\big) = \:\:?$}
+        \end{beamercolorbox}
+    \end{columns}
+
+    \vspace{\boxgridgap}
+    \nointerlineskip
+    \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\textwidth]{apiwarning}
+      {\small\bfseries\color{apiamber}Local subtype closure is unsound}
+
+      \vspace{0.2em}
+      \centering
+      {\fontsize{7.4}{9.4}\selectfont
+      $\displaystyle
+        \left.
+        \begin{aligned}
+          \exprnt{\mathtt{int}}&\to\code{f(}\exprnt{X\,}\code{)}\\
+          \exprnt{X\,}&\to\exprnt{\mathtt D}
+        \end{aligned}
+        \right\}
+        X\in\{\mathtt A,\mathtt B\}
+        \Rightarrow_{G_\Gamma}
+        \exprnt{\mathtt{int}}\Rightarrow^*
+          \code{f(}\exprnt{\mathtt D}\code{)}$
+      }
+
+      \vspace{0.2em}
+      \raggedright
+      {\footnotesize Local subtype expansion derives
+      \texttt{f(}$\exprnt{\mathtt D}$\texttt{)}, but \CC rejects $\code{f(d)}$ as ambiguous.}
+
+      \vspace{0.2em}
+      {\footnotesize\textcolor{apiteal}{\bfseries Resolve before lowering.}
+      Emit a ground call production only when the exact call has a unique best
+      viable function; ambiguous calls emit no production.}
+    \end{beamercolorbox}
+  \end{frame}
+
+  \begin{frame}[t,fragile]{Covariance and contravariance}
+    \vspace{\boxgridtopskip}
+    \nointerlineskip
+    \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\textwidth,vmode]{apisurface}
+      {\small\bfseries\color{apiblue}Subtype setup}
+      \hfill
+
+      \vspace{0.8em}
+      \lstset{%
+        style=grammarcpp,
+        basicstyle=\ttfamily\fontsize{8}{8}\selectfont,
+        xleftmargin=0.8em,
+        aboveskip=0.1em,
+        belowskip=0.05em
+      }
+\begin{lstlisting}
+struct A {}; struct A_: A {};
+struct B {}; struct B_: B {};
+B f(A); B_ g(A_);
+A a; A_ a_;
+\end{lstlisting}
+    \end{beamercolorbox}
+
+    \vspace{\boxgridgap}
     \nointerlineskip
     \begin{columns}[t,onlytextwidth]
       \column{\boxgridcolumn}
+        \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\linewidth,vmode]{apiprojection}
+          {\small\bfseries\color{apiblue}Input position: contravariant}
+
+          \vspace{0.4em}
+          {\footnotesize
+          \textcolor{apigreen}{\checkmark}\enspace
+          \texttt{f(a\_); f(a);}\par
+          \textcolor{apired}{$\times$}\enspace
+          \texttt{g(a);}\enspace\textcolor{apired}{\scriptsize Error}}
+
+          \vspace{0.55em}
+          {\footnotesize An \texttt{A\_} value may be passed to a \texttt{A} parameter but not vis versa.}
+        \end{beamercolorbox}
+
+      \column{\boxgridcolumn}
+        \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\linewidth,vmode]{apiguarantee}
+          {\small\bfseries\color{apiteal}Result position: covariant}
+
+          \vspace{0.4em}
+          {\footnotesize
+          \textcolor{apigreen}{\checkmark}\enspace
+          \texttt{B \ b \ = g(a\_);}\par
+          \textcolor{apired}{$\times$}\enspace
+          \texttt{B\_ b\_ = f(a);}\enspace
+          \textcolor{apired}{\scriptsize Error}\par
+          \vphantom{\texttt{g(a);}}}
+
+          \vspace{0.55em}
+          {\footnotesize A \texttt{B\_} result may widen to \texttt{B}; a
+          \texttt{B} result cannot narrow to \texttt{B\_}.}
+
+          \vspace{1.35em}
+        \end{beamercolorbox}
+    \end{columns}
+  \end{frame}
+
+  \begin{frame}[t,fragile]{Template handling}
+    \vspace{\boxgridtopskip}
+    \nointerlineskip
+    \begin{columns}[T,onlytextwidth]
+      \column{\boxgridcolumn}
         \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\linewidth,vmode]{apieditor}
-          {\small\bfseries\color{apiblue}C++ program}
+          {\small\bfseries\color{apiblue}\CC program}
 
           \vspace{0.1em}
           \lstset{%
             style=grammarcpp,
-            basicstyle=\ttfamily\fontsize{6.1}{7.0}\selectfont,
+            basicstyle=\ttfamily\fontsize{8}{9.0}\selectfont,
+            xleftmargin=0.8em,
             aboveskip=0.1em,
             belowskip=0.05em
           }
@@ -908,20 +1058,22 @@ int main() {
 #include <vector>
 using std::string;
 template<class T>
-T twice(T x) { return x + x; }
+T twice(T x) { return x+x; }
 int main() {
-  int i = 2; int n = twice(i);
-  string h = "ha"; string s = twice(h);
-  return n != 4 || s != "haha";
+    string s;
+    std::vector<int> d;
+    twice(1); // ok
+    twice(s); // ok
+    twice(d); // + undefined
 }
 \end{lstlisting}
         \end{beamercolorbox}
 
       \column{\boxgridcolumn}
         \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\linewidth,vmode]{apiprojection}
-          {\small\bfseries\color{apiblue}Try three concrete types}
+          {\small\bfseries\color{apiblue}Try concrete types}
 
-          \vspace{0.45em}
+          \vspace{1.55em}
           {\footnotesize
           \begin{tabular}{@{}l@{\hspace{0.6em}}l@{}}
             \texttt{int} & \textcolor{apigreen}{\checkmark\ accepted}\\[0.35em]
@@ -929,15 +1081,15 @@ int main() {
             \texttt{std::vector<int>} & \textcolor{apired}{$\times$ rejected}\\
           \end{tabular}}
 
-          \vspace{0.55em}
-          {\scriptsize The vector case fails because \texttt{x + x}
+          \vspace{0.85em}
+          {\footnotesize The vector case fails because \texttt{x+x}
           is not defined for vectors.}
 
-          \vspace{0.8em}
+          \vspace{2.1em}
         \end{beamercolorbox}
     \end{columns}
 
-    \vspace{\boxgridrowgap}
+    \vspace{\boxgridgap}
     \nointerlineskip
     \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\textwidth]{apiguarantee}
       {\small\bfseries\color{apiteal}Filter successful rules}
@@ -946,117 +1098,33 @@ int main() {
       \centering
       {\fontsize{7.6}{9.8}\selectfont
       $\displaystyle
-        \begin{aligned}
-          \Gamma\vdash\mathtt{twice(i)}:\mathtt{int}
-            &\;\Longrightarrow\;
-            \exprnt{\mathtt{int}}\to
-              \code{twice(}\exprnt{\mathtt{int}}\code{)}\\[0.4em]
-          \Gamma\vdash\mathtt{twice(h)}:\gsub{std::string}
-            &\;\Longrightarrow\;
-            \exprnt{\gsub{std::string}}\to
-              \code{twice(}\exprnt{\gsub{std::string}}\code{)}
-        \end{aligned}
+        \Gamma\vdash\mathtt{twice(q)}:\gsub{std::string}
+          \;\Rightarrow\;
+          \exprnt{\gsub{std::string}}\to
+            \code{twice(}\exprnt{\gsub{std::string}}\code{)}
       $}
     \end{beamercolorbox}
 
-    \vspace{\boxgridrowgap}
+    \vspace{\boxgridgap}
     \nointerlineskip
     \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\textwidth]{apiguarantee}
-      \begin{minipage}[t]{0.45\linewidth}
+      \begin{minipage}[t]{0.40\linewidth}
         {\scriptsize\textcolor{apigreen}{\bfseries Sound:}
-        every kept rule compiles.}
-      \end{minipage}
+        every kept rule compiles}
+      \end{minipage}%
       \hfill
-      \begin{minipage}[t]{0.52\linewidth}
-        {\scriptsize\textcolor{apiblue}{\bfseries Complete within this set:}
-        all three were tried.}
+      \begin{minipage}[t]{0.57\linewidth}
+        {\scriptsize\textcolor{apiblue}{\bfseries Complete (in scope):}
+        all scoped types were tried}
       \end{minipage}
     \end{beamercolorbox}
   \end{frame}
 
-%  \begin{frame}[t,fragile]{Covariance and contravariance}
-%    \newcommand{\admits}{\mathrel{\leadsto_\Delta}}
-%
-%    \vspace{0.1cm}
-%    \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\textwidth]{apisurface}
-%      {\small\bfseries\color{apiblue}C++ admissibility---not nominal subtyping}
-%
-%      \vspace{0.3em}
-%      \centering
-%      {\fontsize{9.4}{12.0}\selectfont
-%      $\displaystyle
-%        q\admits q'
-%        \quad\Longleftrightarrow\quad
-%        \operatorname{accepts}_{\mathrm{C++}}(q\text{ where }q'\text{ is required})
-%      $}
-%
-%    \end{beamercolorbox}
-%
-%    \vspace{0.25em}
-%    \begin{columns}[T,onlytextwidth]
-%      \column{0.45\textwidth}
-%        \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\linewidth,vmode]{apieditor}
-%          {\small\bfseries\color{apiblue}Actual callable}
-%
-%          \vspace{0.2em}
-%          \lstset{%
-%            style=grammarcpp,
-%            basicstyle=\ttfamily\fontsize{6.7}{8.2}\selectfont,
-%            aboveskip=0.1em,
-%            belowskip=0.05em
-%          }
-%\begin{lstlisting}
-%struct Animal {};
-%struct Dog : Animal {};
-%Dog* rescue(Animal*);
-%\end{lstlisting}
-%
-%          \vspace{0.25em}
-%          \centering
-%          {\footnotesize $\mathtt{Animal*}\to\mathtt{Dog*}$}
-%        \end{beamercolorbox}
-%
-%      \column{0.52\textwidth}
-%        \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\linewidth]{apiguarantee}
-%          {\small\bfseries\color{apiteal}Required callable slot}
-%
-%          \vspace{0.35em}
-%          \centering
-%          {\fontsize{8.8}{11.4}\selectfont
-%          $\displaystyle
-%            \begin{gathered}
-%              \underbrace{A'\admits A}_{\text{contravariant input}}
-%              \qquad
-%              \underbrace{R\admits R'}_{\text{covariant result}}\\[0.1em]
-%              \Longrightarrow\quad
-%              \operatorname{fits}_\Delta(A\to R,\,A'\to R')
-%            \end{gathered}
-%          $}
-%
-%          \vspace{0.25em}
-%          {\fontsize{6.6}{8.1}\selectfont\ttfamily
-%            using Slot = std::function<Animal*(Dog*)>;\\
-%            Slot h = rescue; \textit{// accepted}}
-%        \end{beamercolorbox}
-%    \end{columns}
-%
-%    \vspace{0.25em}
-%    \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\textwidth]{apiwarning}
-%      {\small\bfseries\color{apiamber}C++ caveat}
-%      \hfill
-%      {\footnotesize callable compatibility $\neq$ function-pointer subtyping}
-%
-%      \vspace{0.2em}
-%      {\scriptsize \texttt{std::function} validates this wrapper construction.
-%      The CFG likewise emits only the exact contexts accepted by C++.}
-%    \end{beamercolorbox}
-%  \end{frame}
-
-  \begin{frame}[t,fragile]{Class templates: invariant by default}
+  \begin{frame}[t,fragile]{Template handling: invariant by default}
     \vspace{\boxgridtopskip}
     \nointerlineskip
     \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\textwidth]{apisurface}
-      {\small\bfseries\color{apiblue}Subtyping does not lift automatically}
+      {\small\bfseries\color{apiblue}Subtyping under parametricity}
 
       \vspace{0.35em}
       \centering
@@ -1068,10 +1136,10 @@ int main() {
       $}
 
       \vspace{0.2em}
-      {\scriptsize Class templates may optionally provide a constrained converting constructor.}
+      {\footnotesize Class templates may optionally provide a constrained converting constructor.}
     \end{beamercolorbox}
 
-    \vspace{\boxgridrowgap}
+    \vspace{\boxgridgap}
     \nointerlineskip
     \begin{columns}[t,onlytextwidth]
       \column{\boxgridcolumn}
@@ -1081,7 +1149,8 @@ int main() {
           \vspace{0.45em}
           \lstset{%
             style=grammarcpp,
-            basicstyle=\ttfamily\fontsize{6.4}{8.0}\selectfont,
+            basicstyle=\ttfamily\fontsize{7.2}{8.0}\selectfont,
+            xleftmargin=0.8em,
             aboveskip=0.1em,
             belowskip=0.05em
           }
@@ -1092,7 +1161,7 @@ std::shared_ptr<Animal> pa = pd;
 \end{lstlisting}
 
           \vspace{0.35em}
-          {\scriptsize \texttt{shared\_ptr} explicitly supplies the conversion.}
+          {\footnotesize \texttt{shared\_ptr} explicitly supplies the conversion.}
         \end{beamercolorbox}
 
       \column{\boxgridcolumn}
@@ -1102,36 +1171,36 @@ std::shared_ptr<Animal> pa = pd;
           \vspace{0.45em}
           \lstset{%
             style=grammarcpp,
-            basicstyle=\ttfamily\fontsize{6.4}{8.0}\selectfont,
+            basicstyle=\ttfamily\fontsize{7.2}{8.0}\selectfont,
+            xleftmargin=0.8em,
             aboveskip=0.1em,
             belowskip=0.05em
           }
 \begin{lstlisting}
-std::vector<Dog*> ds;
-std::vector<Animal*> as = ds;
+std::vector<Dog> ds;
+std::vector<Animal> as = ds;
 // rejected
 \end{lstlisting}
 
           \vspace{0.35em}
-          {\scriptsize The two \texttt{vector} specializations are unrelated.}
+          {\footnotesize The two \texttt{vector} specializations are unrelated.}
         \end{beamercolorbox}
     \end{columns}
 
-    \vspace{\boxgridrowgap}
+    \vspace{\boxgridgap}
     \nointerlineskip
     \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\textwidth]{apiguarantee}
-      {\small\bfseries\color{apiteal}CFG consequence}
+      {\small\bfseries\color{apiteal}CFG generation}
       \hfill
       {\footnotesize enumerate ground states; validate exact contexts}
 
       \vspace{0.2em}
-      {\scriptsize Never infer that $F\langle D\rangle$ converts to
-      $F\langle B\rangle$ merely from $D<:B$.
-      Emit a rule only when the C++ API supplies and accepts that conversion.}
+      {\footnotesize Cannot infer that $F\langle D\rangle$ converts to
+      $F\langle B\rangle$ merely from $D<:B$. Emit a rule only when the \CC API supplies and accepts that conversion.}
     \end{beamercolorbox}
   \end{frame}
 
-\begin{frame}[t,fragile]{Experimental Design Prospectus}
+\begin{frame}[t,fragile]{Experimental Design}
 % TODO: briefly discuss fresh names
 % Collect a dataset of fully standalone C++ files that compile cleanly by themselves
 % then measure precision and recall on whole statements
@@ -1154,7 +1223,7 @@ std::vector<Animal*> as = ds;
         {\small\bfseries\color{apiblue}Dataset \& unit}
 
         \vspace{0.1em}
-        {\scriptsize
+        {\footnotesize
         \begin{itemize}
           \setlength{\itemsep}{0.24em}
           \setlength{\parskip}{0pt}
@@ -1163,7 +1232,7 @@ std::vector<Animal*> as = ds;
           \item Build $G_\Gamma$ from context $\Gamma$
         \end{itemize}}
 
-        \vspace{1.65em}
+        \vspace{1.45em}
       \end{beamercolorbox}
 
     \column{\boxgridcolumn}
@@ -1171,7 +1240,7 @@ std::vector<Animal*> as = ds;
         {\small\bfseries\color{apiblue}Whole-statement measures}
 
         \vspace{0.35em}
-        {\scriptsize
+        {\footnotesize
         \textcolor{apigreen}{\bfseries Precision}\enspace
         reference-compiler acceptance rate of token-bounded uniform samples
         from $\mathcal L(G_\Gamma)$.
@@ -1187,7 +1256,7 @@ std::vector<Animal*> as = ds;
   \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\textwidth]{apiwarning}
     {\small\bfseries\color{apiamber}Name and literal normalization}
 
-    \vspace{0.35em}
+    \vspace{-0.25em}
     \begin{minipage}[t]{0.48\linewidth}
       \vspace{0pt}
       {\scriptsize\bfseries\color{apiblue}Held-out statement $x^*$}
@@ -1222,7 +1291,7 @@ for (const auto& {fresh_id} : animals)
 \end{lstlisting}
     \end{minipage}
 
-    \vspace{0.4em}
+    \vspace{1em}
     {\scriptsize
     \textcolor{apiamber}{\bfseries Fresh-name handling (capture-avoiding).}
     Only a binder introduced by the held-out statement, fresh relative to
@@ -1364,58 +1433,67 @@ for (const auto& {fresh_id} : animals)
     \nointerlineskip
     \begin{columns}[t,onlytextwidth]
       \column{\boxgridcolumn}
-        \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\linewidth,vmode]{apisurface}
-          {\small\bfseries\color{apiblue}Scale \& validate}
+        \begin{beamercolorbox}[rounded=true,sep=0.35em,wd=\linewidth,vmode]{apisurface}
+          {\small\bfseries\color{apiblue}Scale up \& validate}
 
           \vspace{0.1em}
           {\scriptsize
           \begin{itemize}
-            \setlength{\itemsep}{0.26em}
+            \setlength{\itemsep}{0.3em}
             \setlength{\parskip}{0pt}
-            \item Move from standalone files to full libraries and repository-scale corpora
-            \item Compiler-check samples; report coverage, precision/recall, time, and memory
+            \setlength{\parsep}{0pt}
+            \item Move from standalone files to full APIs and repository-scale corpora
+            \item Test samples, report coverage, precision/recall, time, and memory
           \end{itemize}}
         \end{beamercolorbox}
 
       \column{\boxgridcolumn}
-        \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\linewidth,vmode]{apiprojection}
-          {\small\bfseries\color{apiblue}Add expressivity and coverage}
+        \begin{beamercolorbox}[rounded=true,sep=0.35em,wd=\linewidth,vmode]{apiprojection}
+          {\small\bfseries\color{apiblue}Increase expressivity}
 
           \vspace{0.1em}
           {\scriptsize
           \begin{itemize}
-            \setlength{\itemsep}{0.26em}
+            \setlength{\itemsep}{0.3em}
             \setlength{\parskip}{0pt}
-            \item Add fields, operators, conversions, variadics, and larger arities
-            \item Target more languages; explore DCGs for binders and richer type constraints
+            \setlength{\parsep}{0pt}
+            \item Add fields, operators, conversions, variadics, and higher arities
+            \item Target more languages; explore DCGs and richer type constraints
           \end{itemize}}
 
-          \vspace{1.0em}
         \end{beamercolorbox}
     \end{columns}
 
-    \vspace{\boxgridrowgap}
+    \vspace{\boxgridgap}
     \nointerlineskip
-    \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\textwidth]{apiguarantee}
+    \begin{beamercolorbox}[rounded=true,sep=0.35em,wd=\textwidth]{apiguarantee}
       {\small\bfseries\color{apiteal}Smarter generation}
 
       \vspace{0.1em}
       {\scriptsize
       \begin{itemize}
-        \setlength{\itemsep}{0.26em}
+        \setlength{\itemsep}{0.3em}
         \setlength{\parskip}{0pt}
+        \setlength{\parsep}{0pt}
         \item Materialize only productions reachable from the current prefix; quotient symmetric states
         \item Among CFG-admitted completions, use corpus or model scores to put likely continuations first
       \end{itemize}}
     \end{beamercolorbox}
 
-    \vspace{\boxgridrowgap}
+    \vspace{\boxgridgap}
     \nointerlineskip
-    \begin{beamercolorbox}[rounded=true,sep=0.4em,wd=\textwidth]{apiwarning}
+    \begin{beamercolorbox}[rounded=true,sep=0.35em,wd=\textwidth]{apiwarning}
+      {\small\bfseries\color{apiamber}Performance optimizations}
+
+      \vspace{0.1em}
       {\scriptsize
-      \textcolor{apiamber}{\bfseries Performance optimizations}\\
-      \textbf{Lazy construction}: can we generate the same bounded language with less memory?\\
-      \textbf{Reranking}: can we generate the same valid candidates with a lower held-out rank?}
+      \begin{itemize}
+        \setlength{\itemsep}{0.3em}
+        \setlength{\parskip}{0pt}
+        \setlength{\parsep}{0pt}
+        \item \textbf{Lazy construction:} same bounded language, less memory?
+        \item \textbf{Reranking:} same valid candidates, lower held-out rank?
+      \end{itemize}}
     \end{beamercolorbox}
   \end{frame}
 \end{document}
