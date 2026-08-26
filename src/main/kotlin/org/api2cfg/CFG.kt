@@ -1,7 +1,7 @@
 package org.api2cfg
 
 enum class TargetLanguage {
-  KOTLIN, JAVA;
+  KOTLIN, JAVA, CPP;
 
   companion object {
     fun fromPackageName(packageName: String): TargetLanguage =
@@ -295,6 +295,7 @@ object PrimitiveLiteralRules {
   private fun rulesFor(targetLanguage: TargetLanguage): List<LiteralRule> = when (targetLanguage) {
     TargetLanguage.KOTLIN -> KotlinLiteralRules
     TargetLanguage.JAVA -> JavaLiteralRules
+    TargetLanguage.CPP -> CppLiteralRules
   }
 }
 
@@ -332,6 +333,19 @@ private val JavaLiteralRules = listOf(
   LiteralRule("Long", "0L"),
   LiteralRule("Short", "0"),
   LiteralRule("String", "\"s\""),
+)
+
+private val CppLiteralRules = listOf(
+  LiteralRule("bool", "true"),
+  LiteralRule("char", "'x'"),
+  LiteralRule("double", "0.0"),
+  LiteralRule("float", "0.0f"),
+  LiteralRule("int", "0"),
+  LiteralRule("long", "0L"),
+  LiteralRule("long_long", "0LL"),
+  LiteralRule("unsigned", "0u"),
+  LiteralRule("unsigned_long", "0ul"),
+  LiteralRule("unsigned_long_long", "0ull"),
 )
 
 fun toChomskyNormalForm(productions: Iterable<Production>, start: TypeExpr): Set<Production> =

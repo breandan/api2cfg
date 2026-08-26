@@ -1354,6 +1354,7 @@ private fun TypeExpr.typeArgumentPriority(targetLanguage: TargetLanguage): Int {
   val priority = when (targetLanguage) {
     TargetLanguage.KOTLIN -> KotlinTypeArgumentPriority
     TargetLanguage.JAVA -> JavaTypeArgumentPriority
+    TargetLanguage.CPP -> emptyMap()
   }
   return priority[render()] ?: 100
 }
@@ -1747,6 +1748,7 @@ private val UnsupportedReflectionCallableNames = setOf("clone", "finalize")
 private fun TargetLanguage.topTypeName(): String = when (this) {
   TargetLanguage.KOTLIN -> KotlinTopTypeName
   TargetLanguage.JAVA -> JavaTopTypeName
+  TargetLanguage.CPP -> error("C++ has no universal top type; use Cpp26CFGGenerator")
 }
 
 private fun TargetLanguage.topType(): TypeExpr = TypeExpr.Applied(topTypeName())

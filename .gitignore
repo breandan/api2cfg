@@ -48,6 +48,7 @@ __pycache__/
 *.py[cod]
 .mypy_cache/
 .pytest_cache/
+/data/Project_CodeNet.tar.gtar
 
 ### LaTeX ###
 /latex/*

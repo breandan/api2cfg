@@ -10,6 +10,7 @@ repositories { mavenCentral() }
 
 dependencies {
   implementation(kotlin("reflect"))
+  implementation("com.fasterxml.jackson.core:jackson-core:2.18.3")
   testImplementation(kotlin("test"))
   implementation("io.github.classgraph:classgraph:4.8.184")
 }
@@ -25,4 +26,11 @@ tasks.register<JavaExec>("runClassGraph") {
   description = "Generate a grammar with the ClassGraph-backed implementation"
   classpath = sourceSets["main"].runtimeClasspath
   mainClass.set("org.api2cfg.ClassGraphKt")
+}
+
+tasks.register<JavaExec>("runCpp26") {
+  group = "application"
+  description = "Generate a C++26 standard-library statement grammar"
+  classpath = sourceSets["main"].runtimeClasspath
+  mainClass.set("org.api2cfg.cpp26.CliKt")
 }

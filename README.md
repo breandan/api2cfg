@@ -58,14 +58,73 @@ The right-to-left direction is **soundness**; the left-to-right direction is **c
 
 ## Backends
 
-There are three backend families:
+There are four backend families:
 
 | Backend | API source | Example |
 | --- | --- | --- |
 | JVM reflection | Classes loaded on the runtime classpath | `./gradlew run --args='java.util'` |
 | ClassGraph | JVM bytecode and generic-signature metadata | `./gradlew runClassGraph --args='java.util.function'` |
+| C++26 | Installed standard-library headers through Clang | `./gradlew runCpp26 --args='--header=vector --header=random'` |
 | Python | Runtime reflection or static `.pyi` files | `python3 main.py numpy`<br>`python3 main_pyi.py --alias=torch torch` |
 
 The JVM reflection and Python reflection backends also support `--parameterized`. Every backend supports `--cnf`.
 
 Generated grammars are written under `gen/` as `.cfg` files, or `.cnf` files when Chomsky normalization is requested.
+
+## C++26 standard library
+
+The C++ backend is implemented in one package under
+`src/main/kotlin/org/api2cfg/cpp26`. It asks `clang++` for a streamed declaration
+AST, exposes that metadata as an immutable `CppTypeGraph`, and lowers a bounded
+surface into the shared CFG representation. The graph retains templates,
+aliases, inheritance, access, cv qualifiers, pointers, and reference/value
+categories; the CFG only includes declarations that fit this initial fragment:
+
+```text
+statement  ::= expression ;
+expression ::= literal
+             | context-slot
+             | qualified-value
+             | qualified-type ( arguments )
+             | expression . identifier ( arguments )
+             | qualified-type :: identifier ( arguments )
+             | expression ( arguments )
+arguments  ::= ε | expression | expression , expression
+             | expression , expression , expression
+```
+
+This covers construction and ordinary calls, including random engines and
+distribution `operator()`. Other operators, fields, conversions, variadics,
+and calls with more than three arguments are currently omitted. Non-const
+lvalue and rvalue reference parameters remain distinct context slots, such as
+`std::mt19937&`; they are not unsafely collapsed into value types.
+
+The currently curated headers and finite ground instances are:
+
+- `<vector>`: `std::vector<int>` and `std::vector<double>`
+- `<random>`: `std::random_device`, `std::mt19937`, and integer/real distributions
+- `<iostream>`: `ios_base`, the `char` stream types, and `std::cin`, `std::cout`, `std::cerr`, and `std::clog`
+
+With no `--header` flag all three are selected. Flags may be repeated or
+comma-separated, and header spelling may include angle brackets:
+
+```bash
+./gradlew runCpp26 --args='--header=<vector>,random'
+./gradlew runCpp26 --args='--header=iostream --cnf'
+./gradlew runCpp26 --args='--header=vector --clang=/path/to/clang++ --std=c++26'
+```
+
+Output is kept under `gen/cpp26/`. The scan describes the standard-library
+implementation installed with the selected compiler in C++26 mode; it is not a
+normative catalog of every declaration in ISO C++26. The default compiler flag
+is the widely supported `-std=c++2c` spelling; `--std=c++26` selects the newer
+alias when the chosen Clang provides it.
+
+The type graph can be queried before CFG lowering:
+
+```kotlin
+val graph = Cpp26Scanner().scan(listOf("vector"))
+val vector = graph.getClassInfo("std::vector<int>")
+val methods = graph.methodsOf("std::vector<int>")
+val bases = graph.allSupertypesOf("std::iostream")
+```
