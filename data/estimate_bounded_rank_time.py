@@ -29,6 +29,7 @@ import argparse
 import atexit
 import ast
 import contextlib
+import errno
 import gc
 import hashlib
 import heapq
@@ -40,6 +41,7 @@ import os
 import platform
 import signal
 import statistics
+import subprocess
 import sys
 import tempfile
 import time
@@ -48,7 +50,7 @@ from collections import Counter, defaultdict
 from concurrent.futures import Future, ProcessPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Iterator, Mapping, Sequence, TextIO
+from typing import Any, Callable, Iterator, Mapping, Sequence, TextIO
 
 import evaluate_python as evaluator
 from python_wdfa import PythonWDFA, WDFAFormatError, WDFA_INF
@@ -1290,6 +1292,95 @@ def compact_integer(value: int) -> str:
     return evaluator.compact_cardinality(value)
 
 
+_RECOVERABLE_TY_TRANSPORT_ERRNOS = frozenset(
+    value
+    for value in (
+        errno.EBADF,
+        errno.ECONNABORTED,
+        errno.ECONNRESET,
+        errno.ENOTCONN,
+        errno.EPIPE,
+        getattr(errno, "ESHUTDOWN", None),
+    )
+    if value is not None
+)
+_RECOVERABLE_TY_EVALUATION_PREFIXES = (
+    "ty language server closed its output",
+    "invalid LSP header",
+    "LSP response omitted Content-Length",
+    "invalid LSP JSON",
+    "failed to open ty language-server pipes",
+)
+
+
+def _is_recoverable_ty_transport_error(error: BaseException) -> bool:
+    """Recognize dead or desynchronized JSON-RPC pipes, including wrappers."""
+
+    pending: list[BaseException] = [error]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        identity = id(current)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        if isinstance(current, (EOFError, ConnectionError)):
+            return True
+        if (
+            isinstance(current, OSError)
+            and current.errno in _RECOVERABLE_TY_TRANSPORT_ERRNOS
+        ):
+            return True
+        message = str(current)
+        if isinstance(current, evaluator.EvaluationError) and message.startswith(
+            _RECOVERABLE_TY_EVALUATION_PREFIXES
+        ):
+            return True
+        if isinstance(current, ValueError) and message in {
+            "I/O operation on closed file",
+            "write to closed file",
+            "read of closed file",
+        }:
+            return True
+        for nested in (current.__cause__, current.__context__):
+            if isinstance(nested, BaseException):
+                pending.append(nested)
+    return False
+
+
+def _force_stop_ty_client(client: evaluator.TyLspClient) -> None:
+    """Best-effort hard stop which is safe for already-broken LSP pipes."""
+
+    process = client.process
+    try:
+        running = process.poll() is None
+    except OSError:
+        running = False
+    if running:
+        try:
+            process.kill()
+        except (OSError, ProcessLookupError):
+            pass
+    try:
+        process.wait(timeout=5)
+    except (OSError, ProcessLookupError):
+        pass
+    except subprocess.TimeoutExpired:
+        try:
+            process.kill()
+        except (OSError, ProcessLookupError):
+            pass
+        try:
+            process.wait(timeout=2)
+        except (OSError, ProcessLookupError, subprocess.TimeoutExpired):
+            pass
+    for stream in (client.stdin, client.stdout):
+        try:
+            stream.close()
+        except (OSError, ValueError):
+            pass
+
+
 def _create_rank_worker_state(config: RankWorkerConfig) -> RankWorkerState:
     temporary = tempfile.TemporaryDirectory(prefix="api2cfg-rank-worker-")
     workspace = Path(temporary.name)
@@ -1314,9 +1405,15 @@ def _create_rank_worker_state(config: RankWorkerConfig) -> RankWorkerState:
         )
     except BaseException:
         if semantics is not None:
-            semantics.close()
+            try:
+                semantics.close()
+            except BaseException:
+                _force_stop_ty_client(semantics)
         if checker is not None:
-            checker.close()
+            try:
+                checker.close()
+            except BaseException:
+                _force_stop_ty_client(checker)
         temporary.cleanup()
         raise
 
@@ -1327,15 +1424,17 @@ def _destroy_rank_worker(*, force: bool) -> None:
     _WORKER_STATE = None
     if state is None:
         return
-    if force:
+    try:
         for client in (state.semantics, state.checker):
-            if client.process.poll() is None:
-                client.process.kill()
-                client.process.wait()
-    else:
-        state.semantics.close()
-        state.checker.close()
-    state.temporary.cleanup()
+            if force:
+                _force_stop_ty_client(client)
+                continue
+            try:
+                client.close()
+            except BaseException:
+                _force_stop_ty_client(client)
+    finally:
+        state.temporary.cleanup()
 
 
 def _close_rank_worker() -> None:
@@ -1349,6 +1448,34 @@ def _restart_rank_worker() -> None:
         raise RuntimeError("rank worker configuration is unavailable")
     _destroy_rank_worker(force=True)
     _WORKER_STATE = _create_rank_worker_state(config)
+
+
+def _restart_rank_worker_reliably(
+    restart: Callable[[], None] = _restart_rank_worker,
+    attempts: int = 2,
+) -> str | None:
+    """Restart both ty clients, retrying once if server startup is transient."""
+
+    failures: list[str] = []
+    for _attempt in range(attempts):
+        try:
+            restart()
+            return None
+        except BaseException as error:
+            failures.append(f"{type(error).__name__}: {error}")
+    return "; ".join(failures)
+
+
+def _rank_worker_clients_are_running(state: RankWorkerState) -> bool:
+    """Return false when either checker or semantic ty process has exited."""
+
+    for client in (state.checker, state.semantics):
+        try:
+            if client.process.poll() is not None:
+                return False
+        except OSError:
+            return False
+    return True
 
 
 def _initialize_rank_worker(config: RankWorkerConfig) -> None:
@@ -1563,7 +1690,19 @@ def _rank_sample_impl(sample: SourceSample) -> RankOutcome:
             elapsed_seconds=time.perf_counter() - worker_started,
             censored_rank_seconds=censored,
         )
-    except (evaluator.EvaluationError, MemoryError, RecursionError) as error:
+    except evaluator.EvaluationError as error:
+        # A closed or malformed JSON-RPC stream is worker state corruption,
+        # not an ordinary per-sample semantic failure.  Let the worker
+        # boundary replace both ty clients before it accepts another job.
+        if _is_recoverable_ty_transport_error(error):
+            raise
+        return RankOutcome(
+            member=sample.member,
+            failure=type(error).__name__,
+            failure_message=str(error),
+            elapsed_seconds=time.perf_counter() - worker_started,
+        )
+    except (MemoryError, RecursionError) as error:
         return RankOutcome(
             member=sample.member,
             failure=type(error).__name__,
@@ -1576,30 +1715,141 @@ def _rank_sample_impl(sample: SourceSample) -> RankOutcome:
         gc.collect()
 
 
-def _rank_sample(sample: SourceSample) -> RankOutcome:
-    config = _WORKER_CONFIG
-    if config is None:
-        raise RuntimeError("rank worker was not initialized")
+def _rank_sample_with_recovery(
+    sample: SourceSample,
+    sample_timeout: float,
+    implementation: Callable[[SourceSample], RankOutcome],
+    restart: Callable[[], None],
+) -> RankOutcome:
+    """Run one job and replace poisoned ty clients before the next job."""
+
     started = time.perf_counter()
+    outcome: RankOutcome
     try:
-        with sample_deadline(config.sample_timeout):
-            return _rank_sample_impl(sample)
+        with sample_deadline(sample_timeout):
+            outcome = implementation(sample)
     except SampleTimeout as error:
         # The alarm may have interrupted a blocking JSON-RPC read.  Those LSP
         # streams cannot be safely reused, so replace both servers before the
         # worker accepts another source.
-        try:
-            _restart_rank_worker()
-        except BaseException as restart_error:
-            raise RuntimeError(
-                f"failed to restart worker after timeout: {restart_error}"
-            ) from restart_error
-        return RankOutcome(
+        restart_failure = _restart_rank_worker_reliably(restart)
+        message = str(error)
+        if restart_failure is not None:
+            message += f"; worker restart failed: {restart_failure}"
+        outcome = RankOutcome(
             member=sample.member,
             failure="sample_timeout",
-            failure_message=str(error),
+            failure_message=message,
             elapsed_seconds=time.perf_counter() - started,
         )
+    except Exception as error:
+        if not _is_recoverable_ty_transport_error(error):
+            raise
+        restart_failure = _restart_rank_worker_reliably(restart)
+        message = f"{type(error).__name__}: {error}"
+        if restart_failure is not None:
+            message += f"; worker restart failed: {restart_failure}"
+        outcome = RankOutcome(
+            member=sample.member,
+            failure="ty_transport_error",
+            failure_message=message,
+            elapsed_seconds=time.perf_counter() - started,
+        )
+    else:
+        # RankTimeout is deliberately converted to an outcome inside the
+        # implementation so it can preserve censored construction timing.
+        # Recycle the servers here as well: this bounds per-worker state and
+        # guarantees that every timeout path starts the next source cleanly.
+        if outcome.failure == "rank_timeout":
+            restart_failure = _restart_rank_worker_reliably(restart)
+            if restart_failure is not None:
+                message = outcome.failure_message or "rank timeout"
+                outcome = replace(
+                    outcome,
+                    failure_message=(
+                        f"{message}; worker restart failed: {restart_failure}"
+                    ),
+                )
+    return outcome
+
+
+def _rank_sample(sample: SourceSample) -> RankOutcome:
+    config = _WORKER_CONFIG
+    if config is None:
+        raise RuntimeError("rank worker was not initialized")
+    state = _WORKER_STATE
+    if state is None or not _rank_worker_clients_are_running(state):
+        restart_failure = _restart_rank_worker_reliably()
+        if restart_failure is not None:
+            return RankOutcome(
+                member=sample.member,
+                failure="worker_restart_error",
+                failure_message=restart_failure,
+            )
+    return _rank_sample_with_recovery(
+        sample,
+        config.sample_timeout,
+        _rank_sample_impl,
+        _restart_rank_worker,
+    )
+
+
+def _assert_rank_worker_recovery_contract() -> None:
+    sample = SourceSample("mock.py", b"pass\n")
+    restarts: list[None] = []
+
+    def restart() -> None:
+        restarts.append(None)
+
+    def broken_pipe(_sample: SourceSample) -> RankOutcome:
+        raise BrokenPipeError(errno.EPIPE, "mock broken pipe")
+
+    broken = _rank_sample_with_recovery(sample, 0, broken_pipe, restart)
+    assert broken.failure == "ty_transport_error"
+    assert "BrokenPipeError" in (broken.failure_message or "")
+    assert len(restarts) == 1
+
+    success = RankOutcome(sample.member, record={"event": "rank"})
+    recovered = _rank_sample_with_recovery(
+        sample, 0, lambda _sample: success, restart
+    )
+    assert recovered is success
+    assert len(restarts) == 1
+
+    timed_out = _rank_sample_with_recovery(
+        sample,
+        0,
+        lambda _sample: RankOutcome(
+            sample.member,
+            failure="rank_timeout",
+            failure_message="mock timeout",
+        ),
+        restart,
+    )
+    assert timed_out.failure == "rank_timeout"
+    assert len(restarts) == 2
+
+    def sample_timeout(_sample: SourceSample) -> RankOutcome:
+        raise SampleTimeout("mock sample timeout")
+
+    timed_out = _rank_sample_with_recovery(sample, 0, sample_timeout, restart)
+    assert timed_out.failure == "sample_timeout"
+    assert len(restarts) == 3
+
+    assert _is_recoverable_ty_transport_error(EOFError())
+    assert _is_recoverable_ty_transport_error(
+        ConnectionResetError(errno.ECONNRESET, "mock reset")
+    )
+    assert _is_recoverable_ty_transport_error(
+        evaluator.EvaluationError("ty language server closed its output (exit 101)")
+    )
+    assert not _is_recoverable_ty_transport_error(
+        evaluator.EvaluationError("ground truth is outside bounded DFA")
+    )
+
+
+if __debug__:
+    _assert_rank_worker_recovery_contract()
 
 
 def logarithmic_edges(

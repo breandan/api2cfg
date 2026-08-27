@@ -69,7 +69,7 @@ DEFAULT_APPS_DIRECTORY = Path(__file__).resolve().with_name("apps")
 DEFAULT_LIBRARY_DIRECTORY = Path(__file__).resolve().with_name("lib")
 LIBRARY_CFG_SCHEMA = "2"
 SUPPORTED_LIBRARY_CFG_SCHEMAS = frozenset({"1", LIBRARY_CFG_SCHEMA})
-ASSIGNABILITY_RELATION_VERSION = 1
+ASSIGNABILITY_RELATION_VERSION = 2
 
 
 def library_cfg_filename(module: str) -> str:
@@ -110,6 +110,7 @@ CORE_BUILTINS = frozenset(
         "abs",
         "dict",
         "enumerate",
+        "eval",
         "float",
         "input",
         "int",
@@ -155,6 +156,7 @@ CORE_MEMBERS = frozenset(
         "norm",
         "ones",
         "pop",
+        "popleft",
         "read",
         "readline",
         "readlines",
@@ -1232,8 +1234,37 @@ class SemanticProbe:
     def accepts_assignment(self, expression: str) -> bool:
         if self.required_assignment is None:
             return False
-        self._change_statement(f"{self.required_assignment} = {expression}")
-        return not error_diagnostics(self.client.diagnostics())
+        local, downstream = self.assignment_diagnostic_partition(expression)
+        return not local and not downstream
+
+    def assignment_diagnostic_partition(
+        self, expression: str
+    ) -> tuple[
+        tuple[Mapping[str, object], ...],
+        tuple[Mapping[str, object], ...],
+    ]:
+        """Return local and continuation errors for an output assignment."""
+
+        if self.required_assignment is None:
+            return (), ()
+        statement = f"{self.required_assignment} = {expression}"
+        self._change_statement(statement)
+        diagnostics = error_diagnostics(self.client.diagnostics())
+        local: list[Mapping[str, object]] = []
+        downstream: list[Mapping[str, object]] = []
+        for diagnostic in diagnostics:
+            destination = (
+                local
+                if diagnostic_overlaps_statement(
+                    diagnostic,
+                    self.hole,
+                    statement,
+                    self.client.position_encoding,
+                )
+                else downstream
+            )
+            destination.append(diagnostic)
+        return tuple(local), tuple(downstream)
 
     def diagnostics(self, statement: str) -> list[dict[str, object]]:
         self._change_statement(statement)
@@ -1347,11 +1378,13 @@ def progressive_completions(
             preference = (
                 item.detail in {"Any", "Unknown"},
                 item.detail,
+                item.kind is None,
                 -1 if item.kind is None else item.kind,
             )
             current_preference = (
                 current.detail in {"Any", "Unknown"},
                 current.detail,
+                current.kind is None,
                 -1 if current.kind is None else current.kind,
             ) if current is not None else None
             if current_preference is None or preference < current_preference:
@@ -1653,6 +1686,112 @@ def groundable_type(value: str) -> bool:
     )
 
 
+SEQUENCE_BASES = frozenset(
+    {
+        "list",
+        "tuple",
+        "str",
+        "bytes",
+        "bytearray",
+        "memoryview",
+        "range",
+        "Sequence",
+        "MutableSequence",
+    }
+)
+MUTABLE_SEQUENCE_BASES = frozenset(
+    {"list", "bytearray", "MutableSequence"}
+)
+MAPPING_BASES = frozenset(
+    {"dict", "defaultdict", "Mapping", "MutableMapping"}
+)
+MUTABLE_MAPPING_BASES = frozenset(
+    {"dict", "defaultdict", "MutableMapping"}
+)
+COLLECTION_BASES = frozenset(
+    {
+        *SEQUENCE_BASES,
+        *MAPPING_BASES,
+        "set",
+        "frozenset",
+        "deque",
+        "ValuesView",
+        "KeysView",
+        "ItemsView",
+        "dict_values",
+        "dict_keys",
+        "dict_items",
+        "Collection",
+    }
+)
+ITERATOR_BASES = frozenset(
+    {
+        "Iterator",
+        "Generator",
+        "map",
+        "filter",
+        "zip",
+        "enumerate",
+        "reversed",
+    }
+)
+ITERABLE_BASES = frozenset(
+    {
+        *COLLECTION_BASES,
+        *ITERATOR_BASES,
+        "Iterable",
+        "Reversible",
+    }
+)
+REVERSIBLE_BASES = frozenset(
+    {
+        "list",
+        "tuple",
+        "dict",
+        "defaultdict",
+        "str",
+        "bytes",
+        "bytearray",
+        "memoryview",
+        "range",
+        "deque",
+        "Sequence",
+        "MutableSequence",
+        "Reversible",
+        "_SupportsReversed",
+    }
+)
+LEN_AND_GETITEM_BASES = frozenset(
+    {
+        "list",
+        "tuple",
+        "str",
+        "bytes",
+        "bytearray",
+        "memoryview",
+        "range",
+        "deque",
+        "Sequence",
+        "MutableSequence",
+        "SupportsLenAndGetItem",
+    }
+)
+PROTOCOL_CAPABILITY_BASES: Mapping[str, frozenset[str]] = {
+    "Iterable": ITERABLE_BASES,
+    "Iterator": ITERATOR_BASES,
+    "Collection": COLLECTION_BASES,
+    "Container": COLLECTION_BASES | frozenset({"Container"}),
+    "Sequence": SEQUENCE_BASES,
+    "MutableSequence": MUTABLE_SEQUENCE_BASES,
+    "Mapping": MAPPING_BASES,
+    "MutableMapping": MUTABLE_MAPPING_BASES,
+    "Reversible": REVERSIBLE_BASES,
+    "_SupportsReversed": REVERSIBLE_BASES,
+    "SupportsLenAndGetItem": LEN_AND_GETITEM_BASES,
+}
+SIZED_BASES = COLLECTION_BASES | frozenset({"Sized"})
+
+
 @functools.lru_cache(maxsize=250_000)
 def is_assignable(actual: str, expected: str) -> bool:
     """Conservative relation over ty's rendered display types.
@@ -1736,6 +1875,26 @@ def is_assignable(actual: str, expected: str) -> bool:
             "bytes",
             "tuple",
         }
+    if (
+        TYPE_VARIABLE.fullmatch(expected)
+        and expected_base.split("@", 1)[0] == "AnyStr"
+    ):
+        # ``AnyStr`` is constrained to the two string families; treating it
+        # like an unconstrained type variable admits calls such as
+        # ``re.escape(set())`` and ``re.template("".isnumeric)``.  Literal
+        # strings retain their string constraint even when ty renders them as
+        # ``Literal[...]`` rather than ``str``.
+        return (
+            actual_base in {"str", "bytes", "LiteralString"}
+            or (
+                actual_base == "Literal"
+                and bool(actual_args)
+                and all(
+                    argument.startswith(('"', "'", "b\"", "b'"))
+                    for argument in actual_args
+                )
+            )
+        )
     if TYPE_VARIABLE.fullmatch(expected):
         return True
     if actual_base == expected_base:
@@ -1774,48 +1933,11 @@ def is_assignable(actual: str, expected: str) -> bool:
     }:
         return True
 
-    containers = {
-        "list",
-        "tuple",
-        "dict",
-        "defaultdict",
-        "set",
-        "frozenset",
-        "str",
-        "bytes",
-        "bytearray",
-        "memoryview",
-        "range",
-        "deque",
-        "Iterator",
-        "Generator",
-        "ValuesView",
-        "KeysView",
-        "ItemsView",
-        "dict_values",
-        "dict_keys",
-        "dict_items",
-        "map",
-        "filter",
-        "zip",
-        "enumerate",
-        "reversed",
-    }
-    iterable_protocols = {
-        "Iterable",
-        "Iterator",
-        "Collection",
-        "Container",
-        "Sequence",
-        "MutableSequence",
-        "Mapping",
-        "MutableMapping",
-        "Reversible",
-        "_SupportsReversed",
-        "SupportsLenAndGetItem",
-    }
-    if expected_base in iterable_protocols and actual_base in containers:
-        if not expected_args or expected_base in {"Container", "Reversible"}:
+    capability_bases = PROTOCOL_CAPABILITY_BASES.get(expected_base)
+    if capability_bases is not None:
+        if actual_base not in capability_bases:
+            return False
+        if not expected_args or expected_base == "Container":
             return True
         if actual_base == "range":
             actual_elements = ("int",)
@@ -1827,6 +1949,8 @@ def is_assignable(actual: str, expected: str) -> bool:
             actual_elements = (actual_args[1],)
         elif actual_base in {"ItemsView", "dict_items"} and len(actual_args) >= 2:
             actual_elements = (f"tuple[{actual_args[0]}, {actual_args[1]}]",)
+        elif actual_base == "tuple" and actual_args == ("()",):
+            actual_elements = ()
         elif actual_base == "tuple":
             actual_elements = tuple(
                 argument for argument in actual_args if argument != "..."
@@ -1835,22 +1959,44 @@ def is_assignable(actual: str, expected: str) -> bool:
             actual_elements = (actual_args[0],)
         else:
             return True
+
+        def invariant_argument_matches(left: str, right: str) -> bool:
+            left = normalize_type(left)
+            right = normalize_type(right)
+            return (
+                left == right
+                or left in {"Any", "Unknown"}
+                or right in {"Any", "Unknown"}
+                or TYPE_VARIABLE.fullmatch(left) is not None
+                or TYPE_VARIABLE.fullmatch(right) is not None
+            )
+
+        invariant_elements = expected_base in {
+            "MutableSequence",
+            "MutableMapping",
+        }
         element_matches = all(
-            is_assignable(actual_element, expected_args[0])
+            invariant_argument_matches(actual_element, expected_args[0])
+            if invariant_elements
+            else is_assignable(actual_element, expected_args[0])
             for actual_element in actual_elements
         )
         if not element_matches:
             return False
         if (
             expected_base in {"Mapping", "MutableMapping"}
-            and actual_base in {"dict", "defaultdict"}
+            and actual_base in MAPPING_BASES
             and len(expected_args) >= 2
             and len(actual_args) >= 2
         ):
+            if expected_base == "MutableMapping":
+                return invariant_argument_matches(
+                    actual_args[1], expected_args[1]
+                )
             return is_assignable(actual_args[1], expected_args[1])
         return True
-    if expected_base == "Sized" and actual_base in containers:
-        return True
+    if expected_base == "Sized":
+        return actual_base in SIZED_BASES
     if expected_base in {"Buffer", "ReadableBuffer", "SupportsBytes"} and actual_base in {
         "bytes",
         "bytearray",
@@ -1924,6 +2070,29 @@ def dotted_identifier_tokens(expression: str) -> tuple[str, ...] | None:
     return tuple(tokens)
 
 
+def canonical_expression_tokens(expression: str) -> tuple[str, ...] | None:
+    """Lexicalize one exact expression using the evaluator's literal policy."""
+
+    try:
+        ast.parse(expression, mode="eval")
+        stream = tokenize.generate_tokens(io.StringIO(expression).readline)
+        tokens: list[str] = []
+        for item in stream:
+            if item.type in IGNORED_TOKEN_TYPES:
+                continue
+            value = item.string
+            if item.type == tokenize.NUMBER:
+                value = canonical_number(value)
+            elif item.type == tokenize.STRING:
+                value = canonical_string(value)
+            elif item.type not in {tokenize.NAME, tokenize.OP}:
+                return None
+            tokens.append(value)
+        return tuple(tokens) or None
+    except (SyntaxError, ValueError, tokenize.TokenError):
+        return None
+
+
 @dataclass(frozen=True)
 class Parameter:
     name: str
@@ -1942,6 +2111,58 @@ class Signature:
 class ArgumentLayout:
     positional: tuple[str, ...]
     keywords: tuple[tuple[str, str], ...]
+
+
+SELF_TYPE_VARIABLE = re.compile(r"^Self(?:@[A-Za-z0-9_.:-]+)?$")
+SELF_TYPE_REFERENCE = re.compile(
+    r"(?<![A-Za-z0-9_])Self(?:@[A-Za-z0-9_.:-]+)?(?![A-Za-z0-9_])"
+)
+CLASS_DISPLAY = re.compile(r"^<class '([^']+)'>$")
+
+
+def class_instance_type(class_display: str) -> str | None:
+    """Recover the instance type named by ty's ``<class '...'>`` display."""
+
+    match = CLASS_DISPLAY.fullmatch(normalize_type(class_display))
+    if match is None:
+        return None
+    return normalize_type(match.group(1))
+
+
+def bind_unbound_self_signature(
+    signature: Signature, receiver_instance_type: str
+) -> Signature:
+    """Bind an erased leading ``self`` slot to its descriptor's owner.
+
+    Signature help for an unbound class member retains ``self``.  When that
+    parameter is unannotated, ``parse_signature`` deliberately renders it as
+    ``object``; typeshed's implicit descriptor constraint is consequently
+    lost.  ``Self`` may likewise remain as an unresolved return variable.
+    Replacing both with the class receiver's instance type preserves that
+    constraint without changing already-bound methods or constructors.
+    """
+
+    if not signature.parameters:
+        return signature
+    first = signature.parameters[0]
+    first_type = normalize_type(first.type)
+    if first.name != "self" or not (
+        first_type == "object"
+        or SELF_TYPE_VARIABLE.fullmatch(first_type) is not None
+    ):
+        return signature
+    receiver_instance_type = normalize_type(receiver_instance_type)
+    parameters = (
+        replace(first, type=receiver_instance_type),
+        *signature.parameters[1:],
+    )
+    return_type = normalize_type(
+        SELF_TYPE_REFERENCE.sub(
+            lambda _match: receiver_instance_type,
+            signature.return_type,
+        )
+    )
+    return Signature(parameters, return_type)
 
 
 def matching_paren(value: str, start: int) -> int:
@@ -2228,6 +2449,17 @@ def argument_nonterminal(type_display: str) -> str:
     return f"A:{type_display}"
 
 
+def postfix_nonterminal(expression_nonterminal: str) -> str:
+    """Return the primary/postfix layer corresponding to an ``E:`` symbol."""
+
+    if not expression_nonterminal.startswith("E:"):
+        raise ValueError(
+            f"postfix layer requires an expression nonterminal: "
+            f"{expression_nonterminal!r}"
+        )
+    return f"P:{expression_nonterminal[2:]}"
+
+
 @dataclass(frozen=True)
 class BuilderOptions:
     max_call_arity: int = 3
@@ -2236,6 +2468,7 @@ class BuilderOptions:
     member_depth: int = 2
     max_receiver_types: int = 32
     max_module_members: int = 128
+    max_output_producers: int = 2048
 
 
 @dataclass(frozen=True)
@@ -2941,6 +3174,12 @@ class BuildStats:
     dynamic_types: int = 0
     assignment_types_checked: int = 0
     assignment_types_rejected: int = 0
+    output_producer_families: int = 0
+    output_producers_checked: int = 0
+    output_producers_rejected: int = 0
+    output_producers_local_fallback: int = 0
+    output_producers_unchecked: int = 0
+    output_producer_validation_seconds: float = 0.0
     module_member_fallbacks: int = 0
     derived_representatives: int = 0
     invalid_representatives: int = 0
@@ -2981,6 +3220,9 @@ class GrammarBuilder:
         self.stats = BuildStats()
         self.representatives: dict[str, str] = {}
         self.callables: dict[str, str] = {}
+        self.exact_callables: set[tuple[str, str]] = set()
+        self.member_callable_receivers: dict[tuple[str, str], str] = {}
+        self.contextual_dynamic_call_layouts: set[str] = set()
         self.receivers: list[tuple[int, int, str, str, str]] = []
         self.receiver_entries: dict[
             str, tuple[int, int, str, str, str]
@@ -2988,6 +3230,22 @@ class GrammarBuilder:
         self.processed_receiver_types: set[str] = set()
         self.expected_types: set[str] = set()
         self.contextual_call_results: dict[str, bool] = {}
+        self.dynamic_representatives: dict[str, set[str]] = defaultdict(set)
+        contextual_source = getattr(self.probe, "ablated", None)
+        self.has_contextual_source = isinstance(contextual_source, str)
+        try:
+            contextual_tree = (
+                ast.parse(contextual_source)
+                if isinstance(contextual_source, str)
+                else None
+            )
+        except SyntaxError:
+            contextual_tree = None
+        self.source_callable_names = frozenset(
+            node.name
+            for node in ast.walk(contextual_tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ) if contextual_tree is not None else frozenset()
 
     def expression_nonterminal(self, type_display: str) -> str:
         normalized = normalize_type(type_display)
@@ -2995,7 +3253,55 @@ class GrammarBuilder:
         self.grammar.type_labels[name] = normalized
         return name
 
-    def call_result_nonterminal(self, type_display: str) -> str:
+    def callable_entries(self) -> tuple[tuple[str, str], ...]:
+        """Return type/callable spellings, retaining exact dynamic origins."""
+
+        return tuple(
+            sorted({*self.callables.items(), *self.exact_callables})
+        )
+
+    def callable_symbols(
+        self, detail: str, expression: str
+    ) -> tuple[Symbol, ...]:
+        """Lower a callable without merging unrelated dynamic receivers."""
+
+        if (detail, expression) not in self.exact_callables:
+            return (Nonterminal(self.expression_nonterminal(detail)),)
+        tokens = canonical_expression_tokens(expression)
+        if tokens is None:
+            return ()
+        return tuple(Terminal(token) for token in tokens)
+
+    def contextual_dynamic_call_nonterminal(
+        self,
+        return_type: str,
+        detail: str,
+        expression: str,
+        layout: ArgumentLayout,
+    ) -> str:
+        """Create one exact-callable, signature-layout dynamic result family.
+
+        The family remains usable through its displayed ``Any``/``Unknown``
+        expression type, but output assignments root it only after a complete
+        call from this exact family passes in the ablated downstream context.
+        """
+
+        normalized_return = normalize_type(return_type)
+        identity = repr((detail, expression, layout))
+        nonterminal = f"C:__contextual_dynamic_{stable_digest(identity, 16)}__"
+        self.contextual_dynamic_call_layouts.add(nonterminal)
+        self.grammar.add(
+            self.expression_nonterminal(normalized_return),
+            Nonterminal(nonterminal),
+        )
+        return nonterminal
+
+    def call_result_nonterminal(
+        self,
+        type_display: str,
+        *,
+        trusted_dynamic_output: bool = False,
+    ) -> str:
         """Return the result symbol for a call justified by a ty signature.
 
         A displayed ``Any``/``Unknown`` result cannot be validated by testing
@@ -3010,6 +3316,8 @@ class GrammarBuilder:
         expression = self.expression_nonterminal(normalized)
         if normalized not in {"Any", "Unknown"}:
             return expression
+        if not trusted_dynamic_output:
+            return expression
         self.grammar.add(
             expression,
             Nonterminal(TRUSTED_DYNAMIC_CALL_NONTERMINAL),
@@ -3019,6 +3327,32 @@ class GrammarBuilder:
             Nonterminal(TRUSTED_DYNAMIC_CALL_NONTERMINAL),
         )
         return TRUSTED_DYNAMIC_CALL_NONTERMINAL
+
+    def trusts_dynamic_callable(self, detail: str, expression: str) -> bool:
+        """Whether an erased result may retain its signature-backed call shape.
+
+        Builtin/generic constructors sometimes expose ``Unknown`` only because
+        signature help has erased a type variable.  Treating every such result
+        as one trusted output family merged unrelated calls such as ``tuple()``
+        with a source-defined ``lcm(...)``.  A source-defined function has a
+        declaration in the contextual source; its signature-backed call may
+        use the narrow trusted-output path.  Correlated library calls (currently
+        ``heappop``) opt in explicitly at their grounding site.
+        """
+
+        terminal_name = expression.rsplit(".", 1)[-1]
+        if terminal_name in self.source_callable_names:
+            return True
+        # Minimal semantic fixtures do not carry source text.  Retain the
+        # equivalent narrow signal there without trusting Python builtins.
+        return (
+            not self.has_contextual_source
+            and expression.isidentifier()
+            and expression in self.source_ids
+            and expression not in BUILTIN_NAMES
+            and re.search(rf"\bdef\s+{re.escape(expression)}(?:\[|\()", detail)
+            is not None
+        )
 
     def add_expression(
         self,
@@ -3032,6 +3366,8 @@ class GrammarBuilder:
         self.grammar.add(nonterminal, *rhs)
         if representative is not None:
             self.representatives.setdefault(normalized, representative)
+            if normalized in {"Any", "Unknown"}:
+                self.dynamic_representatives[normalized].add(representative)
         if normalized in {"Any", "Unknown"}:
             self.stats.dynamic_types += 1
         return nonterminal
@@ -3115,6 +3451,7 @@ class GrammarBuilder:
                     Nonterminal(DYNAMIC_NONTERMINAL),
                 )
                 self.representatives.setdefault(detail, completion.label)
+                self.dynamic_representatives[detail].add(completion.label)
                 self.stats.dynamic_types += 1
             else:
                 self.add_expression(
@@ -3125,7 +3462,10 @@ class GrammarBuilder:
             self.stats.scope_names += 1
             callable_value = is_callable_type(detail, completion.kind)
             if callable_value:
-                self.callables.setdefault(detail, completion.label)
+                if detail in {"Any", "Unknown"}:
+                    self.exact_callables.add((detail, completion.label))
+                else:
+                    self.callables.setdefault(detail, completion.label)
             should_receive = not callable_value or (
                 completion.kind == LSP_CLASS
                 and completion.label in self.source_ids
@@ -3329,6 +3669,8 @@ class GrammarBuilder:
                 expression = f"{parent}.{production.rhs[2].value}"
                 if member_type not in self.representatives:
                     self.representatives[member_type] = expression
+                    if member_type in {"Any", "Unknown"}:
+                        self.dynamic_representatives[member_type].add(expression)
                     progressed = True
                 if not is_callable_type(member_type):
                     self.queue_receiver(member_type, expression, 1)
@@ -3390,11 +3732,24 @@ class GrammarBuilder:
                     continue
                 member_type = normalize_type(completion.detail)
                 member_expression = f"{expression}.{completion.label}"
-                member_rhs: tuple[Symbol, ...] = (
-                    Nonterminal(receiver_nonterminal),
-                    Terminal("."),
-                    Terminal(completion.label),
-                )
+                if receiver_type in {"Any", "Unknown"}:
+                    receiver_tokens = canonical_expression_tokens(expression)
+                    if receiver_tokens is None:
+                        continue
+                    # Completion was queried for this exact dynamic receiver.
+                    # A shared E:Any/E:Unknown receiver would cross-product its
+                    # members onto every unrelated dynamic expression.
+                    member_rhs = (
+                        *(Terminal(token) for token in receiver_tokens),
+                        Terminal("."),
+                        Terminal(completion.label),
+                    )
+                else:
+                    member_rhs = (
+                        Nonterminal(receiver_nonterminal),
+                        Terminal("."),
+                        Terminal(completion.label),
+                    )
                 if member_type in {"Any", "Unknown"}:
                     self.grammar.add(DYNAMIC_NONTERMINAL, *member_rhs)
                     self.grammar.add(
@@ -3403,6 +3758,9 @@ class GrammarBuilder:
                     )
                     self.representatives.setdefault(
                         member_type, member_expression
+                    )
+                    self.dynamic_representatives[member_type].add(
+                        member_expression
                     )
                     self.stats.dynamic_types += 1
                 else:
@@ -3414,7 +3772,26 @@ class GrammarBuilder:
                 self.stats.member_completions += 1
                 callable_value = is_callable_type(member_type, completion.kind)
                 if callable_value:
-                    self.callables.setdefault(member_type, member_expression)
+                    callable_identity = (member_type, member_expression)
+                    receiver_instance = class_instance_type(receiver_type)
+                    if receiver_instance is not None:
+                        # Class attributes expose an unbound descriptor.  Keep
+                        # its lexical receiver separate from otherwise equal
+                        # callable displays on other classes, and retain the
+                        # owner needed to restore the erased ``self`` bound.
+                        self.exact_callables.add(callable_identity)
+                        self.member_callable_receivers[
+                            callable_identity
+                        ] = receiver_instance
+                    elif receiver_type in {"Any", "Unknown"} or member_type in {
+                        "Any",
+                        "Unknown",
+                    }:
+                        self.exact_callables.add(callable_identity)
+                    else:
+                        self.callables.setdefault(
+                            member_type, member_expression
+                        )
                 elif depth < self.options.member_depth:
                     self.queue_receiver(member_type, member_expression, depth + 1)
 
@@ -3480,27 +3857,101 @@ class GrammarBuilder:
                 )
 
     def add_calls(self) -> None:
-        self.stats.callables = len(self.callables)
-        for callable_type, expression in sorted(self.callables.items()):
+        callable_entries = self.callable_entries()
+        self.stats.callables = len(callable_entries)
+        for callable_type, expression in callable_entries:
             signatures = self.signatures_for(callable_type, expression)
+            if (
+                not signatures
+                and callable_type in {"Any", "Unknown"}
+                and (callable_type, expression) in self.exact_callables
+            ):
+                # ty marks a completion as callable even when an Any/Unknown
+                # receiver has no inspectable signature.  That exact member
+                # accepts arbitrary positional arguments under ty's gradual
+                # semantics; retain the bounded arities without sharing the
+                # member with any other dynamic receiver.
+                signatures = (
+                    Signature(
+                        (
+                            Parameter(
+                                "args", "object", "vararg", False
+                            ),
+                        ),
+                        callable_type,
+                    ),
+                )
             self.stats.signatures += len(signatures)
-            callable_nonterminal = self.expression_nonterminal(callable_type)
+            callable_symbols = self.callable_symbols(
+                callable_type, expression
+            )
+            if not callable_symbols:
+                continue
             for signature in signatures:
+                receiver_instance = self.member_callable_receivers.get(
+                    (callable_type, expression)
+                )
+                if receiver_instance is not None:
+                    signature = bind_unbound_self_signature(
+                        signature, receiver_instance
+                    )
+                if expression == "map":
+                    # ``map`` couples the callback's positional parameters to
+                    # the element type of each following iterable.  Lowering
+                    # its displayed signature one slot at a time loses that
+                    # correlation and admits, for example, ``map(x.bit_length,
+                    # numbers)`` or a unary callback with two iterables.  The
+                    # correlated rows are added in add_grounded_generic_calls.
+                    continue
+                normalized_return = normalize_type(signature.return_type)
+                if (
+                    expression == "tuple"
+                    and (
+                        normalized_return in {"Any", "Unknown"}
+                        or has_unresolved_type_variable(normalized_return)
+                    )
+                ):
+                    # ty's live builtin signature currently erases tuple's
+                    # covariant element parameter to Unknown.  A broad
+                    # Unknown call row destroys the fact that the result is a
+                    # tuple; add_grounded_generic_calls restores its precise
+                    # zero/one-argument shapes below.
+                    continue
                 layouts = argument_layouts(
                     signature,
                     max_arity=self.options.max_call_arity,
                     max_layouts=self.options.max_layouts_per_signature,
                 )
-                return_nonterminal = self.call_result_nonterminal(
-                    signature.return_type
+                trusted_dynamic_output = (
+                    normalized_return == "Any"
+                    or self.trusts_dynamic_callable(
+                        callable_type, expression
+                    )
                 )
                 for layout in layouts:
                     if expression in {"max", "min"} and len(layout.positional) > 1:
                         # Correlated variadic type variables are not independent
                         # CFG slots.  The iterable overload remains available.
                         continue
+                    if (
+                        normalized_return in {"Any", "Unknown"}
+                        and not trusted_dynamic_output
+                    ):
+                        return_nonterminal = (
+                            self.contextual_dynamic_call_nonterminal(
+                                normalized_return,
+                                callable_type,
+                                expression,
+                                layout,
+                            )
+                        )
+                    else:
+                        return_nonterminal = self.call_result_nonterminal(
+                            normalized_return,
+                            trusted_dynamic_output=trusted_dynamic_output,
+                        )
                     rhs: list[Symbol] = [
-                        Nonterminal(callable_nonterminal),
+                        *callable_symbols,
                         Terminal("("),
                     ]
                     normalized_positional: list[str] = []
@@ -3558,15 +4009,19 @@ class GrammarBuilder:
             for actual in expression_types
             if is_assignable(actual, "SupportsRichComparisonT")
         }
-        for callable_type, expression in self.callables.items():
+        for callable_type, expression in callable_entries:
             if expression not in {"max", "min"}:
                 continue
-            callable_nonterminal = self.expression_nonterminal(callable_type)
+            callable_symbols = self.callable_symbols(
+                callable_type, expression
+            )
+            if not callable_symbols:
+                continue
             for actual in comparable_types:
                 result_nonterminal = self.expression_nonterminal(actual)
                 for arity in range(2, self.options.max_call_arity + 1):
                     rhs: list[Symbol] = [
-                        Nonterminal(callable_nonterminal),
+                        *callable_symbols,
                         Terminal("("),
                     ]
                     for index in range(arity):
@@ -3581,27 +4036,34 @@ class GrammarBuilder:
             # constrained type variable unresolved (for example min(list[float])).
             for actual in sorted(expression_types):
                 element_type = iterable_element_type(actual)
-                if element_type is None:
+                if (
+                    element_type is None
+                    or not is_assignable(
+                        element_type, "SupportsRichComparisonT"
+                    )
+                ):
                     continue
                 self.grammar.add(
                     self.expression_nonterminal(element_type),
-                    Nonterminal(callable_nonterminal),
+                    *callable_symbols,
                     Terminal("("),
                     Nonterminal(type_nonterminal(actual)),
                     Terminal(")"),
                 )
 
     def add_grounded_generic_calls(self) -> None:
-        """Ground a few unary iterable APIs whose LSP types retain variables.
+        """Ground iterable APIs whose LSP types retain correlations.
 
         Ordinary call productions intentionally keep ty's displayed type
         variables symbolic.  That loses safe correlations such as
         ``map(str, ints) -> map[str]`` and consequently prevents a later
-        ``str.join`` from seeing an ``Iterable[str]``.  Enumerate only
-        concrete unary callable signatures and concrete iterable element
-        types already present in the contextual grammar.  Each added row is a
-        direct instance of the corresponding ty signature or Python
-        container protocol; no unconstrained type-variable edge is added.
+        ``str.join`` from seeing an ``Iterable[str]``.  For ``map``, enumerate
+        each callable's accepted positional arities and couple every callback
+        parameter to the corresponding iterable element type.  The remaining
+        helpers enumerate concrete iterable element types already present in
+        the contextual grammar.  Each added row is a direct instance of the
+        corresponding ty signature or Python container protocol; no
+        independent callback/iterable cross-product is added.
         """
 
         callable_by_expression: dict[str, tuple[str, str]] = {
@@ -3609,36 +4071,54 @@ class GrammarBuilder:
                 callable_type,
                 self.expression_nonterminal(callable_type),
             )
-            for callable_type, expression in self.callables.items()
+            for callable_type, expression in self.callable_entries()
         }
         map_entry = callable_by_expression.get("map")
         if map_entry is not None and self.options.max_call_arity >= 2:
             _map_type, map_nonterminal = map_entry
-            for callable_type, expression in sorted(self.callables.items()):
-                callable_nonterminal = self.expression_nonterminal(callable_type)
+            max_callback_arity = self.options.max_call_arity - 1
+            for callable_type, expression in self.callable_entries():
+                callable_symbols = self.callable_symbols(
+                    callable_type, expression
+                )
+                if not callable_symbols:
+                    continue
                 for signature in self.signatures_for(callable_type, expression):
                     return_type = normalize_type(signature.return_type)
-                    if not groundable_type(return_type):
+                    if return_type in {"Divergent", "Never", "NoReturn"} or (
+                        has_unresolved_type_variable(return_type)
+                    ):
                         continue
                     layouts = argument_layouts(
                         signature,
-                        max_arity=1,
+                        max_arity=max_callback_arity,
                         max_layouts=self.options.max_layouts_per_signature,
                     )
                     for layout in layouts:
-                        if len(layout.positional) != 1 or layout.keywords:
+                        if not layout.positional or layout.keywords:
                             continue
-                        expected_element = normalize_type(layout.positional[0])
-                        expected_iterable = f"Iterable[{expected_element}]"
-                        self.expected_types.add(expected_iterable)
-                        self.grammar.add(
-                            self.expression_nonterminal(f"map[{return_type}]"),
+                        rhs: list[Symbol] = [
                             Nonterminal(map_nonterminal),
                             Terminal("("),
-                            Nonterminal(callable_nonterminal),
-                            Terminal(","),
-                            Nonterminal(argument_nonterminal(expected_iterable)),
-                            Terminal(")"),
+                            *callable_symbols,
+                        ]
+                        for expected_element in layout.positional:
+                            expected_iterable = (
+                                f"Iterable[{normalize_type(expected_element)}]"
+                            )
+                            self.expected_types.add(expected_iterable)
+                            rhs.extend(
+                                (
+                                    Terminal(","),
+                                    Nonterminal(
+                                        argument_nonterminal(expected_iterable)
+                                    ),
+                                )
+                            )
+                        rhs.append(Terminal(")"))
+                        self.grammar.add(
+                            self.expression_nonterminal(f"map[{return_type}]"),
+                            *rhs,
                         )
 
         def concrete_iterable_elements() -> set[str]:
@@ -3653,6 +4133,52 @@ class GrammarBuilder:
                 if element is not None and groundable_type(element):
                     elements.add(normalize_type(element))
             return elements
+
+        tuple_entry = callable_by_expression.get("tuple")
+        if tuple_entry is not None:
+            _tuple_type, tuple_nonterminal = tuple_entry
+            expression_types = {
+                production.lhs[2:]
+                for production in self.grammar.productions
+                if production.lhs.startswith("E:")
+            }
+            self.grammar.add(
+                self.expression_nonterminal("tuple[()]"),
+                Nonterminal(tuple_nonterminal),
+                Terminal("("),
+                Terminal(")"),
+            )
+            self.grammar.add(
+                self.expression_nonterminal("tuple[()]"),
+                Nonterminal(tuple_nonterminal),
+                Terminal("("),
+                Nonterminal(type_nonterminal("tuple[()]")),
+                Terminal(")"),
+            )
+            for actual in sorted(expression_types):
+                if normalize_type(actual) == "tuple[()]":
+                    result_type = "tuple[()]"
+                else:
+                    element = iterable_element_type(actual)
+                    if element is not None:
+                        element = normalize_type(element)
+                    if element not in {None, "Any", "Unknown"}:
+                        result_type = f"tuple[{element}, ...]"
+                    elif is_assignable(actual, "Iterable[Unknown]"):
+                        # Keep an opaque element only for this exact displayed
+                        # actual type.  A shared A:Iterable[Unknown] fallback
+                        # overlaps every concrete grounding and doubles parse
+                        # counts for ordinary tuple(iterable) words.
+                        result_type = "tuple[Unknown, ...]"
+                    else:
+                        continue
+                self.grammar.add(
+                    self.expression_nonterminal(result_type),
+                    Nonterminal(tuple_nonterminal),
+                    Terminal("("),
+                    Nonterminal(type_nonterminal(actual)),
+                    Terminal(")"),
+                )
 
         list_entry = callable_by_expression.get("list")
         if list_entry is not None and self.options.max_call_arity >= 1:
@@ -3726,11 +4252,33 @@ class GrammarBuilder:
                 for production in self.grammar.productions
                 if production.lhs.startswith("E:")
             }
-            for callable_type, expression in sorted(self.callables.items()):
+            # Covered library artifacts intentionally remove their exports
+            # from self.callables because their ordinary call productions are
+            # already cached.  Their exact lexical representatives remain,
+            # however; recover just heappop here so this correlation pass is
+            # artifact-aware without regenerating every cached call family.
+            heappop_callables = dict(self.callables)
+            cached_heappop_types: set[str] = set()
+            for callable_type, expression in self.representatives.items():
+                if (
+                    expression.rsplit(".", 1)[-1] == "heappop"
+                    and is_callable_type(callable_type)
+                ):
+                    if callable_type not in heappop_callables:
+                        heappop_callables[callable_type] = expression
+                        cached_heappop_types.add(callable_type)
+            for callable_type, expression in sorted(heappop_callables.items()):
                 if expression.rsplit(".", 1)[-1] != "heappop":
                     continue
                 callable_nonterminal = self.expression_nonterminal(callable_type)
-                for signature in self.signatures_for(callable_type, expression):
+                signatures = (
+                    tuple(signatures_from_detail(callable_type))
+                    if callable_type in cached_heappop_types
+                    else self.signatures_for(callable_type, expression)
+                )
+                if not signatures:
+                    signatures = self.signatures_for(callable_type, expression)
+                for signature in signatures:
                     result_variable = normalize_type(signature.return_type)
                     if TYPE_VARIABLE.fullmatch(result_variable) is None:
                         continue
@@ -3753,10 +4301,22 @@ class GrammarBuilder:
                             continue
                         for actual in sorted(expression_types):
                             element = concrete_heap_list_element_type(actual)
-                            if element is None or not is_assignable(actual, expected):
+                            if (
+                                element is None
+                                or (
+                                    element not in {"Any", "Unknown"}
+                                    and not is_assignable(
+                                        element, "SupportsRichComparisonT"
+                                    )
+                                )
+                                or not is_assignable(actual, expected)
+                            ):
                                 continue
                             self.grammar.add(
-                                self.call_result_nonterminal(element),
+                                self.call_result_nonterminal(
+                                    element,
+                                    trusted_dynamic_output=True,
+                                ),
                                 Nonterminal(callable_nonterminal),
                                 Terminal("("),
                                 Nonterminal(type_nonterminal(actual)),
@@ -3792,55 +4352,84 @@ class GrammarBuilder:
             for production in self.grammar.productions
         ):
             return
-        member_names = {
-            name
-            for name in (*CORE_MEMBERS, *self.source_ids)
-            if name.isidentifier() and not keyword.iskeyword(name) and not name.startswith("_")
-        }
-        dynamic_argument = "A:__dynamic_safe__"
-        self.grammar.add(dynamic_argument, Nonterminal(DYNAMIC_NONTERMINAL))
-        for safe_type in (
-            "None",
-            "bool",
-            "int",
-            "float",
-            "complex",
-            "str",
-            "bytes",
-        ):
-            self.grammar.add(
-                dynamic_argument,
-                Nonterminal(type_nonterminal(safe_type)),
-            )
-        for name in member_names:
-            self.grammar.add(
-                DYNAMIC_NONTERMINAL,
-                Nonterminal(DYNAMIC_NONTERMINAL),
-                Terminal("."),
-                Terminal(name),
-            )
-        for operator in ("+", "-", "~"):
-            self.grammar.add(
-                DYNAMIC_NONTERMINAL,
-                Terminal(operator),
-                Nonterminal(DYNAMIC_NONTERMINAL),
-            )
-        for arity in range(self.options.max_call_arity + 1):
-            rhs: list[Symbol] = [Nonterminal(DYNAMIC_NONTERMINAL), Terminal("(")]
-            for index in range(arity):
-                if index:
-                    rhs.append(Terminal(","))
-                rhs.append(Nonterminal(dynamic_argument))
-            rhs.append(Terminal(")"))
-            self.grammar.add(DYNAMIC_NONTERMINAL, *rhs)
+        representatives = sorted(
+            set().union(*self.dynamic_representatives.values())
+            if self.dynamic_representatives
+            else set()
+        )
+        expression_budget = self.options.max_tokens - (
+            2 if self.required_assignment is not None else 0
+        )
+        for representative in representatives:
+            # Dynamic member rows come from an exact completion query in
+            # add_members.  For the two syntactic operations that do not have
+            # completion/signature structure, retain only one-step words that
+            # ty accepts for this exact contextual expression.  Recursive
+            # DYNAMIC -> DYNAMIC op/call/member rules created an unbounded
+            # cross-product across unrelated Any/Unknown values.
+            for candidate in (
+                *(f"{operator}{representative}" for operator in ("+", "-", "~")),
+                f"{representative}()",
+            ):
+                tokens = canonical_expression_tokens(candidate)
+                if (
+                    tokens is None
+                    or len(tokens) > expression_budget
+                    or not self.probe.accepts_expression(candidate)
+                ):
+                    continue
+                self.grammar.add(
+                    DYNAMIC_NONTERMINAL,
+                    *(Terminal(token) for token in tokens),
+                )
+            if self.required_assignment is not None:
+                continue
+            receiver_tokens = canonical_expression_tokens(representative)
+            if receiver_tokens is None:
+                continue
+            # ty may return an incomplete, empty completion page for an
+            # Any/Unknown receiver.  Its gradual type nevertheless accepts
+            # these bounded core member calls.  Anchor every row to this exact
+            # contextual receiver spelling; never reintroduce the old shared
+            # DYNAMIC.member/call recursion.
+            for member in sorted(CORE_MEMBERS):
+                for arity in range(self.options.max_call_arity + 1):
+                    minimum_tokens = len(receiver_tokens) + 4 + max(
+                        0, 2 * arity - 1
+                    )
+                    if minimum_tokens > expression_budget:
+                        continue
+                    rhs: list[Symbol] = [
+                        *(Terminal(token) for token in receiver_tokens),
+                        Terminal("."),
+                        Terminal(member),
+                        Terminal("("),
+                    ]
+                    for index in range(arity):
+                        if index:
+                            rhs.append(Terminal(","))
+                        rhs.append(
+                            Nonterminal(argument_nonterminal("object"))
+                        )
+                    rhs.append(Terminal(")"))
+                    self.expected_types.add("object")
+                    self.grammar.add(
+                        self.expression_nonterminal("Unknown"), *rhs
+                    )
 
     def add_redundant_grouping(self) -> None:
         """Permit Python's type-preserving parenthesized expression form."""
 
+        dynamic_aliases = {
+            production.lhs
+            for production in self.grammar.productions
+            if production.rhs == (Nonterminal(DYNAMIC_NONTERMINAL),)
+        }
         expression_nonterminals = {
             production.lhs
             for production in self.grammar.productions
             if production.lhs.startswith("E:")
+            and production.lhs not in dynamic_aliases
         }
         for nonterminal in expression_nonterminals:
             self.grammar.add(
@@ -3888,6 +4477,123 @@ class GrammarBuilder:
                         changed = True
         return best
 
+    def refine_output_producer_roots(
+        self, shortest: Mapping[str, tuple[str, ...]]
+    ) -> None:
+        """Validate independently rooted expression producers in context.
+
+        An accepted representative of ``E:T`` establishes only that one value
+        with type T satisfies the uses after an output assignment.  Rooting the
+        whole nonterminal also admits producers whose more specific result
+        violates that continuation.  Expand the E/P unit frontier and validate
+        one shortest witness for each producer family instead.
+
+        A local error in that witness is not evidence that every word in the
+        family is bad, so retain the family conservatively.  Families beyond
+        the query budget are retained for the same recall-preserving reason.
+        Only a locally valid witness with downstream errors is rejected.
+        Exact dynamic roots never pass through ``E:`` and remain untouched.
+        """
+
+        if self.required_assignment is None:
+            return
+        started = time.perf_counter()
+        by_lhs: dict[str, list[Production]] = defaultdict(list)
+        for production in self.grammar.productions:
+            by_lhs[production.lhs].append(production)
+
+        typed_roots: set[Production] = set()
+        frontier_names: set[str] = set()
+        for production in by_lhs[self.grammar.start]:
+            if (
+                len(production.rhs) == 3
+                and production.rhs[:2]
+                == (
+                    Terminal(self.required_assignment),
+                    Terminal("="),
+                )
+                and isinstance(production.rhs[2], Nonterminal)
+                and production.rhs[2].value.startswith("E:")
+            ):
+                typed_roots.add(production)
+                frontier_names.add(production.rhs[2].value)
+        if not typed_roots:
+            return
+
+        # Unit productions between E:/P: layers carry no independently
+        # testable syntax.  Traverse them until a concrete producer RHS is
+        # reached, while breaking the harmless cycles introduced by aliases.
+        producer_rhs: set[tuple[Symbol, ...]] = set()
+        pending = list(frontier_names)
+        visited: set[str] = set()
+        while pending:
+            name = pending.pop()
+            if name in visited:
+                continue
+            visited.add(name)
+            for production in by_lhs.get(name, ()):
+                if (
+                    len(production.rhs) == 1
+                    and isinstance(production.rhs[0], Nonterminal)
+                    and production.rhs[0].value.startswith(("E:", "P:"))
+                ):
+                    pending.append(production.rhs[0].value)
+                else:
+                    producer_rhs.add(production.rhs)
+
+        def rhs_sort_key(
+            rhs: tuple[Symbol, ...],
+        ) -> tuple[tuple[int, str], ...]:
+            return tuple(
+                (0 if isinstance(symbol, Terminal) else 1, symbol.value)
+                for symbol in rhs
+            )
+
+        retained: set[tuple[Symbol, ...]] = set()
+        ordered = sorted(producer_rhs, key=rhs_sort_key)
+        self.stats.output_producer_families += len(ordered)
+        for index, rhs in enumerate(ordered):
+            if index >= self.options.max_output_producers:
+                retained.add(rhs)
+                self.stats.output_producers_unchecked += 1
+                continue
+            tokens: list[str] = []
+            for symbol in rhs:
+                if isinstance(symbol, Terminal):
+                    tokens.append(symbol.value)
+                    continue
+                child = shortest.get(symbol.value)
+                if child is None:
+                    self.stats.output_producers_unchecked += 1
+                    retained.add(rhs)
+                    break
+                tokens.extend(child)
+            else:
+                expression = render_tokens(tokens, self.source_ids)
+                local, downstream = (
+                    self.probe.assignment_diagnostic_partition(expression)
+                )
+                self.stats.output_producers_checked += 1
+                if local:
+                    self.stats.output_producers_local_fallback += 1
+                    retained.add(rhs)
+                elif downstream:
+                    self.stats.output_producers_rejected += 1
+                else:
+                    retained.add(rhs)
+
+        self.grammar.productions.difference_update(typed_roots)
+        for rhs in retained:
+            self.grammar.add(
+                self.grammar.start,
+                Terminal(self.required_assignment),
+                Terminal("="),
+                *rhs,
+            )
+        self.stats.output_producer_validation_seconds += (
+            time.perf_counter() - started
+        )
+
     def finish(self) -> tuple[Grammar, BuildStats]:
         # Activate only the precomputed compatibility rows whose A: slot is
         # actually referenced by a bounded library or contextual call.  This
@@ -3903,6 +4609,7 @@ class GrammarBuilder:
                 self.stats.library_productions += (
                     len(self.grammar.productions) - before
                 )
+        self.grammar = enforce_postfix_precedence(self.grammar)
         expression_types = {
             production.lhs[2:]
             for production in self.grammar.productions
@@ -3929,6 +4636,15 @@ class GrammarBuilder:
         if self.required_assignment is not None:
             shortest = self.shortest_terminal_words()
             for actual in sorted(expression_types):
+                if actual in {
+                    "Any",
+                    "Unknown",
+                    DYNAMIC_NONTERMINAL.removeprefix("E:"),
+                }:
+                    # A single accepted witness cannot justify rooting every
+                    # expression of a broad dynamic type.  Signature-backed
+                    # dynamic calls are rooted separately below.
+                    continue
                 if actual in self.representatives:
                     continue
                 tokens = shortest.get(type_nonterminal(actual))
@@ -3951,6 +4667,40 @@ class GrammarBuilder:
                     Nonterminal(expression),
                 )
             else:
+                if actual in {
+                    "Any",
+                    "Unknown",
+                    DYNAMIC_NONTERMINAL.removeprefix("E:"),
+                }:
+                    # Preserve legacy/source-visible dynamic assignments as
+                    # exact, independently context-validated words.  Rooting
+                    # E:Unknown after one witness passed would also admit all
+                    # rejected Unknown expressions (and trusted call results).
+                    for representative in sorted(
+                        self.dynamic_representatives.get(actual, ())
+                    ):
+                        for candidate in (
+                            representative,
+                            *(
+                                f"{operator}{representative}"
+                                for operator in ("+", "-", "~")
+                            ),
+                        ):
+                            self.stats.assignment_types_checked += 1
+                            if not self.probe.accepts_assignment(candidate):
+                                self.stats.assignment_types_rejected += 1
+                                continue
+                            tokens = canonical_expression_tokens(candidate)
+                            if tokens is None:
+                                self.stats.assignment_types_rejected += 1
+                                continue
+                            self.grammar.add(
+                                self.grammar.start,
+                                Terminal(self.required_assignment),
+                                Terminal("="),
+                                *(Terminal(token) for token in tokens),
+                            )
+                    continue
                 representative = self.representatives.get(actual)
                 if representative is not None:
                     self.stats.assignment_types_checked += 1
@@ -3963,6 +4713,38 @@ class GrammarBuilder:
                     Terminal("="),
                     Nonterminal(expression),
                 )
+        if self.required_assignment is not None:
+            for call_family in sorted(
+                self.contextual_dynamic_call_layouts
+            ):
+                tokens = shortest.get(call_family)
+                if not tokens:
+                    continue
+                self.stats.assignment_types_checked += 1
+                if not self.probe.accepts_assignment(" ".join(tokens)):
+                    self.stats.assignment_types_rejected += 1
+                    continue
+                self.grammar.add(
+                    self.grammar.start,
+                    Terminal(self.required_assignment),
+                    Terminal("="),
+                    Nonterminal(call_family),
+                )
+        if (
+            self.required_assignment is not None
+            and any(
+                production.lhs == TRUSTED_DYNAMIC_CALL_NONTERMINAL
+                for production in self.grammar.productions
+            )
+        ):
+            self.grammar.add(
+                self.grammar.start,
+                Terminal(self.required_assignment),
+                Terminal("="),
+                Nonterminal(TRUSTED_DYNAMIC_CALL_NONTERMINAL),
+            )
+        if self.required_assignment is not None:
+            self.refine_output_producer_roots(shortest)
         self.grammar = prune_grammar(self.grammar)
         self.stats.expression_types = len(expression_types)
         return self.grammar, self.stats
@@ -3978,6 +4760,87 @@ class GrammarBuilder:
         self.add_dynamic_operations()
         self.add_redundant_grouping()
         return self.finish()
+
+
+def enforce_postfix_precedence(grammar: Grammar) -> Grammar:
+    """Separate Python primary expressions from prefix-unary expressions.
+
+    The semantic grammar indexes expressions by type, but a single ``E:T``
+    symbol is not quite enough to encode Python's precedence.  In particular,
+    a rule such as ``E:member -> E:int '.' member`` can otherwise treat
+    ``~ 0`` as the receiver in ``~ 0 . member``.  Python parses that word as
+    ``~(0.member)`` because attribute access binds more tightly than unary
+    operators, so the derivation can disagree with the expression ty checks.
+
+    ``P:T`` denotes primary/postfix expressions of type T.  Every non-unary
+    ``E:T`` producer moves to ``P:T`` and ``E:T -> P:T`` supplies the ordinary
+    expression view.  A leading expression child of another primary producer
+    is likewise changed from ``E:U`` to ``P:U``; this covers member access,
+    calls, and type-preserving unit aliases without changing argument slots.
+    Prefix unary rules stay in E.  Parentheses have a leading terminal, so
+    their inner E remains unrestricted and explicitly parenthesized unary
+    expressions become safe postfix receivers.
+
+    Non-expression call-result symbols (notably the trusted dynamic-call
+    root) retain their LHS, but their callable receiver is changed to P too.
+    This keeps the transformation valid for both live and cached-library
+    production shapes.
+    """
+
+    rewritten: set[Production] = set()
+    expression_aliases: set[str] = set()
+    unary_operators = {"+", "-", "~"}
+    for production in grammar.productions:
+        rhs = production.rhs
+        prefix_unary = (
+            production.lhs.startswith("E:")
+            and bool(rhs)
+            and isinstance(rhs[0], Terminal)
+            and rhs[0].value in unary_operators
+        )
+        if prefix_unary:
+            rewritten.add(production)
+            continue
+
+        rewritten_rhs = rhs
+        leading_expression_is_postfix = (
+            production.lhs.startswith("E:")
+            or (
+                len(rhs) >= 2
+                and isinstance(rhs[1], Terminal)
+                and rhs[1].value in {".", "("}
+            )
+        )
+        if (
+            leading_expression_is_postfix
+            and rhs
+            and isinstance(rhs[0], Nonterminal)
+            and rhs[0].value.startswith("E:")
+        ):
+            rewritten_rhs = (
+                Nonterminal(postfix_nonterminal(rhs[0].value)),
+                *rhs[1:],
+            )
+
+        if production.lhs.startswith("E:"):
+            postfix_lhs = postfix_nonterminal(production.lhs)
+            rewritten.add(Production(postfix_lhs, rewritten_rhs))
+            expression_aliases.add(production.lhs)
+        else:
+            rewritten.add(Production(production.lhs, rewritten_rhs))
+
+    for expression in expression_aliases:
+        rewritten.add(
+            Production(
+                expression,
+                (Nonterminal(postfix_nonterminal(expression)),),
+            )
+        )
+    return Grammar(
+        start=grammar.start,
+        productions=rewritten,
+        type_labels=dict(grammar.type_labels),
+    )
 
 
 def prune_grammar(grammar: Grammar) -> Grammar:
@@ -5449,6 +6312,12 @@ def evaluate_prepared_statement(
                 "dynamic_types": 0,
                 "assignment_types_checked": 0,
                 "assignment_types_rejected": 0,
+                "output_producer_families": 0,
+                "output_producers_checked": 0,
+                "output_producers_rejected": 0,
+                "output_producers_local_fallback": 0,
+                "output_producers_unchecked": 0,
+                "output_producer_validation_seconds": 0.0,
                 "module_member_fallbacks": 0,
                 "derived_representatives": 0,
                 "invalid_representatives": 0,
@@ -5668,6 +6537,16 @@ def evaluate_prepared_statement(
             "dynamic_types": build_stats.dynamic_types,
             "assignment_types_checked": build_stats.assignment_types_checked,
             "assignment_types_rejected": build_stats.assignment_types_rejected,
+            "output_producer_families": build_stats.output_producer_families,
+            "output_producers_checked": build_stats.output_producers_checked,
+            "output_producers_rejected": build_stats.output_producers_rejected,
+            "output_producers_local_fallback": (
+                build_stats.output_producers_local_fallback
+            ),
+            "output_producers_unchecked": build_stats.output_producers_unchecked,
+            "output_producer_validation_seconds": (
+                build_stats.output_producer_validation_seconds
+            ),
             "module_member_fallbacks": build_stats.module_member_fallbacks,
             "derived_representatives": build_stats.derived_representatives,
             "invalid_representatives": build_stats.invalid_representatives,
@@ -5746,6 +6625,7 @@ def evaluate(options: EvaluationOptions) -> int:
                         "member_depth": options.builder.member_depth,
                         "max_receiver_types": options.builder.max_receiver_types,
                         "max_module_members": options.builder.max_module_members,
+                        "max_output_producers": options.builder.max_output_producers,
                     },
                     "population": population,
                 },
@@ -6090,6 +6970,13 @@ def run_self_tests() -> None:
             (
                 [
                     raw_completion("beta", "int", None),
+                    raw_completion("alpha", "str", None),
+                ],
+                True,
+            ),
+            (
+                [
+                    raw_completion("beta", "int", None),
                     raw_completion("alpha", "str", LSP_FUNCTION),
                 ],
                 True,
@@ -6115,7 +7002,7 @@ def run_self_tests() -> None:
         fetch_completion_pass
     )
     assert progressive_was_incomplete
-    assert completion_retriggers == [False, True, True]
+    assert completion_retriggers == [False, True, True, True]
     assert progressive == [
         Completion("alpha", "str", LSP_FUNCTION),
         Completion("beta", "int", None),
@@ -6170,6 +7057,187 @@ def run_self_tests() -> None:
     assert not grouping_compiled.recognizes(("(", ")"))
     assert not grouping_compiled.recognizes(("(", "0"))
 
+    # Python trailers bind more tightly than prefix unary operators.  Keep a
+    # distinct primary layer so a typed member row cannot reinterpret ``~0``
+    # as the receiver in the source word ``~0.to_bytes``.  Parentheses make
+    # that receiver explicit and must restore the postfix operation.
+    precedence_grammar = Grammar(start="START")
+    precedence_grammar.add("E:int", Terminal("0"))
+    precedence_grammar.add(
+        "E:int", Terminal("~"), Nonterminal("E:int")
+    )
+    precedence_grammar.add(
+        "E:int", Terminal("("), Nonterminal("E:int"), Terminal(")")
+    )
+    precedence_grammar.add("E:complex", Terminal("x"))
+    precedence_grammar.add(
+        "E:complex", Terminal("-"), Nonterminal("E:complex")
+    )
+    precedence_grammar.add(
+        "E:complex",
+        Terminal("("),
+        Nonterminal("E:complex"),
+        Terminal(")"),
+    )
+    precedence_grammar.add(
+        "E:float",
+        Nonterminal("E:complex"),
+        Terminal("."),
+        Terminal("real"),
+    )
+    precedence_grammar.add(
+        "E:float", Terminal("-"), Nonterminal("E:float")
+    )
+    precedence_grammar.add(
+        "E:to_bytes",
+        Nonterminal("E:int"),
+        Terminal("."),
+        Terminal("to_bytes"),
+    )
+    precedence_grammar.add(
+        "E:bytes",
+        Nonterminal("E:to_bytes"),
+        Terminal("("),
+        Terminal(")"),
+    )
+    precedence_grammar.add("E:factory", Terminal("factory"))
+    precedence_grammar.add(
+        "E:object",
+        Nonterminal("E:factory"),
+        Terminal("("),
+        Terminal(")"),
+    )
+    precedence_grammar.add(
+        "E:child",
+        Nonterminal("E:object"),
+        Terminal("."),
+        Terminal("child"),
+    )
+    precedence_grammar.add(
+        "E:method",
+        Nonterminal("E:child"),
+        Terminal("."),
+        Terminal("method"),
+    )
+    precedence_grammar.add(
+        "E:result",
+        Nonterminal("E:method"),
+        Terminal("("),
+        Terminal(")"),
+    )
+    # A callable that is also invertible is artificial but isolates call
+    # precedence: ``~f()`` is unary-of-call, never call-of-unary.
+    precedence_grammar.add("E:callable_invertible", Terminal("f"))
+    precedence_grammar.add(
+        "E:callable_invertible",
+        Terminal("~"),
+        Nonterminal("E:callable_invertible"),
+    )
+    precedence_grammar.add(
+        "E:callable_invertible",
+        Terminal("("),
+        Nonterminal("E:callable_invertible"),
+        Terminal(")"),
+    )
+    precedence_grammar.add(
+        "E:called",
+        Nonterminal("E:callable_invertible"),
+        Terminal("("),
+        Terminal(")"),
+    )
+    # Context-validated dynamic operations can be exact terminal rows rather
+    # than the usual ``op E`` shape.  They are still unary expressions and
+    # must not become primary receivers merely because their RHS is longer.
+    precedence_grammar.add(DYNAMIC_NONTERMINAL, Terminal("dynamic"))
+    precedence_grammar.add(
+        DYNAMIC_NONTERMINAL, Terminal("-"), Terminal("dynamic")
+    )
+    precedence_grammar.add(
+        DYNAMIC_NONTERMINAL,
+        Terminal("("),
+        Nonterminal(DYNAMIC_NONTERMINAL),
+        Terminal(")"),
+    )
+    precedence_grammar.add(
+        "E:Any", Nonterminal(DYNAMIC_NONTERMINAL)
+    )
+    precedence_grammar.add(
+        "E:dynamic_called",
+        Nonterminal("E:Any"),
+        Terminal("("),
+        Terminal(")"),
+    )
+    # Precomputed library fragments use the same unbinarized E-receiver
+    # shapes as live rows; exercise them without relying on a live LSP.
+    precedence_grammar.add("E:<module 'lib'>", Terminal("lib"))
+    precedence_grammar.add(
+        "E:lib.sqrt",
+        Nonterminal("E:<module 'lib'>"),
+        Terminal("."),
+        Terminal("sqrt"),
+    )
+    precedence_grammar.add(
+        "E:lib.result",
+        Nonterminal("E:lib.sqrt"),
+        Terminal("("),
+        Nonterminal("A:int"),
+        Terminal(")"),
+    )
+    precedence_grammar.add("A:int", Nonterminal("E:int"))
+    for expression in (
+        "E:int",
+        "E:float",
+        "E:to_bytes",
+        "E:bytes",
+        "E:result",
+        "E:called",
+        "E:dynamic_called",
+        "E:lib.result",
+    ):
+        precedence_grammar.add("START", Nonterminal(expression))
+    precedence_compiled = UnitAwareBinaryGrammar(
+        enforce_postfix_precedence(precedence_grammar)
+    )
+    assert precedence_compiled.recognizes(("0",))
+    assert UniformWordSampler(precedence_compiled, 1).parse_count(("0",)) == 1
+    assert precedence_compiled.recognizes(("-", "x", ".", "real"))
+    assert precedence_compiled.recognizes(
+        ("(", "-", "x", ")", ".", "real")
+    )
+    assert not precedence_compiled.recognizes(
+        ("~", "0", ".", "to_bytes")
+    )
+    assert precedence_compiled.recognizes(
+        ("(", "~", "0", ")", ".", "to_bytes")
+    )
+    assert UniformWordSampler(precedence_compiled, 6).parse_count(
+        ("(", "~", "0", ")", ".", "to_bytes")
+    ) == 1
+    assert not precedence_compiled.recognizes(
+        ("~", "0", ".", "to_bytes", "(", ")")
+    )
+    assert precedence_compiled.recognizes(
+        ("(", "~", "0", ")", ".", "to_bytes", "(", ")")
+    )
+    assert precedence_compiled.recognizes(
+        (
+            "factory", "(", ")", ".", "child", ".", "method", "(", ")",
+        )
+    )
+    assert not precedence_compiled.recognizes(("~", "f", "(", ")"))
+    assert precedence_compiled.recognizes(
+        ("(", "~", "f", ")", "(", ")")
+    )
+    assert not precedence_compiled.recognizes(
+        ("-", "dynamic", "(", ")")
+    )
+    assert precedence_compiled.recognizes(
+        ("(", "-", "dynamic", ")", "(", ")")
+    )
+    assert precedence_compiled.recognizes(
+        ("lib", ".", "sqrt", "(", "0", ")")
+    )
+
     class DynamicMemberProbe(SemanticProbe):
         def members(self, expression: str) -> tuple[list[Completion], bool]:
             assert expression == "owner"
@@ -6178,6 +7246,12 @@ def run_self_tests() -> None:
                 Completion("known_text", "str", None),
                 Completion("unknown_value", "Unknown", None),
             ], False
+
+        def accepts_expression(self, expression: str) -> bool:
+            return expression in {
+                "-owner.any_value",
+                "-owner.unknown_value",
+            }
 
     dynamic_member_builder = GrammarBuilder(
         DynamicMemberProbe.__new__(DynamicMemberProbe),
@@ -6191,9 +7265,10 @@ def run_self_tests() -> None:
     dynamic_member_builder.queue_receiver("Owner", "owner", 0)
     dynamic_member_builder.add_members()
     dynamic_member_builder.add_dynamic_operations()
+    dynamic_member_builder.add_redundant_grouping()
     dynamic_member_builder.grammar.add(
         dynamic_member_builder.grammar.start,
-        Nonterminal(DYNAMIC_NONTERMINAL),
+        Nonterminal(type_nonterminal("Any")),
     )
     dynamic_member_compiled = UnitAwareBinaryGrammar(
         dynamic_member_builder.grammar
@@ -6207,6 +7282,21 @@ def run_self_tests() -> None:
     assert not dynamic_member_compiled.recognizes(
         ("-", "owner", ".", "known_text")
     )
+    assert not dynamic_member_compiled.recognizes(
+        ("-", "-", "owner", ".", "any_value")
+    )
+    assert not dynamic_member_compiled.recognizes(
+        ("owner", ".", "any_value", "(", ")")
+    )
+    assert not dynamic_member_compiled.recognizes(
+        ("owner", ".", "any_value", ".", "known_text")
+    )
+    dynamic_grouping_sampler = UniformWordSampler(
+        dynamic_member_compiled, 5
+    )
+    assert dynamic_grouping_sampler.parse_count(
+        ("(", "owner", ".", "any_value", ")")
+    ) == 1
     assert owner_nonterminal == type_nonterminal("Owner")
 
     class LocalUnderscoreProbe(SemanticProbe):
@@ -6271,7 +7361,7 @@ def run_self_tests() -> None:
             "# module: fixture_lib",
             f"# module-type: {module_type}",
             "# local-assignability-complete: true",
-            "# local-assignability-version: 1",
+            f"# local-assignability-version: {ASSIGNABILITY_RELATION_VERSION}",
             "# local-assignability-actuals: "
             '["E:%3Cbuilt-in%20function%20answer%3E","E:int",'
             '"E:%3Cmodule%20%27fixture_lib.sub%27%3E"]',
@@ -6749,12 +7839,66 @@ def run_self_tests() -> None:
     assert ArgumentLayout(("object",), ()) in capped_layouts
     assert iterable_element_type("map[int]") == "int"
     assert iterable_element_type("reversed[str]") == "str"
+    assert concrete_heap_list_element_type("list[int]") == "int"
+    assert (
+        concrete_heap_list_element_type("list[Unknown] & ~AlwaysFalsy")
+        == "Unknown"
+    )
+    assert concrete_heap_list_element_type("Sequence[int]") is None
+    assert concrete_heap_list_element_type("list[_T]") is None
+    assert concrete_heap_list_element_type("list[int] & Sized") is None
     assert groundable_type("int")
     assert groundable_type("int | str")
     assert not groundable_type("_T")
     assert not groundable_type("list[SupportsRichComparisonT]")
     assert is_assignable("list[int]", "Iterable[int]")
     assert is_assignable("map[int]", "Iterable[int]")
+    for actual, expected in (
+        ("list[int]", "Sequence[int]"),
+        ("map[int]", "Iterator[int]"),
+        ("reversed[int]", "Iterator[int]"),
+        ("set[int]", "Collection[int]"),
+        ("dict[int, str]", "Mapping[int, str]"),
+        ("MutableMapping[int, str]", "Mapping[int, str]"),
+        ("list[int]", "MutableSequence[int]"),
+        ("defaultdict[int, str]", "MutableMapping[int, str]"),
+        ("range", "Sized"),
+        ("tuple[()]", "Iterable[str]"),
+    ):
+        assert is_assignable(actual, expected), (actual, expected)
+    for actual, expected in (
+        ("list[int]", "Mapping[int, int]"),
+        ("set[int]", "Sequence[int]"),
+        ("list[int]", "Iterator[int]"),
+        ("map[int]", "Collection[int]"),
+        ("map[int]", "Sized"),
+        ("reversed[int]", "Sized"),
+        ("dict[int, str]", "MutableSequence[int]"),
+        ("tuple[int, ...]", "MutableSequence[int]"),
+        ("list[int]", "MutableSequence[object]"),
+        ("dict[int, str]", "MutableMapping[int, object]"),
+    ):
+        assert not is_assignable(actual, expected), (actual, expected)
+    for reversible in (
+        "list[int]",
+        "tuple[int, ...]",
+        "dict[int, str]",
+        "range",
+        "deque[int]",
+    ):
+        assert is_assignable(reversible, "_SupportsReversed[int]")
+    for forward_only in (
+        "set[int]",
+        "map[int]",
+        "filter[int]",
+        "dict_values[str, int]",
+    ):
+        assert not is_assignable(
+            forward_only, "_SupportsReversed[int]"
+        )
+        assert not is_assignable(
+            forward_only, "SupportsLenAndGetItem[int]"
+        )
     assert is_assignable("defaultdict[Unknown, int]", "Sized")
     assert not is_assignable("defaultdict[Unknown, int]", "Hashable")
     assert not is_assignable(
@@ -6774,6 +7918,11 @@ def run_self_tests() -> None:
         "float", "str | Buffer | SupportsInt | SupportsIndex | SupportsTrunc"
     )
     assert not is_assignable("complex", "SupportsInt")
+    assert is_assignable("str", "AnyStr")
+    assert is_assignable("bytes", "AnyStr@re.escape")
+    assert is_assignable('Literal["x"]', "AnyStr")
+    assert not is_assignable("set[str]", "AnyStr")
+    assert not is_assignable("int", "AnyStr@fixture")
     assert is_assignable("<class 'int'>", "(_T1, /) -> _S")
     assert not is_assignable("str", "int")
 
@@ -6781,6 +7930,161 @@ def run_self_tests() -> None:
         parsed = parse_signature(label)
         assert parsed is not None
         return parsed
+
+    assert class_instance_type("<class 'defaultdict'>") == "defaultdict"
+    assert class_instance_type("bound method defaultdict.copy") is None
+    erased_self = parsed_signature("[Self](self) -> Self | None")
+    bound_self = bind_unbound_self_signature(erased_self, "Widget")
+    assert bound_self.parameters[0].type == "Widget"
+    assert bound_self.return_type == "Widget | None"
+    already_bound = parsed_signature("(value: str, /) -> int")
+    assert bind_unbound_self_signature(already_bound, "Widget") == already_bound
+
+    class SelfBindingProbe(SemanticProbe):
+        """Exercise unbound descriptors alongside bound methods/classes."""
+
+        member_rows: Mapping[str, tuple[Completion, ...]] = {
+            "str": (
+                Completion(
+                    "split",
+                    "Overload[(self: LiteralString, sep: LiteralString | None = None) "
+                    "-> list[LiteralString], (self, sep: str | None = None) "
+                    "-> list[str]]",
+                    LSP_FUNCTION,
+                ),
+            ),
+            "defaultdict": (
+                Completion(
+                    "copy", "def copy[Self](self) -> Self", LSP_FUNCTION
+                ),
+            ),
+            "deque": (
+                Completion(
+                    "index",
+                    "def index(self, x: Unknown, start: int = 0, /) -> int",
+                    LSP_FUNCTION,
+                ),
+            ),
+            "dq": (
+                Completion(
+                    "index",
+                    "bound method deque[str].index(x: str, start: int = 0, /) -> int",
+                    LSP_METHOD,
+                ),
+            ),
+            "Widget": (
+                Completion(
+                    "clone", "def clone[Self](self: Self) -> Self", LSP_FUNCTION
+                ),
+            ),
+            "widget": (
+                Completion(
+                    "clone", "bound method Widget.clone() -> Widget", LSP_METHOD
+                ),
+            ),
+        }
+        signature_rows: Mapping[str, tuple[str, ...]] = {
+            "str.split": (
+                "(self: LiteralString, sep: LiteralString | None = None) "
+                "-> list[LiteralString]",
+                "(self, sep: str | None = None) -> list[str]",
+            ),
+            "defaultdict.copy": ("[Self](self) -> Self",),
+            "deque.index": (
+                "(self, x: Unknown, start: int = 0, /) -> int",
+            ),
+            "dq.index": ("(x: str, start: int = 0, /) -> int",),
+            "Widget.clone": ("[Self](self: Self) -> Self",),
+            "widget.clone": ("() -> Widget",),
+            "deque": ("(iterable: Iterable[str], /) -> deque[str]",),
+        }
+
+        def members(self, expression: str) -> tuple[list[Completion], bool]:
+            return list(self.member_rows.get(expression, ())), False
+
+        def signatures(self, expression: str) -> list[str]:
+            return list(self.signature_rows.get(expression, ()))
+
+    self_binding_probe = SelfBindingProbe.__new__(SelfBindingProbe)
+    self_binding_builder = GrammarBuilder(
+        self_binding_probe,
+        frozenset(
+            {
+                "str",
+                "defaultdict",
+                "deque",
+                "Widget",
+                "s",
+                "dd",
+                "dq",
+                "widget",
+                "split",
+                "copy",
+                "index",
+                "clone",
+            }
+        ),
+        BuilderOptions(max_call_arity=3, max_receiver_types=8),
+        {},
+    )
+    self_binding_builder.add_literals()
+    for type_display, expression in (
+        ("<class 'str'>", "str"),
+        ("<class 'defaultdict'>", "defaultdict"),
+        ("<class 'deque'>", "deque"),
+        ("<class 'Widget'>", "Widget"),
+        ("<class 'enumerate'>", "enumerate"),
+        ("str", "s"),
+        ("defaultdict[str, int]", "dd"),
+        ("deque[str]", "dq"),
+        ("Widget", "widget"),
+    ):
+        self_binding_builder.add_expression(
+            type_display,
+            (Terminal(expression),),
+            representative=expression,
+        )
+    self_binding_builder.callables["<class 'deque'>"] = "deque"
+    for type_display, expression in (
+        ("<class 'str'>", "str"),
+        ("<class 'defaultdict'>", "defaultdict"),
+        ("<class 'deque'>", "deque"),
+        ("<class 'Widget'>", "Widget"),
+        ("deque[str]", "dq"),
+        ("Widget", "widget"),
+    ):
+        self_binding_builder.queue_receiver(type_display, expression, 0)
+    self_binding_builder.add_members()
+    self_binding_builder.add_calls()
+    self_binding_builder.add_redundant_grouping()
+    self_binding_grammar, _self_binding_stats = self_binding_builder.finish()
+    self_binding_compiled = UnitAwareBinaryGrammar(self_binding_grammar)
+    for word in (
+        ("str", ".", "split", "(", "s", ")"),
+        ("defaultdict", ".", "copy", "(", "dd", ")"),
+        ("deque", ".", "index", "(", "dq", ",", "s", ")"),
+        ("Widget", ".", "clone", "(", "widget", ")"),
+        (
+            "Widget", ".", "clone", "(", "widget", ")", ".",
+            "clone", "(", ")",
+        ),
+        ("dq", ".", "index", "(", "s", ")"),
+        ("widget", ".", "clone", "(", ")"),
+        ("deque", "(", "s", ")"),
+    ):
+        assert self_binding_compiled.recognizes(word), word
+    for word in (
+        ("str", ".", "split", "(", "enumerate", ")"),
+        ("defaultdict", ".", "copy", "(", "enumerate", ")"),
+        ("deque", ".", "index", "(", "str", ",", "s", ")"),
+        ("Widget", ".", "clone", "(", "enumerate", ")"),
+    ):
+        assert not self_binding_compiled.recognizes(word), word
+    assert type_nonterminal("Self") not in self_binding_grammar.nonterminals
+    assert (
+        postfix_nonterminal(type_nonterminal("Self"))
+        not in self_binding_grammar.nonterminals
+    )
 
     generic_probe = SemanticProbe.__new__(SemanticProbe)
     generic_signatures: dict[tuple[str, str], tuple[Signature, ...]] = {
@@ -6795,11 +8099,23 @@ def run_self_tests() -> None:
                 "[_T](iterable: Iterable[_T], /) -> list[_T]"
             ),
         ),
+        ("<class 'tuple'>", "tuple"): (
+            parsed_signature(
+                "[_T_co](iterable: Iterable[Unknown] = ..., /) -> Unknown"
+            ),
+        ),
         ("def sorted", "sorted"): (
             parsed_signature(
                 "[SupportsRichComparisonT](iterable: "
                 "Iterable[SupportsRichComparisonT], /, *, "
                 "reverse: bool = False) -> list[SupportsRichComparisonT]"
+            ),
+        ),
+        ("def max", "max"): (
+            parsed_signature(
+                "[SupportsRichComparisonT](iterable: "
+                "Iterable[SupportsRichComparisonT], /) -> "
+                "SupportsRichComparisonT"
             ),
         ),
         ("<class 'reversed'>", "reversed"): (
@@ -6816,6 +8132,21 @@ def run_self_tests() -> None:
         ("<class 'str'>", "str"): (
             parsed_signature("(object: object, /) -> str"),
         ),
+        ("def len", "len"): (
+            parsed_signature("(obj: Sized, /) -> int"),
+        ),
+        ("def add", "add"): (
+            parsed_signature("(left: int, right: int, /) -> int"),
+        ),
+        ("def unknown_result", "unknown_result"): (
+            parsed_signature("(value: int, /) -> Unknown"),
+        ),
+        ("bound method int.conjugate", "number.conjugate"): (
+            parsed_signature("() -> int"),
+        ),
+        ("bound method str.zfill", '"".zfill'): (
+            parsed_signature("(width: SupportsIndex, /) -> str"),
+        ),
         ("bound method str.join", '\"\".join'): (
             parsed_signature("(iterable: Iterable[str], /) -> str"),
         ),
@@ -6826,18 +8157,23 @@ def run_self_tests() -> None:
     generic_builder = GrammarBuilder(
         generic_probe,
         frozenset(),
-        BuilderOptions(max_call_arity=2),
+        BuilderOptions(max_call_arity=3),
         generic_signatures,
     )
     generic_builder.add_literals()
     for callable_type, expression in (
         ("<class 'map'>", "map"),
         ("<class 'list'>", "list"),
+        ("<class 'tuple'>", "tuple"),
         ("def sorted", "sorted"),
+        ("def max", "max"),
         ("<class 'reversed'>", "reversed"),
         ("<class 'range'>", "range"),
         ("<class 'int'>", "int"),
         ("<class 'str'>", "str"),
+        ("def len", "len"),
+        ("def add", "add"),
+        ("def unknown_result", "unknown_result"),
     ):
         generic_builder.add_expression(
             callable_type,
@@ -6851,6 +8187,38 @@ def run_self_tests() -> None:
     generic_builder.add_expression(
         "list[int]", (Terminal("numbers"),), representative="numbers"
     )
+    generic_builder.add_expression(
+        "list[complex]",
+        (Terminal("complexes"),),
+        representative="complexes",
+    )
+    generic_builder.add_expression(
+        "set[int]",
+        (Terminal("unique_numbers"),),
+        representative="unique_numbers",
+    )
+    generic_builder.add_expression(
+        "bound method int.conjugate",
+        (
+            Nonterminal(type_nonterminal("int")),
+            Terminal("."),
+            Terminal("conjugate"),
+        ),
+        representative="number.conjugate",
+    )
+    generic_builder.callables[
+        "bound method int.conjugate"
+    ] = "number.conjugate"
+    generic_builder.add_expression(
+        "bound method str.zfill",
+        (
+            Nonterminal(type_nonterminal("str")),
+            Terminal("."),
+            Terminal("zfill"),
+        ),
+        representative='"".zfill',
+    )
+    generic_builder.callables["bound method str.zfill"] = '"".zfill'
     generic_builder.add_expression("list[int]", (Terminal("target"),))
     generic_builder.add_expression(
         "bound method str.join",
@@ -6887,8 +8255,46 @@ def run_self_tests() -> None:
     assert generic_compiled.recognizes(
         ("sorted", "(", "map", "(", "int", ",", "words", ")", ")")
     )
+    assert generic_compiled.recognizes(("max", "(", "numbers", ")"))
+    assert generic_compiled.recognizes(("tuple", "(", ")"))
+    assert generic_compiled.recognizes(("tuple", "(", "numbers", ")"))
+    assert generic_compiled.recognizes(
+        ("tuple", "(", "tuple", "(", ")", ")")
+    )
+    assert UniformWordSampler(generic_compiled, 4).parse_count(
+        ("tuple", "(", "numbers", ")")
+    ) == 1
+    assert UniformWordSampler(generic_compiled, 6).parse_count(
+        ("tuple", "(", "tuple", "(", ")", ")")
+    ) == 1
+    assert not any(
+        production.lhs == TRUSTED_DYNAMIC_CALL_NONTERMINAL
+        and any(
+            isinstance(symbol, Nonterminal)
+            and symbol.value == type_nonterminal("<class 'tuple'>")
+            for symbol in production.rhs
+        )
+        for production in generic_grammar.productions
+    )
     assert generic_compiled.recognizes(
         ('\"\"', ".", "join", "(", "map", "(", "str", ",", "numbers", ")", ")")
+    )
+    assert generic_compiled.recognizes(
+        ("map", "(", "int", ",", "words", ")")
+    )
+    assert generic_compiled.recognizes(
+        ("map", "(", "str", ",", "numbers", ")")
+    )
+    assert generic_compiled.recognizes(
+        ("map", "(", "len", ",", "words", ")")
+    )
+    assert generic_compiled.recognizes(
+        (
+            "map", "(", "add", ",", "numbers", ",", "numbers", ")",
+        )
+    )
+    assert generic_compiled.recognizes(
+        ("map", "(", "unknown_result", ",", "numbers", ")")
     )
     assert generic_compiled.recognizes(
         (
@@ -6900,7 +8306,347 @@ def run_self_tests() -> None:
         ('\"\"', ".", "join", "(", "map", "(", "int", ",", "words", ")", ")")
     )
     assert not generic_compiled.recognizes(
+        ("map", "(", "add", ",", "numbers", ")")
+    )
+    assert not generic_compiled.recognizes(
+        (
+            "map", "(", "int", ",", "words", ",", "numbers", ")",
+        )
+    )
+    assert not generic_compiled.recognizes(
+        (
+            "map", "(", "0", ".", "conjugate", ",", "numbers", ")",
+        )
+    )
+    assert not generic_compiled.recognizes(
+        (
+            "map", "(", '\"\"', ".", "zfill", ",", "words", ")",
+        )
+    )
+    assert not generic_compiled.recognizes(
         ("target", ".", "extend", "(", "reversed", "(", "words", ")", ")")
+    )
+    assert not generic_compiled.recognizes(
+        ("max", "(", "complexes", ")")
+    )
+    assert not generic_compiled.recognizes(
+        ("reversed", "(", "unique_numbers", ")")
+    )
+    assert not generic_compiled.recognizes(
+        (
+            "reversed", "(", "map", "(", "int", ",", "words", ")", ")",
+        )
+    )
+
+    class RejectingOutputAssignmentProbe(SemanticProbe):
+        """Accept expressions, but reject every ordinary output witness."""
+
+        def __init__(
+            self,
+            accepted: Iterable[str] = (),
+            local_rejections: Iterable[str] = (),
+        ) -> None:
+            self.assignment_queries: list[str] = []
+            self.accepted = frozenset(accepted)
+            self.local_rejections = frozenset(local_rejections)
+
+        def accepts_expression(self, expression: str) -> bool:
+            return True
+
+        def accepts_assignment(self, expression: str) -> bool:
+            self.assignment_queries.append(expression)
+            return expression in self.accepted
+
+        def assignment_diagnostic_partition(
+            self, expression: str
+        ) -> tuple[
+            tuple[Mapping[str, object], ...],
+            tuple[Mapping[str, object], ...],
+        ]:
+            self.assignment_queries.append(expression)
+            if expression in self.accepted:
+                return (), ()
+            diagnostic: dict[str, object] = {
+                "code": "fixture-error",
+                "message": "synthetic output-assignment rejection",
+            }
+            if expression in self.local_rejections:
+                return (diagnostic,), ()
+            return (), (diagnostic,)
+
+    producer_probe = RejectingOutputAssignmentProbe(
+        {"good"}, local_rejections={"local_bad"}
+    )
+    producer_builder = GrammarBuilder(
+        producer_probe,
+        frozenset({"good", "bad", "local_bad"}),
+        BuilderOptions(max_output_producers=2048),
+        {},
+        required_assignment="result",
+    )
+    producer_builder.add_expression(
+        "int", (Terminal("good"),), representative="good"
+    )
+    producer_builder.add_expression("int", (Terminal("bad"),))
+    producer_builder.add_expression("int", (Terminal("local_bad"),))
+    producer_grammar, producer_stats = producer_builder.finish()
+    producer_compiled = UnitAwareBinaryGrammar(producer_grammar)
+    assert producer_compiled.recognizes(("result", "=", "good"))
+    assert producer_compiled.recognizes(("result", "=", "local_bad"))
+    assert not producer_compiled.recognizes(("result", "=", "bad"))
+    assert producer_stats.output_producer_families == 3
+    assert producer_stats.output_producers_checked == 3
+    assert producer_stats.output_producers_rejected == 1
+    assert producer_stats.output_producers_local_fallback == 1
+    assert producer_stats.output_producers_unchecked == 0
+
+    capped_probe = RejectingOutputAssignmentProbe({"gate"})
+    capped_builder = GrammarBuilder(
+        capped_probe,
+        frozenset({"a_bad", "b_bad", "gate"}),
+        BuilderOptions(max_output_producers=1),
+        {},
+        required_assignment="result",
+    )
+    capped_builder.add_expression(
+        "int", (Terminal("gate"),), representative="gate"
+    )
+    capped_builder.add_expression("int", (Terminal("a_bad"),))
+    capped_builder.add_expression("int", (Terminal("b_bad"),))
+    capped_grammar, capped_stats = capped_builder.finish()
+    capped_compiled = UnitAwareBinaryGrammar(capped_grammar)
+    assert not capped_compiled.recognizes(("result", "=", "a_bad"))
+    assert capped_compiled.recognizes(("result", "=", "b_bad"))
+    assert capped_compiled.recognizes(("result", "=", "gate"))
+    assert capped_stats.output_producer_families == 3
+    assert capped_stats.output_producers_checked == 1
+    assert capped_stats.output_producers_rejected == 1
+    assert capped_stats.output_producers_unchecked == 2
+
+    dynamic_probe = RejectingOutputAssignmentProbe()
+    dynamic_type = "def lcm(x: int, y: int) -> Unknown"
+    dynamic_builder = GrammarBuilder(
+        dynamic_probe,
+        frozenset({"lcm", "n", "m", "mystery", "tuple"}),
+        BuilderOptions(max_call_arity=2),
+        {
+            (dynamic_type, "lcm"): (
+                parsed_signature("(x: int, y: int) -> Unknown"),
+            ),
+            ("<class 'tuple'>", "tuple"): (
+                parsed_signature(
+                    "(iterable: Iterable[Unknown] = ..., /) -> Unknown"
+                ),
+            ),
+        },
+        required_assignment="fpb",
+    )
+    dynamic_builder.add_literals()
+    dynamic_builder.add_expression(
+        dynamic_type,
+        (Terminal("lcm"),),
+        representative="lcm",
+    )
+    dynamic_builder.callables[dynamic_type] = "lcm"
+    dynamic_builder.add_expression(
+        "<class 'tuple'>",
+        (Terminal("tuple"),),
+        representative="tuple",
+    )
+    dynamic_builder.callables["<class 'tuple'>"] = "tuple"
+    dynamic_builder.add_expression("int", (Terminal("n"),))
+    dynamic_builder.add_expression("int", (Terminal("m"),))
+    dynamic_builder.add_expression(
+        "Unknown", (Terminal("mystery"),), representative="mystery"
+    )
+    dynamic_builder.add_calls()
+    dynamic_builder.add_grounded_generic_calls()
+    dynamic_builder.add_dynamic_operations()
+    dynamic_grammar, _dynamic_stats = dynamic_builder.finish()
+    dynamic_compiled = UnitAwareBinaryGrammar(dynamic_grammar)
+    assert dynamic_compiled.recognizes(
+        ("fpb", "=", "lcm", "(", "n", ",", "m", ")")
+    )
+    assert not dynamic_compiled.recognizes(("fpb", "=", "mystery"))
+    assert not dynamic_compiled.recognizes(("fpb", "=", "tuple", "(", ")"))
+    assert not dynamic_compiled.recognizes(
+        ("fpb", "=", "lcm", "(", "n", ",", "m", ")", ".", "real")
+    )
+    assert all(
+        Nonterminal(type_nonterminal("Unknown")) not in production.rhs
+        for production in dynamic_grammar.productions
+        if production.lhs == dynamic_grammar.start
+    )
+
+    contextual_output_probe = RejectingOutputAssignmentProbe(
+        {"stack . pop ( )"}
+    )
+    stack_pop_type = (
+        "bound method list[Unknown].pop"
+        "(index: SupportsIndex = -1, /) -> Unknown"
+    )
+    queue_pop_type = "bound method deque[Unknown].pop() -> Unknown"
+    contextual_output_builder = GrammarBuilder(
+        contextual_output_probe,
+        frozenset({"stack", "queue"}),
+        BuilderOptions(max_call_arity=0),
+        {
+            (stack_pop_type, "stack.pop"): (
+                parsed_signature("() -> Unknown"),
+            ),
+            (queue_pop_type, "queue.pop"): (
+                parsed_signature("() -> Unknown"),
+            ),
+        },
+        required_assignment="value",
+    )
+    for callable_type, expression in (
+        (stack_pop_type, "stack.pop"),
+        (queue_pop_type, "queue.pop"),
+    ):
+        expression_tokens = canonical_expression_tokens(expression)
+        assert expression_tokens is not None
+        contextual_output_builder.add_expression(
+            callable_type,
+            tuple(
+                Terminal(token) for token in expression_tokens
+            ),
+            representative=expression,
+        )
+        contextual_output_builder.callables[callable_type] = expression
+    contextual_output_builder.add_calls()
+    contextual_output_grammar, _contextual_output_stats = (
+        contextual_output_builder.finish()
+    )
+    contextual_output_compiled = UnitAwareBinaryGrammar(
+        contextual_output_grammar
+    )
+    assert contextual_output_compiled.recognizes(
+        ("value", "=", "stack", ".", "pop", "(", ")")
+    )
+    assert not contextual_output_compiled.recognizes(
+        ("value", "=", "queue", ".", "pop", "(", ")")
+    )
+    assert set(contextual_output_probe.assignment_queries) == {
+        "stack.pop",
+        "queue.pop",
+        "stack . pop ( )",
+        "queue . pop ( )",
+    }
+
+    legacy_dynamic_probe = RejectingOutputAssignmentProbe(
+        {"visible_unknown", "-self.y"}
+    )
+    legacy_dynamic_builder = GrammarBuilder(
+        legacy_dynamic_probe,
+        frozenset({"visible_unknown", "rejected_unknown"}),
+        BuilderOptions(),
+        {},
+        required_assignment="result",
+    )
+    legacy_dynamic_builder.add_expression(
+        "Unknown",
+        (Terminal("visible_unknown"),),
+        representative="visible_unknown",
+    )
+    legacy_dynamic_builder.add_expression(
+        "Unknown",
+        (Terminal("rejected_unknown"),),
+        representative="rejected_unknown",
+    )
+    legacy_dynamic_builder.add_expression(
+        "Unknown",
+        (Terminal("self"), Terminal("."), Terminal("y")),
+        representative="self.y",
+    )
+    legacy_dynamic_grammar, _legacy_dynamic_stats = (
+        legacy_dynamic_builder.finish()
+    )
+    legacy_dynamic_compiled = UnitAwareBinaryGrammar(legacy_dynamic_grammar)
+    assert legacy_dynamic_compiled.recognizes(
+        ("result", "=", "visible_unknown")
+    )
+    assert not legacy_dynamic_compiled.recognizes(
+        ("result", "=", "rejected_unknown")
+    )
+    assert legacy_dynamic_compiled.recognizes(
+        ("result", "=", "-", "self", ".", "y")
+    )
+    assert not legacy_dynamic_compiled.recognizes(
+        ("result", "=", "+", "self", ".", "y")
+    )
+
+    heap_probe = RejectingOutputAssignmentProbe()
+    heappop_type = (
+        "def heappop[SupportsRichComparisonT]"
+        "(heap: list[SupportsRichComparisonT], /) -> SupportsRichComparisonT"
+    )
+    heap_builder = GrammarBuilder(
+        heap_probe,
+        frozenset({"heapq", "heappop", "w", "words"}),
+        BuilderOptions(max_call_arity=1),
+        {
+            (heappop_type, "heapq.heappop"): (
+                parsed_signature(
+                    "[SupportsRichComparisonT]"
+                    "(heap: list[SupportsRichComparisonT], /) "
+                    "-> SupportsRichComparisonT"
+                ),
+            )
+        },
+        required_assignment="head",
+    )
+    heap_builder.add_literals()
+    heap_builder.add_expression(
+        heappop_type,
+        (Terminal("heapq"), Terminal("."), Terminal("heappop")),
+        representative="heapq.heappop",
+    )
+    heap_builder.callables[heappop_type] = "heapq.heappop"
+    heap_builder.add_expression(
+        "list[Unknown] & ~AlwaysFalsy",
+        (Terminal("w"),),
+        representative="w",
+    )
+    heap_builder.add_expression(
+        "list[str]", (Terminal("words"),), representative="words"
+    )
+    for rejected_type, token in (
+        ("list[object]", "objects"),
+        ("list[dict[str, int]]", "dictionaries"),
+        ("list[complex]", "complexes"),
+    ):
+        heap_builder.add_expression(
+            rejected_type, (Terminal(token),), representative=token
+        )
+    heap_builder.add_calls()
+    # Model a covered heapq artifact: its ordinary call row remains in the
+    # grammar, while add_library_artifact removes the cached export from the
+    # live callable worklist.
+    heap_builder.callables.pop(heappop_type)
+    heap_builder.add_grounded_generic_calls()
+    heappop_nonterminal = Nonterminal(type_nonterminal(heappop_type))
+    for rejected_type, result_type in (
+        ("list[object]", "object"),
+        ("list[dict[str, int]]", "dict[str, int]"),
+        ("list[complex]", "complex"),
+    ):
+        assert Production(
+            type_nonterminal(result_type),
+            (
+                heappop_nonterminal,
+                Terminal("("),
+                Nonterminal(type_nonterminal(rejected_type)),
+                Terminal(")"),
+            ),
+        ) not in heap_builder.grammar.productions
+    heap_grammar, _heap_stats = heap_builder.finish()
+    heap_compiled = UnitAwareBinaryGrammar(heap_grammar)
+    assert heap_compiled.recognizes(
+        ("head", "=", "heapq", ".", "heappop", "(", "w", ")")
+    )
+    assert not heap_compiled.recognizes(
+        ("head", "=", "heapq", ".", "heappop", "(", "words", ")")
     )
 
     class ContextualAppendProbe(SemanticProbe):
@@ -7000,6 +8746,7 @@ def parse_arguments(arguments: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--member-depth", type=int, default=2)
     parser.add_argument("--max-receiver-types", type=int, default=32)
     parser.add_argument("--max-module-members", type=int, default=128)
+    parser.add_argument("--max-output-producers", type=int, default=2048)
     parser.add_argument(
         "--max-rejection-attempts",
         type=int,
@@ -7023,10 +8770,21 @@ def parse_arguments(arguments: Sequence[str]) -> argparse.Namespace:
         "member_depth",
         "max_receiver_types",
         "max_module_members",
+        "max_output_producers",
         "max_rejection_attempts",
     ):
         value = getattr(parsed, name)
-        minimum = 0 if name in {"files", "precision_samples", "member_depth"} else 1
+        minimum = (
+            0
+            if name
+            in {
+                "files",
+                "precision_samples",
+                "member_depth",
+                "max_output_producers",
+            }
+            else 1
+        )
         if value < minimum:
             parser.error(f"--{name.replace('_', '-')} must be at least {minimum}")
     if parsed.shard_count < 1:
@@ -7055,6 +8813,7 @@ def evaluation_options(args: argparse.Namespace) -> EvaluationOptions:
             member_depth=args.member_depth,
             max_receiver_types=args.max_receiver_types,
             max_module_members=args.max_module_members,
+            max_output_producers=args.max_output_producers,
         ),
         max_rejection_attempts=args.max_rejection_attempts,
         json_lines=args.jsonl,

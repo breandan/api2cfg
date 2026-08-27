@@ -7,17 +7,41 @@ in scope, then unions its productions with the contextual grammar.  Fragments
 never define `START`; the evaluator remains responsible for the statement
 root and continuation constraints.
 
-Regenerate the most frequent CodeNet imports with:
+Automatic selection is trained on APPS `train` solutions by default.  Review
+the selected roots and their document frequencies without generating files:
 
 ```sh
-python3 data/gen_python_libraries.py
+python3 data/gen_python_libraries.py \
+  --dataset apps --split train data/apps/train.jsonl \
+  --top 25 --min-files 10 --scan-only --jsonl
 ```
 
-Or generate selected modules without rescanning the archive:
+After reviewing that selection, generate the corresponding artifacts with:
+
+```sh
+python3 data/gen_python_libraries.py \
+  --dataset apps --split train data/apps/train.jsonl \
+  --output-dir data/lib --top 25 --min-files 10
+```
+
+The dataset, split, resolved source, scanned-source count, and per-module
+importing-source count are embedded in newly generated fragment metadata.
+Because imports are counted once per solution, a module imported repeatedly
+within one solution contributes one document-frequency observation.
+
+Generate selected modules without scanning any dataset:
 
 ```sh
 python3 data/gen_python_libraries.py \
   --module numpy --module math --module collections
+```
+
+CodeNet remains supported explicitly:
+
+```sh
+python3 data/gen_python_libraries.py \
+  --dataset codenet data/Project_CodeNet.tar.gtar \
+  --top 25 --min-files 10
 ```
 
 Schema 2 keeps ordinary `LHS -> RHS ...` CFG rows but assigns long ty display
@@ -34,12 +58,16 @@ edge count.  At evaluation time only contextual and cross-artifact pairs are
 rechecked; old fragments without a complete, matching relation version remain
 valid but do not receive this optimization.
 
-The checked-in set was selected by a full archive scan recorded in
-`import_frequencies.json`: 27 standard-library modules plus NumPy, SciPy,
-Numba, SymPy, and NetworkX.  These are finite, ty-derived approximations rather
-than unqualified models of dynamic Python: generation is bounded to 12 call
-arguments, 64 layouts per signature, and two levels of module namespaces;
-members available only after calling a function are discovered contextually,
-not precomputed speculatively.  Ty 0.0.74 marks completion responses as
-incomplete even below its hard item cap, so that fact is retained in every
-artifact instead of claiming absolute completeness.
+The currently checked-in set predates the APPS-default migration.  Its
+historical full-CodeNet selection is recorded in `import_frequencies.json`:
+27 standard-library modules plus NumPy, SciPy, Numba, SymPy, and NetworkX.
+Do not treat that manifest as APPS-training provenance; review the APPS
+`--scan-only` result above before replacing these artifacts.
+
+The fragments are finite, ty-derived approximations rather than unqualified
+models of dynamic Python: generation is bounded to 12 call arguments, 64
+layouts per signature, and two levels of module namespaces; members available
+only after calling a function are discovered contextually, not precomputed
+speculatively.  Ty 0.0.74 marks completion responses as incomplete even below
+its hard item cap, so that fact is retained in every artifact instead of
+claiming absolute completeness.

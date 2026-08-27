@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Precompute ty-derived CFG fragments for commonly imported Python modules.
 
-The script first scans Project CodeNet without extracting it and counts the
-number of Python submissions that import each top-level module.  It then asks
-``ty server`` for the public semantic surface of selected modules and writes
+The script first scans APPS training solutions by default and counts the
+number of Python sources that import each top-level module.  Project CodeNet
+archives remain available through ``--dataset codenet``.  It then asks ``ty
+server`` for the public semantic surface of selected modules and writes
 deterministic, evaluator-native fragments to ``data/lib/*.cfg``.
 
 A fragment intentionally has no ``START`` production and no production for a
@@ -58,7 +59,6 @@ import re
 import shutil
 import subprocess
 import sys
-import tarfile
 import tempfile
 import time
 import urllib.parse
@@ -72,6 +72,8 @@ import evaluate_python as evaluator
 
 
 CFG_SCHEMA_VERSION = 2
+DEFAULT_DATASET = "apps"
+DEFAULT_SPLIT = "train"
 DEFAULT_ARCHIVE = evaluator.DEFAULT_CODENET_ARCHIVE
 DEFAULT_OUTPUT_DIRECTORY = Path(__file__).resolve().with_name("lib")
 LIBRARY_ALIAS = "__api2cfg_library"
@@ -88,7 +90,7 @@ class GenerationError(RuntimeError):
 
 @dataclass
 class ImportScan:
-    """Document frequencies collected from CodeNet Python submissions."""
+    """Document frequencies collected from dataset Python sources."""
 
     frequencies: Counter[str] = field(default_factory=Counter)
     python_files: int = 0
@@ -96,6 +98,9 @@ class ImportScan:
     parsed_files: int = 0
     decode_failures: int = 0
     parse_failures: int = 0
+    dataset: str | None = None
+    split: str | None = None
+    source: Path | None = None
 
 
 @dataclass
@@ -117,7 +122,9 @@ class FragmentStats:
 
 @dataclass(frozen=True)
 class GeneratorOptions:
-    archive: Path
+    dataset: str
+    source: Path
+    split: str
     output_directory: Path
     modules: tuple[str, ...]
     top: int
@@ -151,53 +158,66 @@ def imported_top_level_modules(tree: ast.AST) -> frozenset[str]:
     return frozenset(result)
 
 
+def scan_dataset_imports(
+    dataset: str,
+    source: Path,
+    split: str,
+    *,
+    max_python_files: int | None = None,
+) -> ImportScan:
+    """Stream evaluator dataset sources and count importing files per root."""
+
+    resolved_source = evaluator.resolved_dataset_source(dataset, source, split)
+    result = ImportScan(
+        dataset=dataset,
+        split=split if dataset == "apps" else None,
+        source=resolved_source,
+    )
+    for dataset_source in evaluator.iter_dataset_sources(
+        dataset,
+        source,
+        split,
+    ):
+        if (
+            max_python_files is not None
+            and result.python_files >= max_python_files
+        ):
+            break
+        result.python_files += 1
+        decoded_source = evaluator.decode_source(dataset_source.data)
+        if decoded_source is None:
+            result.decode_failures += 1
+            continue
+        result.decoded_files += 1
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", SyntaxWarning)
+                tree = ast.parse(
+                    decoded_source,
+                    filename=dataset_source.member,
+                    type_comments=True,
+                )
+        except (SyntaxError, ValueError):
+            result.parse_failures += 1
+            continue
+        result.parsed_files += 1
+        result.frequencies.update(imported_top_level_modules(tree))
+    return result
+
+
 def scan_archive_imports(
     archive_path: Path,
     *,
     max_python_files: int | None = None,
 ) -> ImportScan:
-    """Stream a CodeNet archive and count importing files per root module."""
+    """Compatibility wrapper for scanning a Project CodeNet archive."""
 
-    if not archive_path.is_file():
-        raise GenerationError(f"archive not found: {archive_path}")
-    result = ImportScan()
-    with tarfile.open(archive_path, mode="r|gz") as archive:
-        for member in archive:
-            if (
-                max_python_files is not None
-                and result.python_files >= max_python_files
-            ):
-                break
-            if (
-                not member.isfile()
-                or evaluator.PYTHON_SUBMISSION(member.name) is None
-            ):
-                continue
-            result.python_files += 1
-            extracted = archive.extractfile(member)
-            if extracted is None:
-                result.decode_failures += 1
-                continue
-            with extracted:
-                source = evaluator.decode_source(extracted.read())
-            if source is None:
-                result.decode_failures += 1
-                continue
-            result.decoded_files += 1
-            try:
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore", SyntaxWarning)
-                    tree = ast.parse(
-                        source,
-                        filename=member.name,
-                        type_comments=True,
-                    )
-            except (SyntaxError, ValueError):
-                result.parse_failures += 1
-                continue
-            result.parsed_files += 1
-            result.frequencies.update(imported_top_level_modules(tree))
-    return result
+    return scan_dataset_imports(
+        "codenet",
+        archive_path,
+        DEFAULT_SPLIT,
+        max_python_files=max_python_files,
+    )
 
 
 def validate_module_name(module: str) -> str:
@@ -735,6 +755,9 @@ def render_fragment(
                 separators=(",", ":"),
             ),
         ),
+        ("import-scan-dataset", scan.dataset or "none"),
+        ("import-scan-split", scan.split or "none"),
+        ("import-scan-source", str(scan.source) if scan.source else "none"),
         ("import-files", str(scan.frequencies[module])),
         ("scanned-python-files", str(scan.python_files)),
         ("max-call-arity", str(options.max_call_arity)),
@@ -854,8 +877,10 @@ def generate(options: GeneratorOptions) -> int:
         or options.scan_only
     )
     if needs_scan:
-        scan = scan_archive_imports(
-            options.archive,
+        scan = scan_dataset_imports(
+            options.dataset,
+            options.source,
+            options.split,
             max_python_files=options.scan_files,
         )
     else:
@@ -864,7 +889,9 @@ def generate(options: GeneratorOptions) -> int:
     emit(
         {
             "event": "scan",
-            "archive": str(options.archive),
+            "dataset": options.dataset,
+            "split": options.split if options.dataset == "apps" else None,
+            "source": str(options.source),
             "python_files": scan.python_files,
             "decoded_files": scan.decoded_files,
             "parsed_files": scan.parsed_files,
@@ -987,7 +1014,9 @@ from . import local
         (evaluator.Nonterminal("E:float"),),
     ) in grammar.productions
     options = GeneratorOptions(
-        archive=Path("unused"),
+        dataset="apps",
+        source=Path("unused"),
+        split="train",
         output_directory=Path("unused"),
         modules=("math",),
         top=0,
@@ -1017,6 +1046,9 @@ from . import local
         environment_source="current-interpreter",
     )
     assert text.startswith("# api2cfg-python-library-cfg: 2\n# module: math\n")
+    assert "# import-scan-dataset: none\n" in text
+    assert "# import-scan-split: none\n" in text
+    assert "# import-scan-source: none\n" in text
     assert "# receiver-policy: module-namespaces\n" in text
     assert "# callable-return-members: false\n" in text
     assert "# local-assignability-complete: true\n" in text
@@ -1039,21 +1071,85 @@ from . import local
         pass
     else:
         raise AssertionError("START should not be serializable in a fragment")
-    defaults = parse_arguments([])
+    defaults = generation_options(parse_arguments([]))
+    assert defaults.dataset == "apps"
+    assert defaults.split == "train"
+    assert defaults.source == evaluator.default_dataset_source("apps", "train")
     assert defaults.max_call_arity == 12
     assert defaults.max_layouts_per_signature == 64
     assert defaults.member_depth == 2
+    codenet = generation_options(parse_arguments(["--dataset", "codenet"]))
+    assert codenet.dataset == "codenet"
+    assert codenet.source == evaluator.default_dataset_source(
+        "codenet", "train"
+    )
+    explicit = generation_options(
+        parse_arguments(
+            [
+                "--dataset",
+                "apps",
+                "--split",
+                "test",
+                "custom-apps",
+                "--module",
+                "numpy",
+            ]
+        )
+    )
+    assert explicit.source == Path("custom-apps")
+    assert explicit.modules == ("numpy",)
+    with tempfile.TemporaryDirectory() as directory:
+        apps_directory = Path(directory)
+        (apps_directory / "train.jsonl").write_text(
+            json.dumps(
+                {
+                    "id": 1,
+                    "solutions": [
+                        "import math\nimport numpy as np\n",
+                        "from math import sqrt\nfrom . import local\n",
+                    ],
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        apps_scan = scan_dataset_imports(
+            "apps",
+            apps_directory,
+            "train",
+        )
+        assert apps_scan.dataset == "apps"
+        assert apps_scan.split == "train"
+        assert apps_scan.source == apps_directory / "train.jsonl"
+        assert apps_scan.python_files == 2
+        assert apps_scan.parsed_files == 2
+        assert apps_scan.frequencies == Counter({"math": 2, "numpy": 1})
     print("self-test passed")
 
 
 def parse_arguments(arguments: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "archive",
+        "source",
         nargs="?",
         type=Path,
-        default=DEFAULT_ARCHIVE,
-        help="Project CodeNet gzip tar archive",
+        default=None,
+        help=(
+            "dataset source (APPS directory/split JSONL or CodeNet gzip tar); "
+            "defaults according to --dataset and --split"
+        ),
+    )
+    parser.add_argument(
+        "--dataset",
+        choices=("apps", "codenet"),
+        default=DEFAULT_DATASET,
+        help="dataset whose imports select automatically generated libraries",
+    )
+    parser.add_argument(
+        "--split",
+        choices=("train", "test"),
+        default=DEFAULT_SPLIT,
+        help="APPS split to scan (default: train; ignored for CodeNet)",
     )
     parser.add_argument(
         "--output-dir",
@@ -1137,13 +1233,16 @@ def parse_arguments(arguments: Sequence[str]) -> argparse.Namespace:
     return parsed
 
 
-def main(arguments: Sequence[str] | None = None) -> int:
-    args = parse_arguments(sys.argv[1:] if arguments is None else arguments)
-    if args.self_test:
-        run_self_tests()
-        return 0
-    options = GeneratorOptions(
-        archive=args.archive,
+def generation_options(args: argparse.Namespace) -> GeneratorOptions:
+    """Resolve dataset-dependent defaults into immutable generator options."""
+
+    source = args.source
+    if source is None:
+        source = evaluator.default_dataset_source(args.dataset, args.split)
+    return GeneratorOptions(
+        dataset=args.dataset,
+        source=source,
+        split=args.split,
         output_directory=args.output_dir,
         modules=tuple(args.module),
         top=args.top,
@@ -1160,6 +1259,14 @@ def main(arguments: Sequence[str] | None = None) -> int:
         require_complete=args.require_complete,
         json_lines=args.jsonl,
     )
+
+
+def main(arguments: Sequence[str] | None = None) -> int:
+    args = parse_arguments(sys.argv[1:] if arguments is None else arguments)
+    if args.self_test:
+        run_self_tests()
+        return 0
+    options = generation_options(args)
     try:
         return generate(options)
     except (GenerationError, evaluator.EvaluationError, FileNotFoundError) as error:
