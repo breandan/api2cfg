@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate cursor-specific Python CFGs on Project CodeNet.
+"""Evaluate cursor-specific Python CFGs on APPS or Project CodeNet.
 
 The evaluator keeps the held-out statement away from the ``ty`` language
 server used to construct its grammar.  It currently supports one-line
@@ -22,8 +22,9 @@ For every eligible statement in every selected source file it independently:
    ``max(1, k - 2)`` through ``k + 2`` before reinserting each sample and checking
    it with ty.
 
-The evaluator implementation itself uses only the Python standard library and
-streams the CodeNet tarball without extracting it.  Evaluated sources may use
+The evaluator implementation itself uses only the Python standard library.  It
+streams APPS solutions from a split JSONL file, or CodeNet submissions from its
+tarball without extracting either dataset.  Evaluated sources may use
 third-party packages available in ty's pinned semantic environment; compatible
 precomputed fragments under ``data/lib`` are loaded for visible imports.
 """
@@ -35,6 +36,7 @@ import ast
 import builtins
 import functools
 import hashlib
+import heapq
 import io
 import importlib.metadata
 import itertools
@@ -56,11 +58,14 @@ import warnings
 from collections import Counter, defaultdict, deque
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Iterable, Iterator, Mapping, Sequence, TextIO
+from typing import Callable, Iterable, Iterator, Mapping, Sequence, TextIO
 from urllib.parse import quote, unquote
 
 
-DEFAULT_ARCHIVE = Path(__file__).resolve().with_name("Project_CodeNet.tar.gtar")
+DEFAULT_CODENET_ARCHIVE = Path(__file__).resolve().with_name(
+    "Project_CodeNet.tar.gtar"
+)
+DEFAULT_APPS_DIRECTORY = Path(__file__).resolve().with_name("apps")
 DEFAULT_LIBRARY_DIRECTORY = Path(__file__).resolve().with_name("lib")
 LIBRARY_CFG_SCHEMA = "2"
 SUPPORTED_LIBRARY_CFG_SCHEMAS = frozenset({"1", LIBRARY_CFG_SCHEMA})
@@ -79,12 +84,14 @@ PYTHON_SUBMISSION = re.compile(
 ).fullmatch
 FRESH_TOKEN = "@fresh"
 DYNAMIC_NONTERMINAL = "E:__contextual_dynamic__"
+TRUSTED_DYNAMIC_CALL_NONTERMINAL = "C:__trusted_dynamic_call__"
 
 LSP_METHOD = 2
 LSP_FUNCTION = 3
 LSP_CONSTRUCTOR = 4
 LSP_CLASS = 7
 LSP_MODULE = 9
+MAX_PROGRESSIVE_COMPLETION_PASSES = 8
 
 CALLABLE_KINDS = {LSP_METHOD, LSP_FUNCTION, LSP_CONSTRUCTOR, LSP_CLASS}
 IGNORED_TOKEN_TYPES = {
@@ -207,6 +214,214 @@ def decode_source(data: bytes) -> str | None:
         return data.decode(source_encoding(data))
     except (LookupError, UnicodeDecodeError):
         return None
+
+
+def default_dataset_source(dataset: str, split: str) -> Path:
+    """Return the default on-disk source for a dataset and APPS split."""
+
+    if dataset == "apps":
+        if split not in {"train", "test"}:
+            raise ValueError(f"unsupported APPS split: {split}")
+        return DEFAULT_APPS_DIRECTORY / f"{split}.jsonl"
+    if dataset == "codenet":
+        return DEFAULT_CODENET_ARCHIVE
+    raise ValueError(f"unsupported dataset: {dataset}")
+
+
+def resolved_dataset_source(dataset: str, source: Path, split: str) -> Path:
+    """Resolve an APPS directory to its selected split JSONL file."""
+
+    if dataset == "apps":
+        if source.is_dir():
+            return source / f"{split}.jsonl"
+        if source.suffix.lower() != ".jsonl":
+            raise EvaluationError(
+                f"APPS source must be a directory or JSONL file, not {source}; "
+                "use --dataset codenet for a CodeNet archive"
+            )
+        named_split = source.stem if source.stem in {"train", "test"} else None
+        if named_split is not None and named_split != split:
+            raise EvaluationError(
+                f"APPS source {source.name} conflicts with --split {split}; "
+                f"use --split {named_split}"
+            )
+    return source
+
+
+@dataclass(frozen=True)
+class DatasetSource:
+    """One independently evaluated Python source from a streamed dataset."""
+
+    member: str
+    data: bytes
+    dataset: str
+    split: str | None = None
+    problem_id: str | int | None = None
+    solution_index: int | None = None
+    difficulty: str | None = None
+    url: str | None = None
+
+
+def decode_apps_solutions(
+    value: object,
+    *,
+    path: Path,
+    line_number: int,
+) -> list[str]:
+    """Decode the APPS ``solutions`` field in either supported representation."""
+
+    if isinstance(value, str):
+        # APPS uses an empty string, rather than ``[]``, for the 1,235 test
+        # problems that have no reference solutions.
+        if not value.strip():
+            return []
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError as error:
+            raise EvaluationError(
+                f"{path}:{line_number}: invalid JSON in solutions field: {error}"
+            ) from error
+    if not isinstance(value, list) or not all(
+        isinstance(solution, str) for solution in value
+    ):
+        raise EvaluationError(
+            f"{path}:{line_number}: solutions must decode to a list of strings"
+        )
+    return value
+
+
+def apps_member_name(
+    split: str,
+    problem_id: str | int,
+    solution_index: int,
+) -> str:
+    """Return a stable virtual filename for an APPS solution."""
+
+    encoded_problem = quote(str(problem_id), safe="")
+    return (
+        f"APPS/{split}/{encoded_problem}/"
+        f"solution_{solution_index:04d}.py"
+    )
+
+
+def _iter_apps_sources(
+    path: Path,
+    split: str,
+    shard_count: int,
+    shard_index: int,
+) -> Iterator[DatasetSource]:
+    source_index = 0
+    with path.open("r", encoding="utf-8") as rows:
+        for line_number, line in enumerate(rows, start=1):
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise EvaluationError(
+                    f"{path}:{line_number}: invalid APPS JSONL row: {error}"
+                ) from error
+            if not isinstance(row, dict):
+                raise EvaluationError(
+                    f"{path}:{line_number}: APPS row must be a JSON object"
+                )
+            problem_id = row.get("id")
+            if not isinstance(problem_id, (str, int)) or isinstance(
+                problem_id, bool
+            ):
+                raise EvaluationError(
+                    f"{path}:{line_number}: APPS row has no scalar id"
+                )
+            solutions = decode_apps_solutions(
+                row.get("solutions"),
+                path=path,
+                line_number=line_number,
+            )
+            difficulty = row.get("difficulty")
+            if not isinstance(difficulty, str):
+                difficulty = None
+            url = row.get("url")
+            if not isinstance(url, str):
+                url = None
+            for solution_index, solution in enumerate(solutions):
+                owned = source_index % shard_count == shard_index
+                source_index += 1
+                if not owned:
+                    continue
+                try:
+                    data = solution.encode("utf-8")
+                except UnicodeEncodeError as error:
+                    raise EvaluationError(
+                        f"{path}:{line_number}: solution {solution_index} "
+                        "is not valid UTF-8"
+                    ) from error
+                yield DatasetSource(
+                    member=apps_member_name(
+                        split,
+                        problem_id,
+                        solution_index,
+                    ),
+                    data=data,
+                    dataset="apps",
+                    split=split,
+                    problem_id=problem_id,
+                    solution_index=solution_index,
+                    difficulty=difficulty,
+                    url=url,
+                )
+
+
+def _iter_codenet_sources(
+    path: Path,
+    shard_count: int,
+    shard_index: int,
+) -> Iterator[DatasetSource]:
+    source_index = 0
+    try:
+        with tarfile.open(path, mode="r|gz") as archive:
+            for member in archive:
+                if not member.isfile() or PYTHON_SUBMISSION(member.name) is None:
+                    continue
+                owned = source_index % shard_count == shard_index
+                source_index += 1
+                if not owned:
+                    continue
+                extracted = archive.extractfile(member)
+                if extracted is None:
+                    continue
+                with extracted:
+                    data = extracted.read()
+                yield DatasetSource(
+                    member=member.name,
+                    data=data,
+                    dataset="codenet",
+                )
+    except (tarfile.ReadError, tarfile.CompressionError) as error:
+        raise EvaluationError(f"invalid CodeNet tar archive {path}: {error}") from error
+
+
+def iter_dataset_sources(
+    dataset: str,
+    source: Path,
+    split: str,
+    shard_count: int = 1,
+    shard_index: int = 0,
+) -> Iterator[DatasetSource]:
+    """Stream dataset sources, sharding APPS over solutions rather than rows."""
+
+    if shard_count < 1:
+        raise ValueError("shard_count must be at least 1")
+    if not 0 <= shard_index < shard_count:
+        raise ValueError("shard_index must be in [0, shard_count)")
+    path = resolved_dataset_source(dataset, source, split)
+    if not path.is_file():
+        raise EvaluationError(f"dataset source not found: {path}")
+    if dataset == "apps":
+        yield from _iter_apps_sources(path, split, shard_count, shard_index)
+    elif dataset == "codenet":
+        yield from _iter_codenet_sources(path, shard_count, shard_index)
+    else:
+        raise ValueError(f"unsupported dataset: {dataset}")
 
 
 def uri_for(path: Path) -> str:
@@ -388,12 +603,23 @@ class TyLspClient:
             },
         )
 
-    def completion(self, line: int, character: int, *, trigger: str | None = None) -> tuple[list[dict[str, object]], bool]:
+    def completion(
+        self,
+        line: int,
+        character: int,
+        *,
+        trigger: str | None = None,
+        retrigger_incomplete: bool = False,
+    ) -> tuple[list[dict[str, object]], bool]:
         if self.document_uri is None:
             raise EvaluationError("no open ty document")
-        context: dict[str, object] = {"triggerKind": 1}
-        if trigger is not None:
+        context: dict[str, object]
+        if retrigger_incomplete:
+            context = {"triggerKind": 3}
+        elif trigger is not None:
             context = {"triggerKind": 2, "triggerCharacter": trigger}
+        else:
+            context = {"triggerKind": 1}
         result = self.request(
             "textDocument/completion",
             {
@@ -1017,8 +1243,13 @@ class SemanticProbe:
         self._change_expression("()")
         prefix = self._expression_cursor_text("(")
         character = self.hole.character_after(prefix, self.client.position_encoding)
-        items, incomplete = self.client.completion(self.hole.line, character)
-        return simplify_completions(items), incomplete
+        return progressive_completions(
+            lambda retrigger: self.client.completion(
+                self.hole.line,
+                character,
+                retrigger_incomplete=retrigger,
+            )
+        )
 
     def hover_expression(self, expression: str) -> str | None:
         self._change_expression(expression)
@@ -1032,12 +1263,14 @@ class SemanticProbe:
         self._change_expression(expression_inserted)
         inserted = self._expression_cursor_text(expression_inserted)
         character = self.hole.character_after(inserted, self.client.position_encoding)
-        items, incomplete = self.client.completion(
-            self.hole.line,
-            character,
-            trigger=".",
+        return progressive_completions(
+            lambda retrigger: self.client.completion(
+                self.hole.line,
+                character,
+                trigger=".",
+                retrigger_incomplete=retrigger,
+            )
         )
-        return simplify_completions(items), incomplete
 
     def signatures(self, expression: str) -> list[str]:
         expression_prefix = f"{expression}("
@@ -1083,6 +1316,49 @@ def simplify_completions(items: Iterable[Mapping[str, object]]) -> list[Completi
             kind=kind if isinstance(kind, int) else None,
         )
     return sorted(result.values(), key=lambda item: item.label)
+
+
+def progressive_completions(
+    fetch: Callable[[bool], tuple[list[dict[str, object]], bool]],
+) -> tuple[list[Completion], bool]:
+    """Union deterministic completion passes until complete or repeated.
+
+    LSP completion lists marked ``isIncomplete`` must be retriggered with
+    trigger kind 3.  Servers are permitted to keep returning incomplete lists,
+    so a repeated normalized page terminates the loop and a hard pass bound is
+    retained as a final guard.
+    """
+
+    merged: dict[str, Completion] = {}
+    seen_pages: set[tuple[tuple[str, str, int | None], ...]] = set()
+    saw_incomplete = False
+    for pass_index in range(MAX_PROGRESSIVE_COMPLETION_PASSES):
+        items, incomplete = fetch(pass_index > 0)
+        saw_incomplete = saw_incomplete or incomplete
+        page = simplify_completions(items)
+        fingerprint = tuple(
+            (item.label, item.detail, item.kind) for item in page
+        )
+        if fingerprint in seen_pages:
+            break
+        seen_pages.add(fingerprint)
+        for item in page:
+            current = merged.get(item.label)
+            preference = (
+                item.detail in {"Any", "Unknown"},
+                item.detail,
+                -1 if item.kind is None else item.kind,
+            )
+            current_preference = (
+                current.detail in {"Any", "Unknown"},
+                current.detail,
+                -1 if current.kind is None else current.kind,
+            ) if current is not None else None
+            if current_preference is None or preference < current_preference:
+                merged[item.label] = item
+        if not incomplete:
+            break
+    return sorted(merged.values(), key=lambda item: item.label), saw_incomplete
 
 
 def normalize_type(value: str) -> str:
@@ -1237,6 +1513,9 @@ def iterable_element_type(value: str) -> str | None:
             "set",
             "frozenset",
             "deque",
+            "map",
+            "filter",
+            "reversed",
             "Iterable",
             "Iterator",
             "Sequence",
@@ -1247,6 +1526,7 @@ def iterable_element_type(value: str) -> str | None:
             "dict_values",
             "dict_keys",
             "dict_items",
+            "defaultdict",
         } or not arguments:
             return None
         if base in {"ValuesView", "dict_values"} and len(arguments) >= 2:
@@ -1267,6 +1547,30 @@ def iterable_element_type(value: str) -> str | None:
     if all(is_assignable(element, "__numeric__") for element in elements):
         return " | ".join(sorted(elements))
     return None
+
+
+def concrete_heap_list_element_type(value: str) -> str | None:
+    """Recover ``T`` from a concrete ``list[T]`` plus flow refinements.
+
+    ``heapq.heappop`` mutates its argument, so accepting an arbitrary iterable
+    here would be unsound.  ty may append negative flow refinements such as
+    ``& ~AlwaysFalsy`` after a loop guard; those do not change the invariant
+    list element type and are safe to discard.
+    """
+
+    intersections = split_top_level(normalize_type(value), "&")
+    if not intersections or any(
+        not refinement.strip().startswith("~")
+        for refinement in intersections[1:]
+    ):
+        return None
+    base, arguments = generic_parts(intersections[0])
+    if base.split(".")[-1] != "list" or len(arguments) != 1:
+        return None
+    element = normalize_type(arguments[0])
+    if element in {"Any", "Unknown"}:
+        return element
+    return element if groundable_type(element) else None
 
 
 def numeric_unary_kinds(value: str) -> tuple[bool, bool]:
@@ -1327,6 +1631,28 @@ TYPE_VARIABLE = re.compile(
 )
 
 
+def has_unresolved_type_variable(value: str) -> bool:
+    """Return whether a rendered type still contains a ty type variable."""
+
+    return any(
+        TYPE_VARIABLE.fullmatch(identifier) is not None
+        for identifier in re.findall(
+            r"[A-Za-z_][A-Za-z0-9_]*(?:@[A-Za-z0-9_.:-]+)?",
+            normalize_type(value),
+        )
+    )
+
+
+def groundable_type(value: str) -> bool:
+    """Return whether ``value`` is concrete enough to specialize a call."""
+
+    value = normalize_type(value)
+    return (
+        value not in {"Any", "Unknown", "Divergent", "Never", "NoReturn"}
+        and not has_unresolved_type_variable(value)
+    )
+
+
 @functools.lru_cache(maxsize=250_000)
 def is_assignable(actual: str, expected: str) -> bool:
     """Conservative relation over ty's rendered display types.
@@ -1361,7 +1687,12 @@ def is_assignable(actual: str, expected: str) -> bool:
     actual_base = actual_base.split(".")[-1]
     expected_base = expected_base.split(".")[-1]
     if expected_base == "__dict_source__":
-        return actual_base in {"dict", "Mapping", "MutableMapping"}
+        return actual_base in {
+            "dict",
+            "defaultdict",
+            "Mapping",
+            "MutableMapping",
+        }
     if expected_base == "__numeric_iterable__":
         if actual_base in {"bytes", "bytearray", "range"}:
             return True
@@ -1436,11 +1767,18 @@ def is_assignable(actual: str, expected: str) -> bool:
         "unsignedinteger",
     }:
         return True
+    if expected_base == "SupportsInt" and actual_base in {
+        "bool",
+        "int",
+        "float",
+    }:
+        return True
 
     containers = {
         "list",
         "tuple",
         "dict",
+        "defaultdict",
         "set",
         "frozenset",
         "str",
@@ -1505,7 +1843,7 @@ def is_assignable(actual: str, expected: str) -> bool:
             return False
         if (
             expected_base in {"Mapping", "MutableMapping"}
-            and actual_base == "dict"
+            and actual_base in {"dict", "defaultdict"}
             and len(expected_args) >= 2
             and len(actual_args) >= 2
         ):
@@ -1519,7 +1857,12 @@ def is_assignable(actual: str, expected: str) -> bool:
         "memoryview",
     }:
         return True
-    if expected_base == "Hashable" and actual_base not in {"list", "dict", "set"}:
+    if expected_base == "Hashable" and actual_base not in {
+        "list",
+        "dict",
+        "defaultdict",
+        "set",
+    }:
         return True
     if expected_base in {"Callable", "Protocol"} and is_callable_type(actual):
         return True
@@ -1528,6 +1871,57 @@ def is_assignable(actual: str, expected: str) -> bool:
     ):
         return True
     return False
+
+
+def set_tuple_refinement_candidate(actual: str, expected: str) -> bool:
+    """Identify the flow-sensitive tuple shape that ty may refine at a call.
+
+    A displayed ``set[tuple[T, ...]]`` is not globally assignable to
+    ``set[tuple[T, T]]``: ``set`` is invariant and the variadic tuple may have
+    another length.  At a particular program point ty can nevertheless know
+    that a local set contains only fixed-length tuples.  This predicate only
+    selects that narrow case for an explicit contextual query; it never adds
+    a global assignability edge.
+    """
+
+    actual_base, actual_arguments = generic_parts(actual)
+    expected_base, expected_arguments = generic_parts(expected)
+    if (
+        actual_base.split(".")[-1] != "set"
+        or expected_base.split(".")[-1] != "set"
+        or len(actual_arguments) != 1
+        or len(expected_arguments) != 1
+    ):
+        return False
+    actual_tuple, actual_items = generic_parts(actual_arguments[0])
+    expected_tuple, expected_items = generic_parts(expected_arguments[0])
+    if (
+        actual_tuple.split(".")[-1] != "tuple"
+        or expected_tuple.split(".")[-1] != "tuple"
+        or len(actual_items) != 2
+        or actual_items[1] != "..."
+        or not expected_items
+        or expected_items[-1] == "..."
+    ):
+        return False
+    actual_item = normalize_type(actual_items[0])
+    return all(normalize_type(item) == actual_item for item in expected_items)
+
+
+def dotted_identifier_tokens(expression: str) -> tuple[str, ...] | None:
+    """Tokenize a plain dotted identifier without admitting other syntax."""
+
+    parts = expression.split(".")
+    if not parts or any(
+        not part.isidentifier() or keyword.iskeyword(part) for part in parts
+    ):
+        return None
+    tokens: list[str] = []
+    for index, part in enumerate(parts):
+        if index:
+            tokens.append(".")
+        tokens.append(part)
+    return tuple(tokens)
 
 
 @dataclass(frozen=True)
@@ -2587,15 +2981,44 @@ class GrammarBuilder:
         self.stats = BuildStats()
         self.representatives: dict[str, str] = {}
         self.callables: dict[str, str] = {}
-        self.receivers: deque[tuple[str, str, int]] = deque()
-        self.queued_receiver_types: set[str] = set()
+        self.receivers: list[tuple[int, int, str, str, str]] = []
+        self.receiver_entries: dict[
+            str, tuple[int, int, str, str, str]
+        ] = {}
+        self.processed_receiver_types: set[str] = set()
         self.expected_types: set[str] = set()
+        self.contextual_call_results: dict[str, bool] = {}
 
     def expression_nonterminal(self, type_display: str) -> str:
         normalized = normalize_type(type_display)
         name = type_nonterminal(normalized)
         self.grammar.type_labels[name] = normalized
         return name
+
+    def call_result_nonterminal(self, type_display: str) -> str:
+        """Return the result symbol for a call justified by a ty signature.
+
+        A displayed ``Any``/``Unknown`` result cannot be validated by testing
+        an arbitrary witness of the same broad type in the post-statement
+        context.  Keep such calls on a separate trusted path: they remain
+        usable as ordinary unknown/dynamic expressions, but output-assignment
+        rooting can admit the call itself without admitting every unrelated
+        ``E:Unknown`` witness.
+        """
+
+        normalized = normalize_type(type_display)
+        expression = self.expression_nonterminal(normalized)
+        if normalized not in {"Any", "Unknown"}:
+            return expression
+        self.grammar.add(
+            expression,
+            Nonterminal(TRUSTED_DYNAMIC_CALL_NONTERMINAL),
+        )
+        self.grammar.add(
+            DYNAMIC_NONTERMINAL,
+            Nonterminal(TRUSTED_DYNAMIC_CALL_NONTERMINAL),
+        )
+        return TRUSTED_DYNAMIC_CALL_NONTERMINAL
 
     def add_expression(
         self,
@@ -2659,7 +3082,6 @@ class GrammarBuilder:
                 or label in self.probe.excluded_names
                 or not label.isidentifier()
                 or keyword.iskeyword(label)
-                or label.startswith("_")
                 or not self.probe.accepts_expression(label)
             ):
                 continue
@@ -2689,28 +3111,16 @@ class GrammarBuilder:
             if detail in {"Any", "Unknown"}:
                 self.grammar.add(DYNAMIC_NONTERMINAL, Terminal(completion.label))
                 self.grammar.add(
-                    DYNAMIC_NONTERMINAL,
-                    Terminal("("),
-                    Terminal(completion.label),
-                    Terminal(")"),
-                )
-                self.grammar.add(
                     self.expression_nonterminal(detail),
                     Nonterminal(DYNAMIC_NONTERMINAL),
                 )
                 self.representatives.setdefault(detail, completion.label)
                 self.stats.dynamic_types += 1
             else:
-                nonterminal = self.add_expression(
+                self.add_expression(
                     detail,
                     (Terminal(completion.label),),
                     representative=completion.label,
-                )
-                self.grammar.add(
-                    nonterminal,
-                    Terminal("("),
-                    Terminal(completion.label),
-                    Terminal(")"),
                 )
             self.stats.scope_names += 1
             callable_value = is_callable_type(detail, completion.kind)
@@ -2733,14 +3143,28 @@ class GrammarBuilder:
             if type_display in {"Any", "Unknown"}
             else type_display
         )
-        if receiver_key in self.queued_receiver_types:
+        if receiver_key in self.processed_receiver_types:
             return
         if type_display in {"Never", "NoReturn", "None"}:
             return
-        if len(self.queued_receiver_types) >= self.options.max_receiver_types:
+        contextual = bool(
+            self.source_ids.intersection(source_identifiers(expression))
+        )
+        common_container = type_display in {
+            "bytes",
+            "dict",
+            "list",
+            "set",
+            "str",
+            "tuple",
+        }
+        priority = 0 if contextual else 1 if common_container else 2
+        entry = (priority, depth, expression, type_display, receiver_key)
+        current = self.receiver_entries.get(receiver_key)
+        if current is not None and current <= entry:
             return
-        self.queued_receiver_types.add(receiver_key)
-        self.receivers.append((type_display, expression, depth))
+        self.receiver_entries[receiver_key] = entry
+        heapq.heappush(self.receivers, entry)
 
     def add_library_artifacts(self) -> None:
         pending = list(self.library_artifacts)
@@ -2916,8 +3340,22 @@ class GrammarBuilder:
         string_representative = self.representatives.get("str")
         if string_representative is not None:
             self.queue_receiver("str", string_representative, 0)
-        while self.receivers:
-            receiver_type, expression, depth = self.receivers.popleft()
+        while (
+            self.receivers
+            and self.stats.receiver_types < self.options.max_receiver_types
+        ):
+            entry = heapq.heappop(self.receivers)
+            (
+                _priority,
+                depth,
+                expression,
+                receiver_type,
+                receiver_key,
+            ) = entry
+            if self.receiver_entries.get(receiver_key) != entry:
+                continue
+            del self.receiver_entries[receiver_key]
+            self.processed_receiver_types.add(receiver_key)
             if receiver_type in self.precomputed_module_types:
                 continue
             self.stats.receiver_types += 1
@@ -2931,27 +3369,48 @@ class GrammarBuilder:
                 module_receiver
                 and len(completions) <= self.options.max_module_members
             )
+            # Source-contextual receivers and the small built-in containers are
+            # both bounded and especially likely to supply the held-out API.
+            # Keeping only a hand-written member allowlist here would discard
+            # valid completions such as ``deque.popleft`` or ``str.rfind`` even
+            # after the LSP supplied them.
+            expand_all_receiver_members = (
+                not module_receiver and _priority <= 1
+            )
             if module_receiver and not expand_all_module_members:
                 self.stats.module_member_fallbacks += 1
             receiver_nonterminal = self.expression_nonterminal(receiver_type)
             for completion in completions:
                 if (
-                    not expand_all_module_members
+                    not expand_all_receiver_members
+                    and not expand_all_module_members
                     and completion.label not in CORE_MEMBERS
                     and completion.label not in self.source_ids
                 ):
                     continue
                 member_type = normalize_type(completion.detail)
                 member_expression = f"{expression}.{completion.label}"
-                self.add_expression(
-                    member_type,
-                    (
-                        Nonterminal(receiver_nonterminal),
-                        Terminal("."),
-                        Terminal(completion.label),
-                    ),
-                    representative=member_expression,
+                member_rhs: tuple[Symbol, ...] = (
+                    Nonterminal(receiver_nonterminal),
+                    Terminal("."),
+                    Terminal(completion.label),
                 )
+                if member_type in {"Any", "Unknown"}:
+                    self.grammar.add(DYNAMIC_NONTERMINAL, *member_rhs)
+                    self.grammar.add(
+                        self.expression_nonterminal(member_type),
+                        Nonterminal(DYNAMIC_NONTERMINAL),
+                    )
+                    self.representatives.setdefault(
+                        member_type, member_expression
+                    )
+                    self.stats.dynamic_types += 1
+                else:
+                    self.add_expression(
+                        member_type,
+                        member_rhs,
+                        representative=member_expression,
+                    )
                 self.stats.member_completions += 1
                 callable_value = is_callable_type(member_type, completion.kind)
                 if callable_value:
@@ -2976,6 +3435,50 @@ class GrammarBuilder:
         self.signature_cache[cache_key] = unique
         return unique
 
+    def add_context_validated_append(
+        self,
+        return_nonterminal: str,
+        expression: str,
+        expected: str,
+    ) -> None:
+        """Add an exact append word when ty proves a flow-sensitive argument.
+
+        ty can retain a broad displayed type such as ``set[tuple[int, ...]]``
+        while its flow graph knows that one local contains only pairs.  A
+        global ``A:`` edge would be unsound because mutable containers are
+        invariant.  Instead, validate the exact receiver/argument spelling in
+        this ablated context and add only that lexical call production.
+        """
+
+        if (
+            return_nonterminal != self.expression_nonterminal("None")
+            or not expression.endswith(".append")
+        ):
+            return
+        callable_tokens = dotted_identifier_tokens(expression)
+        if callable_tokens is None:
+            return
+        for actual, representative in sorted(self.representatives.items()):
+            if (
+                not representative.isidentifier()
+                or keyword.iskeyword(representative)
+                or not set_tuple_refinement_candidate(actual, expected)
+            ):
+                continue
+            call = f"{expression}({representative})"
+            accepted = self.contextual_call_results.get(call)
+            if accepted is None:
+                accepted = self.probe.accepts_expression(call)
+                self.contextual_call_results[call] = accepted
+            if accepted:
+                self.grammar.add(
+                    return_nonterminal,
+                    *(Terminal(token) for token in callable_tokens),
+                    Terminal("("),
+                    Terminal(representative),
+                    Terminal(")"),
+                )
+
     def add_calls(self) -> None:
         self.stats.callables = len(self.callables)
         for callable_type, expression in sorted(self.callables.items()):
@@ -2988,7 +3491,9 @@ class GrammarBuilder:
                     max_arity=self.options.max_call_arity,
                     max_layouts=self.options.max_layouts_per_signature,
                 )
-                return_nonterminal = self.expression_nonterminal(signature.return_type)
+                return_nonterminal = self.call_result_nonterminal(
+                    signature.return_type
+                )
                 for layout in layouts:
                     if expression in {"max", "min"} and len(layout.positional) > 1:
                         # Correlated variadic type variables are not independent
@@ -2998,6 +3503,7 @@ class GrammarBuilder:
                         Nonterminal(callable_nonterminal),
                         Terminal("("),
                     ]
+                    normalized_positional: list[str] = []
                     first = True
                     for position, expected in enumerate(layout.positional):
                         if not first:
@@ -3015,6 +3521,7 @@ class GrammarBuilder:
                             # demand that the argument itself be bottom-typed.
                             expected = re.sub(r"\bDivergent\b", "object", expected)
                         expected = normalize_type(expected)
+                        normalized_positional.append(expected)
                         self.expected_types.add(expected)
                         rhs.append(Nonterminal(argument_nonterminal(expected)))
                     for name, expected in layout.keywords:
@@ -3034,6 +3541,12 @@ class GrammarBuilder:
                         )
                     rhs.append(Terminal(")"))
                     self.grammar.add(return_nonterminal, *rhs)
+                    if len(normalized_positional) == 1 and not layout.keywords:
+                        self.add_context_validated_append(
+                            return_nonterminal,
+                            expression,
+                            normalized_positional[0],
+                        )
 
         expression_types = {
             production.lhs[2:]
@@ -3077,6 +3590,178 @@ class GrammarBuilder:
                     Nonterminal(type_nonterminal(actual)),
                     Terminal(")"),
                 )
+
+    def add_grounded_generic_calls(self) -> None:
+        """Ground a few unary iterable APIs whose LSP types retain variables.
+
+        Ordinary call productions intentionally keep ty's displayed type
+        variables symbolic.  That loses safe correlations such as
+        ``map(str, ints) -> map[str]`` and consequently prevents a later
+        ``str.join`` from seeing an ``Iterable[str]``.  Enumerate only
+        concrete unary callable signatures and concrete iterable element
+        types already present in the contextual grammar.  Each added row is a
+        direct instance of the corresponding ty signature or Python
+        container protocol; no unconstrained type-variable edge is added.
+        """
+
+        callable_by_expression: dict[str, tuple[str, str]] = {
+            expression: (
+                callable_type,
+                self.expression_nonterminal(callable_type),
+            )
+            for callable_type, expression in self.callables.items()
+        }
+        map_entry = callable_by_expression.get("map")
+        if map_entry is not None and self.options.max_call_arity >= 2:
+            _map_type, map_nonterminal = map_entry
+            for callable_type, expression in sorted(self.callables.items()):
+                callable_nonterminal = self.expression_nonterminal(callable_type)
+                for signature in self.signatures_for(callable_type, expression):
+                    return_type = normalize_type(signature.return_type)
+                    if not groundable_type(return_type):
+                        continue
+                    layouts = argument_layouts(
+                        signature,
+                        max_arity=1,
+                        max_layouts=self.options.max_layouts_per_signature,
+                    )
+                    for layout in layouts:
+                        if len(layout.positional) != 1 or layout.keywords:
+                            continue
+                        expected_element = normalize_type(layout.positional[0])
+                        expected_iterable = f"Iterable[{expected_element}]"
+                        self.expected_types.add(expected_iterable)
+                        self.grammar.add(
+                            self.expression_nonterminal(f"map[{return_type}]"),
+                            Nonterminal(map_nonterminal),
+                            Terminal("("),
+                            Nonterminal(callable_nonterminal),
+                            Terminal(","),
+                            Nonterminal(argument_nonterminal(expected_iterable)),
+                            Terminal(")"),
+                        )
+
+        def concrete_iterable_elements() -> set[str]:
+            elements: set[str] = set()
+            expression_types = {
+                production.lhs[2:]
+                for production in self.grammar.productions
+                if production.lhs.startswith("E:")
+            }
+            for actual in expression_types:
+                element = iterable_element_type(actual)
+                if element is not None and groundable_type(element):
+                    elements.add(normalize_type(element))
+            return elements
+
+        list_entry = callable_by_expression.get("list")
+        if list_entry is not None and self.options.max_call_arity >= 1:
+            _list_type, list_nonterminal = list_entry
+            for element in sorted(concrete_iterable_elements()):
+                expected = f"Iterable[{element}]"
+                self.expected_types.add(expected)
+                self.grammar.add(
+                    self.expression_nonterminal(f"list[{element}]"),
+                    Nonterminal(list_nonterminal),
+                    Terminal("("),
+                    Nonterminal(argument_nonterminal(expected)),
+                    Terminal(")"),
+                )
+
+        # Recompute after grounding list(map(...)); sorted can now retain the
+        # map/list element type instead of returning list[TypeVariable].
+        sorted_entry = callable_by_expression.get("sorted")
+        if sorted_entry is not None and self.options.max_call_arity >= 1:
+            _sorted_type, sorted_nonterminal = sorted_entry
+            for element in sorted(concrete_iterable_elements()):
+                if not is_assignable(element, "SupportsRichComparisonT"):
+                    continue
+                expected = f"Iterable[{element}]"
+                self.expected_types.update((expected, "bool"))
+                result = self.expression_nonterminal(f"list[{element}]")
+                prefix: tuple[Symbol, ...] = (
+                    Nonterminal(sorted_nonterminal),
+                    Terminal("("),
+                    Nonterminal(argument_nonterminal(expected)),
+                )
+                self.grammar.add(result, *prefix, Terminal(")"))
+                self.grammar.add(
+                    result,
+                    *prefix,
+                    Terminal(","),
+                    Terminal("reverse"),
+                    Terminal("="),
+                    Nonterminal(argument_nonterminal("bool")),
+                    Terminal(")"),
+                )
+
+        reversed_entry = callable_by_expression.get("reversed")
+        if reversed_entry is not None and self.options.max_call_arity >= 1:
+            _reversed_type, reversed_nonterminal = reversed_entry
+            for element in sorted(concrete_iterable_elements()):
+                result = self.expression_nonterminal(f"reversed[{element}]")
+                for protocol in (
+                    f"_SupportsReversed[{element}]",
+                    f"SupportsLenAndGetItem[{element}]",
+                ):
+                    self.expected_types.add(protocol)
+                    self.grammar.add(
+                        result,
+                        Nonterminal(reversed_nonterminal),
+                        Terminal("("),
+                        Nonterminal(argument_nonterminal(protocol)),
+                        Terminal(")"),
+                    )
+
+        # typeshed renders heapq.heappop as list[T] -> T, but signature help
+        # leaves T unresolved.  Unlike the iterable helpers above, heappop
+        # mutates its input, so correlate the result only with an actual
+        # concrete list element type already represented in this grammar.
+        # Negative flow refinements on that list are accepted by
+        # concrete_heap_list_element_type; arbitrary iterable/list-like
+        # protocols are deliberately not.
+        if self.options.max_call_arity >= 1:
+            expression_types = {
+                production.lhs[2:]
+                for production in self.grammar.productions
+                if production.lhs.startswith("E:")
+            }
+            for callable_type, expression in sorted(self.callables.items()):
+                if expression.rsplit(".", 1)[-1] != "heappop":
+                    continue
+                callable_nonterminal = self.expression_nonterminal(callable_type)
+                for signature in self.signatures_for(callable_type, expression):
+                    result_variable = normalize_type(signature.return_type)
+                    if TYPE_VARIABLE.fullmatch(result_variable) is None:
+                        continue
+                    layouts = argument_layouts(
+                        signature,
+                        max_arity=1,
+                        max_layouts=self.options.max_layouts_per_signature,
+                    )
+                    for layout in layouts:
+                        if len(layout.positional) != 1 or layout.keywords:
+                            continue
+                        expected = normalize_type(layout.positional[0])
+                        expected_base, expected_arguments = generic_parts(expected)
+                        if (
+                            expected_base.split(".")[-1] != "list"
+                            or len(expected_arguments) != 1
+                            or normalize_type(expected_arguments[0])
+                            != result_variable
+                        ):
+                            continue
+                        for actual in sorted(expression_types):
+                            element = concrete_heap_list_element_type(actual)
+                            if element is None or not is_assignable(actual, expected):
+                                continue
+                            self.grammar.add(
+                                self.call_result_nonterminal(element),
+                                Nonterminal(callable_nonterminal),
+                                Terminal("("),
+                                Nonterminal(type_nonterminal(actual)),
+                                Terminal(")"),
+                            )
 
     def add_typed_unary_operations(self) -> None:
         expression_types = {
@@ -3148,6 +3833,22 @@ class GrammarBuilder:
                 rhs.append(Nonterminal(dynamic_argument))
             rhs.append(Terminal(")"))
             self.grammar.add(DYNAMIC_NONTERMINAL, *rhs)
+
+    def add_redundant_grouping(self) -> None:
+        """Permit Python's type-preserving parenthesized expression form."""
+
+        expression_nonterminals = {
+            production.lhs
+            for production in self.grammar.productions
+            if production.lhs.startswith("E:")
+        }
+        for nonterminal in expression_nonterminals:
+            self.grammar.add(
+                nonterminal,
+                Terminal("("),
+                Nonterminal(nonterminal),
+                Terminal(")"),
+            )
 
     def shortest_terminal_words(self) -> dict[str, tuple[str, ...]]:
         """Find a deterministic shortest terminal witness for each nonterminal."""
@@ -3224,10 +3925,7 @@ class GrammarBuilder:
                     continue
                 self.stats.assignability_pairs_checked += 1
                 if is_assignable(actual, expected):
-                    self.grammar.add(
-                        argument,
-                        Nonterminal(type_nonterminal(actual)),
-                    )
+                    self.grammar.add(argument, Nonterminal(type_nonterminal(actual)))
         if self.required_assignment is not None:
             shortest = self.shortest_terminal_words()
             for actual in sorted(expression_types):
@@ -3275,8 +3973,10 @@ class GrammarBuilder:
         self.add_library_artifacts()
         self.add_members()
         self.add_calls()
+        self.add_grounded_generic_calls()
         self.add_typed_unary_operations()
         self.add_dynamic_operations()
+        self.add_redundant_grouping()
         return self.finish()
 
 
@@ -4578,7 +5278,9 @@ def ty_version(executable: str) -> str:
 
 @dataclass(frozen=True)
 class EvaluationOptions:
-    archive: Path
+    dataset: str
+    source: Path
+    split: str
     files: int
     precision_samples: int
     max_samples: int | None
@@ -4652,13 +5354,14 @@ def evaluate_prepared_statement(
     funnel: dict[str, int],
     semantics: TyLspClient,
     workspace: Path,
-    member_name: str,
+    dataset_source: DatasetSource,
     file_index: int,
     statement_index: int,
     candidate_index: int,
     prepared: PreparedTarget,
     library_catalog: LibraryCatalog,
 ) -> None:
+    member_name = dataset_source.member
     selected = prepared.target
     started = time.perf_counter()
     truth = canonical_tokens(selected)
@@ -4684,6 +5387,12 @@ def evaluate_prepared_statement(
             )
         return {
             "event": "statement",
+            "dataset": dataset_source.dataset,
+            "split": dataset_source.split,
+            "problem_id": dataset_source.problem_id,
+            "solution_index": dataset_source.solution_index,
+            "difficulty": dataset_source.difficulty,
+            "url": dataset_source.url,
             "index": metrics.evaluated,
             "file_index": file_index,
             "statement_index": statement_index,
@@ -4976,22 +5685,27 @@ def evaluate_prepared_statement(
 
 
 def evaluate(options: EvaluationOptions) -> int:
-    if not options.archive.is_file():
-        raise EvaluationError(f"archive not found: {options.archive}")
+    source_path = resolved_dataset_source(
+        options.dataset,
+        options.source,
+        options.split,
+    )
+    if not source_path.is_file():
+        raise EvaluationError(f"dataset source not found: {source_path}")
     metrics = RunningMetrics()
     funnel: dict[str, int] = defaultdict(int)
     version = ty_version(options.ty)
     library_catalog = LibraryCatalog(
         options.library_directory, options.ty, version
     )
-    archive_stat = options.archive.stat()
+    source_stat = source_path.stat()
     population = (
         "all independently ablated eligible statements in the first "
-        "archive-order ty-clean files"
+        f"dataset-order ty-clean {options.dataset} source files"
     )
     if options.shard_count > 1:
         population += (
-            f" in Python-member shard {options.shard_index}/"
+            f" in source shard {options.shard_index}/"
             f"{options.shard_count}"
         )
     if options.max_samples is not None:
@@ -5007,10 +5721,12 @@ def evaluate(options: EvaluationOptions) -> int:
             json.dumps(
                 {
                     "event": "start",
+                    "dataset": options.dataset,
+                    "split": options.split if options.dataset == "apps" else None,
                     "ty": version,
-                    "archive": str(options.archive),
-                    "archive_bytes": archive_stat.st_size,
-                    "archive_mtime_ns": archive_stat.st_mtime_ns,
+                    "source": str(source_path),
+                    "source_bytes": source_stat.st_size,
+                    "source_mtime_ns": source_stat.st_mtime_ns,
                     "files": options.files,
                     "sample_lengths": "max(1, ground_truth_tokens-2)..ground_truth_tokens+2",
                     "precision_samples": options.precision_samples,
@@ -5039,7 +5755,9 @@ def evaluate(options: EvaluationOptions) -> int:
         )
     else:
         print(
-            f"ty={version}; target_files={options.files}; "
+            f"ty={version}; dataset={options.dataset}; "
+            f"split={options.split if options.dataset == 'apps' else 'n/a'}; "
+            f"source={source_path}; target_files={options.files}; "
             f"precision_samples={options.precision_samples}; "
             f"max_samples={options.max_samples or 'unlimited'}; "
             f"shard={options.shard_index}/{options.shard_count}; "
@@ -5048,31 +5766,30 @@ def evaluate(options: EvaluationOptions) -> int:
             flush=True,
         )
 
-    with tempfile.TemporaryDirectory(prefix="api2cfg-codenet-") as directory:
+    with tempfile.TemporaryDirectory(prefix="api2cfg-python-") as directory:
         workspace = Path(directory)
         checker_uri = uri_for(workspace / "clean_check.py")
         with (
             TyLspClient(options.ty, workspace) as checker,
             TyLspClient(options.ty, workspace) as semantics,
-            tarfile.open(options.archive, mode="r|gz") as archive,
         ):
-            python_submission_index = 0
-            for member in archive:
-                if metrics.files_evaluated >= options.files or sample_limit_reached():
+            sources = iter_dataset_sources(
+                options.dataset,
+                options.source,
+                options.split,
+                options.shard_count,
+                options.shard_index,
+            )
+            while (
+                metrics.files_evaluated < options.files
+                and not sample_limit_reached()
+            ):
+                try:
+                    dataset_source = next(sources)
+                except StopIteration:
                     break
-                if not member.isfile() or PYTHON_SUBMISSION(member.name) is None:
-                    continue
-                member_shard = python_submission_index % options.shard_count
-                python_submission_index += 1
-                if member_shard != options.shard_index:
-                    continue
                 funnel["submissions"] += 1
-                extracted = archive.extractfile(member)
-                if extracted is None:
-                    continue
-                with extracted:
-                    data = extracted.read()
-                source = decode_source(data)
+                source = decode_source(dataset_source.data)
                 if source is None:
                     funnel["decode_failures"] += 1
                     continue
@@ -5081,7 +5798,7 @@ def evaluate(options: EvaluationOptions) -> int:
                         warnings.simplefilter("ignore", SyntaxWarning)
                         tree = ast.parse(
                             source,
-                            filename=member.name,
+                            filename=dataset_source.member,
                             type_comments=True,
                         )
                 except (SyntaxError, ValueError):
@@ -5164,7 +5881,7 @@ def evaluate(options: EvaluationOptions) -> int:
                         funnel,
                         semantics,
                         workspace,
-                        member.name,
+                        dataset_source,
                         file_index,
                         statement_index,
                         candidate_index,
@@ -5174,6 +5891,9 @@ def evaluate(options: EvaluationOptions) -> int:
 
     summary = {
         "event": "summary",
+        "dataset": options.dataset,
+        "split": options.split if options.dataset == "apps" else None,
+        "source": str(source_path),
         "population": population,
         "files_requested": options.files,
         "files_evaluated": metrics.files_evaluated,
@@ -5203,7 +5923,9 @@ def evaluate(options: EvaluationOptions) -> int:
             for offset, count in sorted(metrics.sampled_length_offsets.items())
         },
         "average_cfg_intersection_seconds": (
-            metrics.average_cfg_intersection_seconds
+            0.0
+            if metrics.evaluated == 0
+            else metrics.average_cfg_intersection_seconds
         ),
         "funnel": dict(sorted(funnel.items())),
     }
@@ -5230,6 +5952,315 @@ def evaluate(options: EvaluationOptions) -> int:
 
 
 def run_self_tests() -> None:
+    assert default_dataset_source("apps", "test") == (
+        DEFAULT_APPS_DIRECTORY / "test.jsonl"
+    )
+    assert default_dataset_source("codenet", "train") == (
+        DEFAULT_CODENET_ARCHIVE
+    )
+    try:
+        resolved_dataset_source("apps", Path("train.jsonl"), "test")
+    except EvaluationError as error:
+        assert "use --split train" in str(error)
+    else:
+        raise AssertionError("mismatched explicit APPS split was accepted")
+    try:
+        resolved_dataset_source("apps", Path("archive.tar.gz"), "test")
+    except EvaluationError as error:
+        assert "--dataset codenet" in str(error)
+    else:
+        raise AssertionError("CodeNet archive was accepted as APPS JSONL")
+    assert apps_member_name("test", "x/y", 3) == (
+        "APPS/test/x%2Fy/solution_0003.py"
+    )
+    with tempfile.TemporaryDirectory(prefix="api2cfg-source-test-") as directory:
+        fixture_directory = Path(directory)
+        apps_path = fixture_directory / "test.jsonl"
+        apps_rows = (
+            {
+                "id": 7,
+                "solutions": json.dumps(["first = 1\n", "second = 2\n"]),
+                "difficulty": "introductory",
+                "url": "https://example.invalid/7",
+            },
+            {
+                "id": "x/y",
+                "solutions": ["third = 3\n"],
+                "difficulty": None,
+            },
+            {
+                "id": "no-solutions",
+                "solutions": "",
+                "difficulty": "competition",
+            },
+        )
+        apps_path.write_text(
+            "".join(json.dumps(row) + "\n" for row in apps_rows),
+            encoding="utf-8",
+        )
+        apps_sources = list(
+            iter_dataset_sources("apps", fixture_directory, "test")
+        )
+        assert [source.solution_index for source in apps_sources] == [0, 1, 0]
+        assert [source.problem_id for source in apps_sources] == [7, 7, "x/y"]
+        assert apps_sources[0].data == b"first = 1\n"
+        assert apps_sources[0].difficulty == "introductory"
+        assert apps_sources[0].url == "https://example.invalid/7"
+        assert apps_sources[2].member == "APPS/test/x%2Fy/solution_0000.py"
+        assert [
+            source.member
+            for source in iter_dataset_sources(
+                "apps", apps_path, "test", shard_count=2, shard_index=0
+            )
+        ] == [apps_sources[0].member, apps_sources[2].member]
+        assert [
+            source.member
+            for source in iter_dataset_sources(
+                "apps", apps_path, "test", shard_count=2, shard_index=1
+            )
+        ] == [apps_sources[1].member]
+
+        archive_path = fixture_directory / "codenet.tar.gz"
+        submission_name = "Project_CodeNet/data/p00001/Python/s000000001.py"
+        with tarfile.open(archive_path, "w:gz") as archive:
+            submission = b"answer = 42\n"
+            submission_info = tarfile.TarInfo(submission_name)
+            submission_info.size = len(submission)
+            archive.addfile(submission_info, io.BytesIO(submission))
+            ignored = b"not Python"
+            ignored_info = tarfile.TarInfo(
+                "Project_CodeNet/data/p00001/Java/s000000001.java"
+            )
+            ignored_info.size = len(ignored)
+            archive.addfile(ignored_info, io.BytesIO(ignored))
+        codenet_sources = list(
+            iter_dataset_sources("codenet", archive_path, "test")
+        )
+        assert codenet_sources == [
+            DatasetSource(
+                member=submission_name,
+                data=b"answer = 42\n",
+                dataset="codenet",
+            )
+        ]
+
+    default_args = parse_arguments([])
+    assert default_args.dataset == "apps"
+    assert default_args.split == "test"
+    assert default_args.source is None
+    default_options = evaluation_options(default_args)
+    assert default_options.source == DEFAULT_APPS_DIRECTORY / "test.jsonl"
+
+    private_completion_items = simplify_completions(
+        (
+            {
+                "label": "_private_library_name",
+                "detail": "int",
+                "kind": LSP_FUNCTION,
+            },
+            {
+                "label": "__private_library_name",
+                "detail": "int",
+                "kind": LSP_FUNCTION,
+            },
+            {
+                "label": "public_library_name",
+                "detail": "int",
+                "kind": LSP_FUNCTION,
+            },
+        )
+    )
+    assert [item.label for item in private_completion_items] == [
+        "public_library_name"
+    ]
+
+    def raw_completion(
+        label: str, detail: str, kind: int | None
+    ) -> dict[str, object]:
+        return {"label": label, "detail": detail, "kind": kind}
+
+    completion_passes: Iterator[
+        tuple[list[dict[str, object]], bool]
+    ] = iter(
+        (
+            (
+                [raw_completion("alpha", "Unknown", LSP_FUNCTION)],
+                True,
+            ),
+            (
+                [
+                    raw_completion("beta", "int", None),
+                    raw_completion("alpha", "str", LSP_FUNCTION),
+                ],
+                True,
+            ),
+            (
+                [
+                    raw_completion("beta", "int", None),
+                    raw_completion("alpha", "str", LSP_FUNCTION),
+                ],
+                True,
+            ),
+        )
+    )
+    completion_retriggers: list[bool] = []
+
+    def fetch_completion_pass(
+        retrigger: bool,
+    ) -> tuple[list[dict[str, object]], bool]:
+        completion_retriggers.append(retrigger)
+        return next(completion_passes)
+
+    progressive, progressive_was_incomplete = progressive_completions(
+        fetch_completion_pass
+    )
+    assert progressive_was_incomplete
+    assert completion_retriggers == [False, True, True]
+    assert progressive == [
+        Completion("alpha", "str", LSP_FUNCTION),
+        Completion("beta", "int", None),
+    ]
+
+    class ReceiverPriorityProbe(SemanticProbe):
+        def __init__(self) -> None:
+            self.queries: list[str] = []
+
+        def members(self, expression: str) -> tuple[list[Completion], bool]:
+            self.queries.append(expression)
+            if expression == "important":
+                return [Completion("child", "list[int]", None)], False
+            if expression == "important.child":
+                return [Completion("leaf", "int", None)], False
+            return [Completion("irrelevant_member", "int", None)], False
+
+    receiver_probe = ReceiverPriorityProbe()
+    receiver_builder = GrammarBuilder(
+        receiver_probe,
+        frozenset({"important"}),
+        BuilderOptions(max_receiver_types=2, member_depth=2),
+        {},
+    )
+    # Enqueue the same type through an irrelevant representative first.  The
+    # contextual representative must replace it before bounded processing.
+    receiver_builder.queue_receiver("SharedType", "aaa", 0)
+    receiver_builder.queue_receiver("SharedType", "important", 0)
+    receiver_builder.add_members()
+    assert receiver_probe.queries == ["important", "important.child"]
+    assert receiver_builder.stats.receiver_types == 2
+    assert {"child", "leaf"} <= receiver_builder.grammar.terminals
+    assert "irrelevant_member" not in receiver_builder.grammar.terminals
+
+    grouping_builder = GrammarBuilder(
+        SemanticProbe.__new__(SemanticProbe),
+        frozenset(),
+        BuilderOptions(),
+        {},
+    )
+    int_nonterminal = grouping_builder.add_expression(
+        "int", (Terminal("0"),)
+    )
+    grouping_builder.grammar.add(
+        grouping_builder.grammar.start, Nonterminal(int_nonterminal)
+    )
+    grouping_builder.add_redundant_grouping()
+    grouping_compiled = UnitAwareBinaryGrammar(grouping_builder.grammar)
+    assert grouping_compiled.recognizes(("0",))
+    assert grouping_compiled.recognizes(("(", "0", ")"))
+    assert grouping_compiled.recognizes(("(", "(", "0", ")", ")"))
+    assert not grouping_compiled.recognizes(("(", ")"))
+    assert not grouping_compiled.recognizes(("(", "0"))
+
+    class DynamicMemberProbe(SemanticProbe):
+        def members(self, expression: str) -> tuple[list[Completion], bool]:
+            assert expression == "owner"
+            return [
+                Completion("any_value", "Any", None),
+                Completion("known_text", "str", None),
+                Completion("unknown_value", "Unknown", None),
+            ], False
+
+    dynamic_member_builder = GrammarBuilder(
+        DynamicMemberProbe.__new__(DynamicMemberProbe),
+        frozenset({"owner"}),
+        BuilderOptions(max_receiver_types=1, member_depth=0),
+        {},
+    )
+    owner_nonterminal = dynamic_member_builder.add_expression(
+        "Owner", (Terminal("owner"),)
+    )
+    dynamic_member_builder.queue_receiver("Owner", "owner", 0)
+    dynamic_member_builder.add_members()
+    dynamic_member_builder.add_dynamic_operations()
+    dynamic_member_builder.grammar.add(
+        dynamic_member_builder.grammar.start,
+        Nonterminal(DYNAMIC_NONTERMINAL),
+    )
+    dynamic_member_compiled = UnitAwareBinaryGrammar(
+        dynamic_member_builder.grammar
+    )
+    assert dynamic_member_compiled.recognizes(
+        ("-", "owner", ".", "any_value")
+    )
+    assert dynamic_member_compiled.recognizes(
+        ("-", "owner", ".", "unknown_value")
+    )
+    assert not dynamic_member_compiled.recognizes(
+        ("-", "owner", ".", "known_text")
+    )
+    assert owner_nonterminal == type_nonterminal("Owner")
+
+    class LocalUnderscoreProbe(SemanticProbe):
+        """Minimal semantic fixture for source-local underscore bindings."""
+
+        def __init__(self) -> None:
+            self.excluded_names = frozenset()
+
+        def scope(self) -> tuple[list[Completion], bool]:
+            # LSP completion filtering deliberately omits private names.  The
+            # builder must recover only names known to occur in the source.
+            return [], False
+
+        def accepts_expression(self, expression: str) -> bool:
+            return expression in {"_helper", "__main__", "__starting_point"}
+
+        def hover_expression(self, expression: str) -> str | None:
+            if not self.accepts_expression(expression):
+                return None
+            return f"def {expression}() -> None"
+
+        def members(self, expression: str) -> tuple[list[Completion], bool]:
+            return [], False
+
+        def signatures(self, expression: str) -> list[str]:
+            if self.accepts_expression(expression):
+                return ["() -> None"]
+            return []
+
+    underscore_source = (
+        "def _helper():\n"
+        "    pass\n"
+        "def __main__():\n"
+        "    pass\n"
+        "def __starting_point():\n"
+        "    pass\n"
+        "__starting_point()\n"
+        "__main__()\n"
+    )
+    underscore_ids = source_identifiers(underscore_source)
+    assert {"_helper", "__main__", "__starting_point"} <= underscore_ids
+    underscore_builder = GrammarBuilder(
+        LocalUnderscoreProbe(),
+        underscore_ids,
+        BuilderOptions(max_call_arity=0),
+        {},
+    )
+    underscore_grammar, _underscore_stats = underscore_builder.build()
+    underscore_compiled = UnitAwareBinaryGrammar(underscore_grammar)
+    assert underscore_compiled.recognizes(("__starting_point", "(", ")"))
+    assert underscore_compiled.recognizes(("__main__", "(", ")"))
+    assert "_private_library_name" not in underscore_grammar.terminals
+    assert "__private_library_name" not in underscore_grammar.terminals
+
     module_type = "<module 'fixture_lib'>"
     encoded_module_type = encode_library_nonterminal(
         type_nonterminal(module_type)
@@ -5716,28 +6747,239 @@ def run_self_tests() -> None:
         max_layouts=4,
     )
     assert ArgumentLayout(("object",), ()) in capped_layouts
+    assert iterable_element_type("map[int]") == "int"
+    assert iterable_element_type("reversed[str]") == "str"
+    assert groundable_type("int")
+    assert groundable_type("int | str")
+    assert not groundable_type("_T")
+    assert not groundable_type("list[SupportsRichComparisonT]")
     assert is_assignable("list[int]", "Iterable[int]")
     assert is_assignable("map[int]", "Iterable[int]")
+    assert is_assignable("defaultdict[Unknown, int]", "Sized")
+    assert not is_assignable("defaultdict[Unknown, int]", "Hashable")
+    assert not is_assignable(
+        "set[tuple[int, ...]]", "set[tuple[int, int]]"
+    )
+    assert not is_assignable(
+        "set[tuple[str, ...]]", "set[tuple[int, int]]"
+    )
+    assert set_tuple_refinement_candidate(
+        "set[tuple[int, ...]]", "set[tuple[int, int]]"
+    )
+    assert not set_tuple_refinement_candidate(
+        "set[tuple[str, ...]]", "set[tuple[int, int]]"
+    )
+    assert is_assignable("float", "SupportsInt")
+    assert is_assignable(
+        "float", "str | Buffer | SupportsInt | SupportsIndex | SupportsTrunc"
+    )
+    assert not is_assignable("complex", "SupportsInt")
     assert is_assignable("<class 'int'>", "(_T1, /) -> _S")
     assert not is_assignable("str", "int")
+
+    def parsed_signature(label: str) -> Signature:
+        parsed = parse_signature(label)
+        assert parsed is not None
+        return parsed
+
+    generic_probe = SemanticProbe.__new__(SemanticProbe)
+    generic_signatures: dict[tuple[str, str], tuple[Signature, ...]] = {
+        ("<class 'map'>", "map"): (
+            parsed_signature(
+                "[_T1, _S](func: (_T1, /) -> _S, "
+                "iterable: Iterable[_T1], /) -> map[_S]"
+            ),
+        ),
+        ("<class 'list'>", "list"): (
+            parsed_signature(
+                "[_T](iterable: Iterable[_T], /) -> list[_T]"
+            ),
+        ),
+        ("def sorted", "sorted"): (
+            parsed_signature(
+                "[SupportsRichComparisonT](iterable: "
+                "Iterable[SupportsRichComparisonT], /, *, "
+                "reverse: bool = False) -> list[SupportsRichComparisonT]"
+            ),
+        ),
+        ("<class 'reversed'>", "reversed"): (
+            parsed_signature(
+                "[_T](sequence: _SupportsReversed[_T], /) -> reversed[_T]"
+            ),
+        ),
+        ("<class 'range'>", "range"): (
+            parsed_signature("(stop: SupportsIndex, /) -> range"),
+        ),
+        ("<class 'int'>", "int"): (
+            parsed_signature("(x: str, /) -> int"),
+        ),
+        ("<class 'str'>", "str"): (
+            parsed_signature("(object: object, /) -> str"),
+        ),
+        ("bound method str.join", '\"\".join'): (
+            parsed_signature("(iterable: Iterable[str], /) -> str"),
+        ),
+        ("bound method list[int].extend", "target.extend"): (
+            parsed_signature("(iterable: Iterable[int], /) -> None"),
+        ),
+    }
+    generic_builder = GrammarBuilder(
+        generic_probe,
+        frozenset(),
+        BuilderOptions(max_call_arity=2),
+        generic_signatures,
+    )
+    generic_builder.add_literals()
+    for callable_type, expression in (
+        ("<class 'map'>", "map"),
+        ("<class 'list'>", "list"),
+        ("def sorted", "sorted"),
+        ("<class 'reversed'>", "reversed"),
+        ("<class 'range'>", "range"),
+        ("<class 'int'>", "int"),
+        ("<class 'str'>", "str"),
+    ):
+        generic_builder.add_expression(
+            callable_type,
+            (Terminal(expression),),
+            representative=expression,
+        )
+        generic_builder.callables[callable_type] = expression
+    generic_builder.add_expression(
+        "list[str]", (Terminal("words"),), representative="words"
+    )
+    generic_builder.add_expression(
+        "list[int]", (Terminal("numbers"),), representative="numbers"
+    )
+    generic_builder.add_expression("list[int]", (Terminal("target"),))
+    generic_builder.add_expression(
+        "bound method str.join",
+        (
+            Nonterminal(type_nonterminal("str")),
+            Terminal("."),
+            Terminal("join"),
+        ),
+        representative='\"\".join',
+    )
+    generic_builder.callables["bound method str.join"] = '\"\".join'
+    generic_builder.add_expression(
+        "bound method list[int].extend",
+        (
+            Nonterminal(type_nonterminal("list[int]")),
+            Terminal("."),
+            Terminal("extend"),
+        ),
+        representative="target.extend",
+    )
+    generic_builder.callables[
+        "bound method list[int].extend"
+    ] = "target.extend"
+    generic_builder.add_calls()
+    generic_builder.add_grounded_generic_calls()
+    generic_grammar, _generic_stats = generic_builder.finish()
+    generic_compiled = UnitAwareBinaryGrammar(generic_grammar)
+    assert generic_compiled.recognizes(
+        (
+            "sorted", "(", "list", "(", "map", "(", "int", ",",
+            "words", ")", ")", ")",
+        )
+    )
+    assert generic_compiled.recognizes(
+        ("sorted", "(", "map", "(", "int", ",", "words", ")", ")")
+    )
+    assert generic_compiled.recognizes(
+        ('\"\"', ".", "join", "(", "map", "(", "str", ",", "numbers", ")", ")")
+    )
+    assert generic_compiled.recognizes(
+        (
+            "target", ".", "extend", "(", "reversed", "(", "range",
+            "(", "0", ")", ")", ")",
+        )
+    )
+    assert not generic_compiled.recognizes(
+        ('\"\"', ".", "join", "(", "map", "(", "int", ",", "words", ")", ")")
+    )
+    assert not generic_compiled.recognizes(
+        ("target", ".", "extend", "(", "reversed", "(", "words", ")", ")")
+    )
+
+    class ContextualAppendProbe(SemanticProbe):
+        def __init__(self) -> None:
+            self.queries: list[str] = []
+
+        def accepts_expression(self, expression: str) -> bool:
+            self.queries.append(expression)
+            return expression == "l.append(s)"
+
+    append_probe = ContextualAppendProbe()
+    append_type = (
+        "bound method list[set[tuple[int, int]]].append"
+        "(object: set[tuple[int, int]], /) -> None"
+    )
+    append_signatures: dict[tuple[str, str], tuple[Signature, ...]] = {
+        (append_type, "l.append"): (
+            parsed_signature("(object: set[tuple[int, int]], /) -> None"),
+        )
+    }
+    append_builder = GrammarBuilder(
+        append_probe,
+        frozenset({"l", "s", "y"}),
+        BuilderOptions(max_call_arity=1),
+        append_signatures,
+    )
+    append_builder.add_literals()
+    append_builder.add_expression(
+        "set[tuple[int, ...]]", (Terminal("s"),), representative="s"
+    )
+    append_builder.add_expression(
+        "set[tuple[int, ...]]", (Terminal("y"),), representative="y"
+    )
+    append_builder.add_expression(
+        append_type,
+        (Terminal("l"), Terminal("."), Terminal("append")),
+        representative="l.append",
+    )
+    append_builder.callables[append_type] = "l.append"
+    append_builder.add_calls()
+    append_grammar, _append_stats = append_builder.finish()
+    append_compiled = UnitAwareBinaryGrammar(append_grammar)
+    assert append_probe.queries == ["l.append(s)"]
+    assert append_compiled.recognizes(("l", ".", "append", "(", "s", ")"))
+    assert not append_compiled.recognizes(
+        ("l", ".", "append", "(", "y", ")")
+    )
     print("self-test passed")
 
 
 def parse_arguments(arguments: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "archive",
+        "source",
         nargs="?",
         type=Path,
-        default=DEFAULT_ARCHIVE,
-        help="Project CodeNet gzip tar archive",
+        default=None,
+        help=(
+            "dataset source (APPS directory/split JSONL or CodeNet gzip tar); "
+            "defaults according to --dataset and --split"
+        ),
+    )
+    parser.add_argument(
+        "--dataset",
+        choices=("apps", "codenet"),
+        default="apps",
+    )
+    parser.add_argument(
+        "--split",
+        choices=("train", "test"),
+        default="test",
+        help="APPS split to read when its source is a directory",
     )
     parser.add_argument(
         "-n",
         "--files",
         type=int,
         default=1000,
-        help="number of archive-order ty-clean files to evaluate",
+        help="number of dataset-order ty-clean source files to evaluate",
     )
     parser.add_argument("--precision-samples", type=int, default=10)
     parser.add_argument(
@@ -5795,8 +7037,13 @@ def parse_arguments(arguments: Sequence[str]) -> argparse.Namespace:
 
 
 def evaluation_options(args: argparse.Namespace) -> EvaluationOptions:
+    source = args.source
+    if source is None:
+        source = default_dataset_source(args.dataset, args.split)
     return EvaluationOptions(
-        archive=args.archive,
+        dataset=args.dataset,
+        source=source,
+        split=args.split,
         files=args.files,
         precision_samples=args.precision_samples,
         max_samples=args.max_samples,

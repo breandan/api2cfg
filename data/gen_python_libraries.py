@@ -68,11 +68,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 
-import evaluate_codenet_python as evaluator
+import evaluate_python as evaluator
 
 
 CFG_SCHEMA_VERSION = 2
-DEFAULT_ARCHIVE = evaluator.DEFAULT_ARCHIVE
+DEFAULT_ARCHIVE = evaluator.DEFAULT_CODENET_ARCHIVE
 DEFAULT_OUTPUT_DIRECTORY = Path(__file__).resolve().with_name("lib")
 LIBRARY_ALIAS = "__api2cfg_library"
 FRAGMENT_START = "__LIBRARY_FRAGMENT__"
