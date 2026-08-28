@@ -2,8 +2,9 @@
 """Evaluate cursor-specific Python CFGs on APPS or Project CodeNet.
 
 The evaluator keeps the held-out statement away from the ``ty`` language
-server used to construct its grammar.  It currently supports one-line
-expression statements in the Name/Attribute/Call/literal fragment and simple
+server used to construct its grammar.  It supports one-line expression
+statements built from names, literals, attributes, calls, arithmetic binary
+operators, subscripts, and slices, together with simple
 single-name bindings whose right-hand side is in the same fragment.  A live
 binding name is inferred from the ablated context; a private binding is
 canonicalized to a fresh-name placeholder.
@@ -17,10 +18,9 @@ For every eligible statement in every selected source file it independently:
 3. lowers the returned semantic information into a lexicalized, type-indexed
    CFG;
 4. recognizes the canonicalized ground-truth token sequence; and
-5. samples exactly uniformly from the distinct words in the union of
-   ``L(G) intersect Sigma^i`` for every token length from
-   ``max(1, k - 2)`` through ``k + 2`` before reinserting each sample and checking
-   it with ty.
+5. draws a uniform integer from ``[0, 10^6)``, decodes that global shortlex
+   rank through an exact DFA bijection, then reinserts the word and checks it
+   with ty.
 
 The evaluator implementation itself uses only the Python standard library.  It
 streams APPS solutions from a split JSONL file, or CodeNet submissions from its
@@ -33,7 +33,9 @@ from __future__ import annotations
 
 import argparse
 import ast
+import bisect
 import builtins
+import contextlib
 import functools
 import hashlib
 import heapq
@@ -48,6 +50,7 @@ import platform
 import random
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tarfile
@@ -58,7 +61,7 @@ import warnings
 from collections import Counter, defaultdict, deque
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Callable, Iterable, Iterator, Mapping, Sequence, TextIO
+from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence, TextIO, cast
 from urllib.parse import quote, unquote
 
 
@@ -70,6 +73,8 @@ DEFAULT_LIBRARY_DIRECTORY = Path(__file__).resolve().with_name("lib")
 LIBRARY_CFG_SCHEMA = "2"
 SUPPORTED_LIBRARY_CFG_SCHEMAS = frozenset({"1", LIBRARY_CFG_SCHEMA})
 ASSIGNABILITY_RELATION_VERSION = 2
+SAMPLE_RANK_LIMIT = 1_000_000
+DEFAULT_MAX_DFA_STATES = 500_000
 
 
 def library_cfg_filename(module: str) -> str:
@@ -85,6 +90,10 @@ PYTHON_SUBMISSION = re.compile(
 FRESH_TOKEN = "@fresh"
 DYNAMIC_NONTERMINAL = "E:__contextual_dynamic__"
 TRUSTED_DYNAMIC_CALL_NONTERMINAL = "C:__trusted_dynamic_call__"
+SLICE_NONTERMINAL = "Q:__slice__"
+SLICE_BOUND_NONTERMINAL = "Q:__slice_bound__"
+DYNAMIC_COMPOSITION_ATOM_NONTERMINAL = "E:__contextual_dynamic_atom__"
+DYNAMIC_BINARY_OPERAND_NONTERMINAL = "E:__contextual_binary_operand__"
 
 LSP_METHOD = 2
 LSP_FUNCTION = 3
@@ -104,6 +113,37 @@ IGNORED_TOKEN_TYPES = {
     tokenize.COMMENT,
 }
 SUPPORTED_CONSTANT_TYPES = (type(None), bool, int, float, complex, str, bytes)
+SUPPORTED_BINARY_OPERATOR_TYPES = (
+    ast.Add,
+    ast.Sub,
+    ast.Mult,
+    ast.Div,
+    ast.FloorDiv,
+    ast.Mod,
+    ast.Pow,
+)
+BINARY_OPERATOR_SYMBOLS: Mapping[type[ast.operator], str] = {
+    ast.Add: "+",
+    ast.Sub: "-",
+    ast.Mult: "*",
+    ast.Div: "/",
+    ast.FloorDiv: "//",
+    ast.Mod: "%",
+    ast.Pow: "**",
+}
+
+
+def surface_fragment_metadata() -> dict[str, object]:
+    """Describe syntax choices that materially change the candidate language."""
+
+    return {
+        "binary_operators": list(BINARY_OPERATOR_SYMBOLS.values()),
+        "subscripts": True,
+        "slices": True,
+        "list_displays": False,
+    }
+
+
 BUILTIN_NAMES = frozenset(dir(builtins))
 CORE_BUILTINS = frozenset(
     {
@@ -195,12 +235,98 @@ class EvaluationError(RuntimeError):
     """An expected benchmark operation could not be completed."""
 
 
+class TyTransportError(EvaluationError):
+    """The ty language-server transport closed during an evaluation."""
+
+
+class StatementTimeout(Exception):
+    """One complete prepared-target evaluation exceeded its wall deadline."""
+
+
 class LanguageTooLarge(EvaluationError):
     """Exact bounded-language determinization exceeded its configured cap."""
 
 
+@contextlib.contextmanager
+def wall_deadline(
+    seconds: float,
+    exception: Callable[[], Exception],
+) -> Iterator[None]:
+    """Compose a wall deadline with any earlier active ``ITIMER_REAL``."""
+
+    if seconds <= 0 or not hasattr(signal, "SIGALRM"):
+        yield
+        return
+
+    def expired(_signum: int, _frame: object) -> None:
+        raise exception()
+
+    old_handler = signal.getsignal(signal.SIGALRM)
+    old_remaining, old_interval = signal.getitimer(signal.ITIMER_REAL)
+    started = time.monotonic()
+    outer_expires_first = 0 < old_remaining <= seconds
+    if outer_expires_first:
+        active_handler = old_handler
+        active_seconds = old_remaining
+    else:
+        active_handler = expired
+        active_seconds = seconds
+    signal.signal(signal.SIGALRM, active_handler)
+    signal.setitimer(signal.ITIMER_REAL, active_seconds)
+    try:
+        yield
+    finally:
+        elapsed = time.monotonic() - started
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, old_handler)
+        restored_remaining = (
+            max(0.0, old_remaining - elapsed) if old_remaining > 0 else 0.0
+        )
+        if restored_remaining > 0 or old_interval > 0:
+            signal.setitimer(
+                signal.ITIMER_REAL,
+                restored_remaining,
+                old_interval,
+            )
+
+
+@contextlib.contextmanager
+def statement_deadline(seconds: float) -> Iterator[None]:
+    """Bound one end-to-end prepared-target attempt."""
+
+    with wall_deadline(
+        seconds,
+        lambda: StatementTimeout(
+            f"statement evaluation exceeded {seconds:g}s end-to-end deadline"
+        ),
+    ):
+        yield
+
+
 def stable_digest(value: str, length: int = 16) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:length]
+
+
+def compact_cardinality(value: int) -> str:
+    """Render a language cardinality without Python's huge-int digit limit."""
+
+    if value < 0:
+        raise ValueError("cardinality must be nonnegative")
+    try:
+        return str(value)
+    except ValueError:
+        # Python limits decimal conversion of very large integers.  Preserve
+        # exact strings in the ordinary case and use a deterministic six-digit
+        # scientific rendering only beyond that runtime safety limit.
+        if value == 0:
+            return "0"
+        bits = value.bit_length()
+        shift = max(0, bits - 53)
+        leading = value >> shift
+        logarithm = math.log10(leading) + shift * math.log10(2)
+        exponent = math.floor(logarithm)
+        mantissa = 10 ** (logarithm - exponent)
+        return f"{mantissa:.6g}e+{exponent}"
 
 
 def source_encoding(data: bytes) -> str:
@@ -434,6 +560,9 @@ class TyLspClient:
     """Small synchronous JSON-RPC client for ``ty server``."""
 
     def __init__(self, executable: str, workspace: Path, *, quiet: bool = True):
+        self.executable = executable
+        self.workspace = workspace
+        self.quiet = quiet
         stderr = subprocess.DEVNULL if quiet else None
         self.process = subprocess.Popen(
             [executable, "server"],
@@ -481,12 +610,8 @@ class TyLspClient:
                 },
             )
         except BaseException:
-            self.process.terminate()
-            try:
-                self.process.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait()
+            self._terminate_process()
+            self._close_pipes()
             raise
         result_map = result if isinstance(result, dict) else {}
         capabilities = result_map.get("capabilities", {})
@@ -495,13 +620,25 @@ class TyLspClient:
         self.position_encoding = (
             position_encoding if isinstance(position_encoding, str) else "utf-16"
         )
-        self.notify("initialized", {})
+        try:
+            self.notify("initialized", {})
+        except BaseException:
+            self._terminate_process()
+            self._close_pipes()
+            raise
 
     def _write(self, payload: Mapping[str, object]) -> None:
         body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-        self.stdin.write(f"Content-Length: {len(body)}\r\n\r\n".encode("ascii"))
-        self.stdin.write(body)
-        self.stdin.flush()
+        try:
+            self.stdin.write(
+                f"Content-Length: {len(body)}\r\n\r\n".encode("ascii")
+            )
+            self.stdin.write(body)
+            self.stdin.flush()
+        except BrokenPipeError as error:
+            raise TyTransportError(
+                "ty language server closed its input"
+            ) from error
 
     def notify(self, method: str, params: object | None = None) -> None:
         payload: dict[str, object] = {"jsonrpc": "2.0", "method": method}
@@ -538,8 +675,11 @@ class TyLspClient:
         while True:
             line = self.stdout.readline()
             if not line:
-                detail = f" (exit {self.process.poll()})" if self.process.poll() is not None else ""
-                raise EvaluationError(f"ty language server closed its output{detail}")
+                return_code = self.process.poll()
+                detail = f" (exit {return_code})" if return_code is not None else ""
+                raise TyTransportError(
+                    f"ty language server closed its output{detail}"
+                )
             if line in {b"\r\n", b"\n"}:
                 break
             try:
@@ -552,6 +692,13 @@ class TyLspClient:
         except (KeyError, ValueError) as error:
             raise EvaluationError("LSP response omitted Content-Length") from error
         body = self.stdout.read(length)
+        if len(body) != length:
+            return_code = self.process.poll()
+            detail = f" (exit {return_code})" if return_code is not None else ""
+            raise TyTransportError(
+                "ty language server closed its output while reading an LSP "
+                f"message{detail}"
+            )
         try:
             decoded = json.loads(body)
         except json.JSONDecodeError as error:
@@ -702,20 +849,73 @@ class TyLspClient:
         items = result.get("items", [])
         return [item for item in items if isinstance(item, dict)]
 
-    def close(self) -> None:
+    def restart(self) -> None:
+        """Replace a failed or timed-out server while preserving this client."""
+
+        # ``restart`` is only used after transport failure or an evaluation
+        # deadline.  A graceful shutdown can itself wait forever when ty is
+        # still computing the request that timed out, so recovery must abort
+        # the old process before starting its replacement.
+        try:
+            self._terminate_process()
+        finally:
+            self._close_pipes()
+        replacement: TyLspClient | None = None
+        adopted = False
+        try:
+            replacement = type(self)(
+                self.executable,
+                self.workspace,
+                quiet=self.quiet,
+            )
+            replacement_state = {
+                "process": replacement.process,
+                "stdin": replacement.stdin,
+                "stdout": replacement.stdout,
+                "next_id": replacement.next_id,
+                "document_uri": replacement.document_uri,
+                "document_version": replacement.document_version,
+                "position_encoding": replacement.position_encoding,
+            }
+            self.__dict__.update(replacement_state)
+            adopted = True
+        except BaseException:
+            if replacement is not None and not adopted:
+                replacement.close()
+            raise
+
+    def _terminate_process(self) -> None:
         if self.process.poll() is not None:
             return
+        self.process.terminate()
         try:
-            self.request("shutdown")
-            self.notify("exit")
-            self.process.wait(timeout=5)
-        except (BrokenPipeError, EvaluationError, subprocess.TimeoutExpired):
-            self.process.terminate()
+            self.process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            self.process.kill()
+            self.process.wait()
+
+    def _close_pipes(self) -> None:
+        for pipe in (self.stdin, self.stdout):
             try:
-                self.process.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait()
+                pipe.close()
+            except OSError:
+                pass
+
+    def close(self) -> None:
+        try:
+            try:
+                if self.process.poll() is not None:
+                    return
+                self.request("shutdown")
+                self.notify("exit")
+                self.process.wait(timeout=5)
+            except (BrokenPipeError, EvaluationError, subprocess.TimeoutExpired):
+                self._terminate_process()
+            except BaseException:
+                self._terminate_process()
+                raise
+        finally:
+            self._close_pipes()
 
     def __enter__(self) -> TyLspClient:
         return self
@@ -800,29 +1000,135 @@ def hole_for_node(source: str, node: ast.stmt) -> Hole | None:
     return Hole(before=before, after=after, line=line_index, indentation=indentation)
 
 
+def supported_surface_node(root: ast.AST) -> bool:
+    """Check the recursive expression fragment without Python recursion."""
+
+    pending = [root]
+    while pending:
+        node = pending.pop()
+        if isinstance(node, ast.Name):
+            continue
+        if isinstance(node, ast.Constant):
+            if type(node.value) not in SUPPORTED_CONSTANT_TYPES:
+                return False
+            continue
+        if isinstance(node, ast.Attribute):
+            if node.attr.startswith("_"):
+                return False
+            pending.append(node.value)
+            continue
+        if isinstance(node, ast.UnaryOp):
+            if not isinstance(node.op, (ast.UAdd, ast.USub, ast.Invert)):
+                return False
+            pending.append(node.operand)
+            continue
+        if isinstance(node, ast.BinOp):
+            if not isinstance(node.op, SUPPORTED_BINARY_OPERATOR_TYPES):
+                return False
+            pending.extend((node.right, node.left))
+            continue
+        if isinstance(node, ast.Subscript):
+            pending.extend((node.slice, node.value))
+            continue
+        if isinstance(node, ast.Slice):
+            pending.extend(
+                item
+                for item in (node.step, node.upper, node.lower)
+                if item is not None
+            )
+            continue
+        if isinstance(node, ast.Call):
+            if any(isinstance(argument, ast.Starred) for argument in node.args):
+                return False
+            if any(item.arg is None for item in node.keywords):
+                return False
+            pending.append(node.func)
+            pending.extend(reversed(node.args))
+            pending.extend(item.value for item in reversed(node.keywords))
+            continue
+        return False
+    return True
+
+
+def supported_subscript_slice(node: ast.expr | ast.slice) -> bool:
+    """Return whether one ordinary index or slice stays in the surface syntax."""
+
+    return supported_surface_node(node)
+
+
 def supported_expression(node: ast.expr) -> bool:
-    if isinstance(node, ast.Name):
-        return True
-    if isinstance(node, ast.Constant):
-        return type(node.value) in SUPPORTED_CONSTANT_TYPES
-    if isinstance(node, ast.Attribute):
-        return (
-            not node.attr.startswith("_")
-            and supported_expression(node.value)
-        )
-    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub, ast.Invert)):
-        return supported_expression(node.operand)
-    if isinstance(node, ast.Call):
-        if any(isinstance(argument, ast.Starred) for argument in node.args):
-            return False
-        if any(item.arg is None for item in node.keywords):
-            return False
-        return (
-            supported_expression(node.func)
-            and all(supported_expression(argument) for argument in node.args)
-            and all(supported_expression(item.value) for item in node.keywords)
-        )
-    return False
+    return supported_surface_node(node)
+
+
+def unsupported_surface_spelling_counts(
+    source: str,
+    root: ast.expr,
+) -> Counter[str]:
+    """Count spellings erased by the AST but absent from the surface CFG.
+
+    Python drops a call's trailing comma and folds adjacent string literals
+    into one ``Constant`` node.  Canonical tokenization retains both spellings,
+    so accepting them here would select words that the grammar cannot derive.
+    """
+
+    issues: Counter[str] = Counter()
+    pending: list[ast.AST] = [root]
+    while pending:
+        node = pending.pop()
+        # String-valued Constant nodes inside an f-string are formatting
+        # segments, not implicit literal concatenation.  The JoinedStr itself
+        # is outside the surface fragment, but expressions interpolated into
+        # either its value or a nested format specification still need their
+        # spelling checked for a complete exclusion audit.
+        if isinstance(node, ast.JoinedStr):
+            for value in node.values:
+                if not isinstance(value, ast.FormattedValue):
+                    continue
+                pending.append(value.value)
+                if value.format_spec is not None:
+                    pending.append(value.format_spec)
+            continue
+        pending.extend(ast.iter_child_nodes(node))
+        if not isinstance(node, (ast.Call, ast.Constant)):
+            continue
+        if isinstance(node, ast.Constant) and not isinstance(
+            node.value, (str, bytes)
+        ):
+            continue
+        segment = ast.get_source_segment(source, node)
+        if segment is None:
+            issues["source_segment"] += 1
+            continue
+        try:
+            tokens = [
+                item
+                for item in tokenize.generate_tokens(io.StringIO(segment).readline)
+                if item.type not in IGNORED_TOKEN_TYPES
+            ]
+        except (IndentationError, SyntaxError, tokenize.TokenError):
+            issues["tokenization"] += 1
+            continue
+        if isinstance(node, ast.Call):
+            if (
+                len(tokens) >= 2
+                and tokens[-1].string == ")"
+                and tokens[-2].string == ","
+            ):
+                issues["trailing_call_comma"] += 1
+        elif sum(item.type == tokenize.STRING for item in tokens) != 1:
+            issues["adjacent_literal"] += 1
+    return issues
+
+
+def unsupported_surface_spellings(
+    source: str,
+    root: ast.expr,
+) -> frozenset[str]:
+    return frozenset(unsupported_surface_spelling_counts(source, root))
+
+
+def surface_spelling_supported(source: str, root: ast.expr) -> bool:
+    return not unsupported_surface_spellings(source, root)
 
 
 LEXICAL_SCOPES = (
@@ -1096,7 +1402,9 @@ def candidate_targets(
             kind = "assignment"
         else:
             continue
-        if not supported_expression(expression):
+        if not supported_expression(expression) or not surface_spelling_supported(
+            source, expression
+        ):
             continue
         hole = hole_for_node(source, node)
         if hole is None:
@@ -1582,6 +1890,41 @@ def iterable_element_type(value: str) -> str | None:
     return None
 
 
+def strip_negative_flow_refinements(value: str) -> str | None:
+    """Discard ty's negative flow facts while preserving the value type.
+
+    Facts such as ``~AlwaysFalsy`` narrow which values reach a program point,
+    but do not change the operations supported by the underlying type.  A
+    positive intersection may add a protocol and is therefore not erased.
+    """
+
+    intersections = split_top_level(normalize_type(value), "&")
+    if not intersections or any(
+        not refinement.strip().startswith("~")
+        for refinement in intersections[1:]
+    ):
+        return None
+    return normalize_type(intersections[0])
+
+
+def has_gradual_value_branch(value: str) -> bool:
+    """Whether a top-level union/intersection branch is ``Any``/``Unknown``.
+
+    Generic arguments may themselves be gradual without making the container
+    value gradual.  Only the value-level head matters when deciding whether a
+    complete expression may enter a capability-specific grammar family.
+    """
+
+    for branch in split_union(normalize_type(value)):
+        intersections = split_top_level(normalize_type(branch), "&")
+        if intersections and normalize_type(intersections[0]) in {
+            "Any",
+            "Unknown",
+        }:
+            return True
+    return False
+
+
 def concrete_heap_list_element_type(value: str) -> str | None:
     """Recover ``T`` from a concrete ``list[T]`` plus flow refinements.
 
@@ -1591,13 +1934,10 @@ def concrete_heap_list_element_type(value: str) -> str | None:
     list element type and are safe to discard.
     """
 
-    intersections = split_top_level(normalize_type(value), "&")
-    if not intersections or any(
-        not refinement.strip().startswith("~")
-        for refinement in intersections[1:]
-    ):
+    concrete = strip_negative_flow_refinements(value)
+    if concrete is None:
         return None
-    base, arguments = generic_parts(intersections[0])
+    base, arguments = generic_parts(concrete)
     if base.split(".")[-1] != "list" or len(arguments) != 1:
         return None
     element = normalize_type(arguments[0])
@@ -1611,8 +1951,10 @@ def numeric_unary_kinds(value: str) -> tuple[bool, bool]:
 
     saw_concrete = False
     integral = True
-    for branch in split_union(normalize_type(value)):
-        branch = normalize_type(branch)
+    for raw_branch in split_union(normalize_type(value)):
+        branch = strip_negative_flow_refinements(raw_branch)
+        if branch is None:
+            return False, False
         if branch in {"Any", "Unknown", "Divergent", "Never", "NoReturn"}:
             continue
         base, _arguments = generic_parts(branch)
@@ -1636,13 +1978,206 @@ def numeric_unary_kinds(value: str) -> tuple[bool, bool]:
 
 def numeric_unary_result(value: str) -> str:
     result: list[str] = []
-    for branch in split_union(normalize_type(value)):
-        branch = normalize_type(branch)
+    for raw_branch in split_union(normalize_type(value)):
+        branch = strip_negative_flow_refinements(raw_branch)
+        if branch is None:
+            continue
         base, _arguments = generic_parts(branch)
         mapped = "int" if base.split(".")[-1] == "bool" else branch
         if mapped not in result:
             result.append(mapped)
     return " | ".join(result)
+
+
+BUILTIN_NUMERIC_RANK: Mapping[str, int] = {
+    "bool": 0,
+    "int": 0,
+    "float": 1,
+    "complex": 2,
+}
+ARITHMETIC_SEQUENCE_BASES = frozenset(
+    {"list", "tuple", "str", "bytes", "bytearray"}
+)
+INDEXED_SEQUENCE_BASES = frozenset(
+    {
+        "list",
+        "tuple",
+        "str",
+        "bytes",
+        "bytearray",
+        "memoryview",
+        "range",
+        "deque",
+        "Sequence",
+        "MutableSequence",
+    }
+)
+SLICEABLE_SEQUENCE_BASES = INDEXED_SEQUENCE_BASES - {"deque"}
+INDEXED_MAPPING_BASES = frozenset(
+    {"dict", "defaultdict", "Mapping", "MutableMapping"}
+)
+
+
+def tuple_arithmetic_preserves_type(arguments: tuple[str, ...]) -> bool:
+    """Whether concatenation/repetition retains this rendered tuple type."""
+
+    return (
+        not arguments
+        or arguments == ("()",)
+        or (len(arguments) == 2 and arguments[1] == "...")
+    )
+
+
+def arithmetic_binary_result(
+    left: str, operator: str, right: str
+) -> str | None:
+    """Conservatively type one common Python arithmetic operation.
+
+    These rows cover Python's concrete numeric tower and the built-in
+    sequence operations whose result is fixed by the displayed operand types.
+    User-defined overloads are deliberately left to calls and members learned
+    from ``ty`` rather than inferred from a class name.
+    """
+
+    concrete_left = strip_negative_flow_refinements(left)
+    concrete_right = strip_negative_flow_refinements(right)
+    if concrete_left is None or concrete_right is None:
+        return None
+    left = concrete_left
+    right = concrete_right
+    if len(split_union(left)) != 1 or len(split_union(right)) != 1:
+        return None
+    left_base, left_arguments = generic_parts(left)
+    right_base, right_arguments = generic_parts(right)
+    left_base = left_base.split(".")[-1]
+    right_base = right_base.split(".")[-1]
+
+    left_rank = BUILTIN_NUMERIC_RANK.get(left_base)
+    right_rank = BUILTIN_NUMERIC_RANK.get(right_base)
+    if left_rank is not None and right_rank is not None:
+        if operator in {"//", "%"} and max(left_rank, right_rank) == 2:
+            return None
+        if operator == "/":
+            return "complex" if max(left_rank, right_rank) == 2 else "float"
+        rank = max(left_rank, right_rank)
+        return ("int", "float", "complex")[rank]
+
+    if operator == "+" and left == right and left_base in {
+        "str",
+        "bytes",
+        "bytearray",
+        "list",
+        "tuple",
+    }:
+        if left_base == "tuple" and not tuple_arithmetic_preserves_type(
+            left_arguments
+        ):
+            return None
+        return left
+
+    if (
+        operator == "+"
+        and left_base == right_base == "list"
+        and len(left_arguments) == len(right_arguments) == 1
+    ):
+        left_element = normalize_type(left_arguments[0])
+        right_element = normalize_type(right_arguments[0])
+        left_element_base, _ = generic_parts(left_element)
+        right_element_base, _ = generic_parts(right_element)
+        left_element_rank = BUILTIN_NUMERIC_RANK.get(
+            left_element_base.split(".")[-1]
+        )
+        right_element_rank = BUILTIN_NUMERIC_RANK.get(
+            right_element_base.split(".")[-1]
+        )
+        if left_element_rank is not None and right_element_rank is not None:
+            element = ("int", "float", "complex")[
+                max(left_element_rank, right_element_rank)
+            ]
+            return f"list[{element}]"
+
+    if operator == "*":
+        if (
+            left_base in ARITHMETIC_SEQUENCE_BASES
+            and is_assignable(right, "SupportsIndex")
+        ):
+            if left_base == "tuple" and not tuple_arithmetic_preserves_type(
+                left_arguments
+            ):
+                return None
+            return left
+        if (
+            right_base in ARITHMETIC_SEQUENCE_BASES
+            and is_assignable(left, "SupportsIndex")
+        ):
+            if right_base == "tuple" and not tuple_arithmetic_preserves_type(
+                right_arguments
+            ):
+                return None
+            return right
+
+    return None
+
+
+def indexed_access_types(value: str) -> tuple[str, str] | None:
+    """Return ``(index_type, result_type)`` for a displayed container type."""
+
+    value = normalize_type(value)
+    if len(split_union(value)) != 1:
+        return None
+    container = strip_negative_flow_refinements(value)
+    if container is None:
+        return None
+    base, arguments = generic_parts(container)
+    base = base.split(".")[-1]
+    if base in INDEXED_MAPPING_BASES and len(arguments) >= 2:
+        return normalize_type(arguments[0]), normalize_type(arguments[1])
+    if base == "str":
+        return "SupportsIndex", "str"
+    if base in {"bytes", "bytearray", "memoryview", "range"}:
+        return "SupportsIndex", "int"
+    if base == "tuple":
+        if arguments == ("()",):
+            return None
+        elements = [
+            normalize_type(item)
+            for item in arguments
+            if item != "..."
+        ]
+        if not elements:
+            return None
+        result = " | ".join(dict.fromkeys(elements))
+        return "SupportsIndex", result
+    if base in INDEXED_SEQUENCE_BASES and arguments:
+        return "SupportsIndex", normalize_type(arguments[0])
+    return None
+
+
+def sliced_access_type(value: str) -> str | None:
+    """Return the type of an ordinary slice when it is container-preserving."""
+
+    value = normalize_type(value)
+    if len(split_union(value)) != 1:
+        return None
+    container = strip_negative_flow_refinements(value)
+    if container is None:
+        return None
+    base, arguments = generic_parts(container)
+    base = base.split(".")[-1]
+    if base in {"str", "bytes", "bytearray", "memoryview", "range"}:
+        return container
+    if base == "tuple":
+        if arguments == ("()",) or (
+            len(arguments) == 2 and arguments[1] == "..."
+        ):
+            return container
+        if arguments:
+            element = " | ".join(dict.fromkeys(map(normalize_type, arguments)))
+            return f"tuple[{element}, ...]"
+        return None
+    if base in SLICEABLE_SEQUENCE_BASES and arguments:
+        return container
+    return None
 
 
 def is_callable_type(value: str, kind: int | None = None) -> bool:
@@ -1939,6 +2474,7 @@ def is_assignable(actual: str, expected: str) -> bool:
             return False
         if not expected_args or expected_base == "Container":
             return True
+        actual_elements: tuple[str, ...]
         if actual_base == "range":
             actual_elements = ("int",)
         elif actual_base == "str":
@@ -2460,9 +2996,39 @@ def postfix_nonterminal(expression_nonterminal: str) -> str:
     return f"P:{expression_nonterminal[2:]}"
 
 
+def expression_layer_nonterminal(
+    expression_nonterminal: str, layer: str
+) -> str:
+    """Return one precedence layer corresponding to an ``E:`` symbol."""
+
+    if not expression_nonterminal.startswith("E:"):
+        raise ValueError(
+            f"expression layer requires an expression nonterminal: "
+            f"{expression_nonterminal!r}"
+        )
+    return f"{layer}:{expression_nonterminal[2:]}"
+
+
+def sum_nonterminal(expression_nonterminal: str) -> str:
+    return expression_layer_nonterminal(expression_nonterminal, "S")
+
+
+def term_nonterminal(expression_nonterminal: str) -> str:
+    return expression_layer_nonterminal(expression_nonterminal, "M")
+
+
+def factor_nonterminal(expression_nonterminal: str) -> str:
+    return expression_layer_nonterminal(expression_nonterminal, "F")
+
+
+def power_nonterminal(expression_nonterminal: str) -> str:
+    return expression_layer_nonterminal(expression_nonterminal, "W")
+
+
 @dataclass(frozen=True)
 class BuilderOptions:
     max_call_arity: int = 3
+    max_dynamic_composition_depth: int = 2
     max_tokens: int = 20
     max_layouts_per_signature: int = 64
     member_depth: int = 2
@@ -2533,6 +3099,35 @@ def parse_library_metadata(value: str) -> object:
         return json.loads(value)
     except json.JSONDecodeError:
         return value
+
+
+def is_canonical_library_terminal(atom: str) -> bool:
+    """Accept exactly one canonical Python token as a cached terminal."""
+
+    items: list[tokenize.TokenInfo] = []
+    try:
+        for item in tokenize.generate_tokens(io.StringIO(atom).readline):
+            if item.type not in IGNORED_TOKEN_TYPES:
+                items.append(item)
+    except (IndentationError, tokenize.TokenError):
+        # A single opening delimiter is a valid grammar terminal even though
+        # it is not a balanced Python input by itself.  Keep tokens emitted
+        # before the tokenizer reports the incomplete input.
+        pass
+    try:
+        if len(items) != 1:
+            return False
+        item = items[0]
+        value = item.string
+        if item.type == tokenize.NUMBER:
+            value = canonical_number(value)
+        elif item.type == tokenize.STRING:
+            value = canonical_string(value)
+        elif item.type not in {tokenize.NAME, tokenize.OP}:
+            return False
+        return value == atom
+    except ValueError:
+        return False
 
 
 def parse_library_cfg_text(text: str, path: Path) -> LibraryArtifact:
@@ -2613,6 +3208,12 @@ def parse_library_cfg_text(text: str, path: Path) -> LibraryArtifact:
             rhs = tuple(
                 decode_library_nonterminal(atom) for atom in rhs_text.split()
             )
+        if any(atom in {"[", "]"} for atom in rhs):
+            raise EvaluationError(
+                f"{path}:{line_number}: cached library fragments must not "
+                "contain bracket terminals; subscripts and slices are built "
+                "from the live typing context"
+            )
         if lhs == "START":
             raise EvaluationError(
                 f"{path}:{line_number}: library fragments must not define START"
@@ -2645,16 +3246,23 @@ def parse_library_cfg_text(text: str, path: Path) -> LibraryArtifact:
             is_nonterminal = atom in lhs_names or atom.startswith(("E:", "A:"))
             if is_nonterminal:
                 name = canonical_names.setdefault(atom, atom)
-                symbol = nonterminal_symbols.get(name)
-                if symbol is None:
-                    symbol = Nonterminal(name)
-                    nonterminal_symbols[name] = symbol
+                nonterminal_symbol = nonterminal_symbols.get(name)
+                if nonterminal_symbol is None:
+                    nonterminal_symbol = Nonterminal(name)
+                    nonterminal_symbols[name] = nonterminal_symbol
+                symbol: Symbol = nonterminal_symbol
             else:
                 name = canonical_names.setdefault(atom, atom)
-                symbol = terminal_symbols.get(name)
-                if symbol is None:
-                    symbol = Terminal(name)
-                    terminal_symbols[name] = symbol
+                if not is_canonical_library_terminal(name):
+                    raise EvaluationError(
+                        f"{path}:{_line_number}: cached terminal {name!r} "
+                        "must be one canonical Python token"
+                    )
+                terminal_symbol = terminal_symbols.get(name)
+                if terminal_symbol is None:
+                    terminal_symbol = Terminal(name)
+                    terminal_symbols[name] = terminal_symbol
+                symbol = terminal_symbol
             symbols.append(symbol)
             if atom.startswith("E:"):
                 grammar.type_labels[name] = name[2:]
@@ -2939,7 +3547,7 @@ def visible_imported_library_modules(
 
     modules: set[str] = set()
     for node in visible_absolute_import_nodes(source, target_line):
-        imported = (
+        imported: Sequence[str | None] = (
             [alias.name for alias in node.names]
             if isinstance(node, ast.Import)
             else [node.module]
@@ -3189,6 +3797,9 @@ class BuildStats:
     library_incomplete_artifacts: int = 0
     assignability_pairs_cached: int = 0
     assignability_pairs_checked: int = 0
+    binary_operation_productions: int = 0
+    subscript_productions: int = 0
+    slice_productions: int = 0
 
 
 class GrammarBuilder:
@@ -3221,8 +3832,10 @@ class GrammarBuilder:
         self.representatives: dict[str, str] = {}
         self.callables: dict[str, str] = {}
         self.exact_callables: set[tuple[str, str]] = set()
+        self.processed_callable_entries: set[tuple[str, str]] = set()
         self.member_callable_receivers: dict[tuple[str, str], str] = {}
-        self.contextual_dynamic_call_layouts: set[str] = set()
+        self.contextual_dynamic_output_families: set[str] = set()
+        self.internal_expression_types: set[str] = set()
         self.receivers: list[tuple[int, int, str, str, str]] = []
         self.receiver_entries: dict[
             str, tuple[int, int, str, str, str]
@@ -3231,6 +3844,7 @@ class GrammarBuilder:
         self.expected_types: set[str] = set()
         self.contextual_call_results: dict[str, bool] = {}
         self.dynamic_representatives: dict[str, set[str]] = defaultdict(set)
+        self.dynamic_scope_representatives: dict[str, set[str]] = defaultdict(set)
         contextual_source = getattr(self.probe, "ablated", None)
         self.has_contextual_source = isinstance(contextual_source, str)
         try:
@@ -3272,6 +3886,32 @@ class GrammarBuilder:
             return ()
         return tuple(Terminal(token) for token in tokens)
 
+    def contextual_dynamic_output_nonterminal(
+        self,
+        return_type: str,
+        identity: object,
+    ) -> str:
+        """Create one producer-specific Any/Unknown result family.
+
+        The family remains usable through its displayed ``Any``/``Unknown``
+        expression type, but output assignments root it only after a complete
+        producer from this exact family passes in the ablated downstream
+        context.
+        """
+
+        normalized_return = normalize_type(return_type)
+        encoded_identity = repr((normalized_return, identity))
+        nonterminal = (
+            f"C:__contextual_dynamic_"
+            f"{stable_digest(encoded_identity, 16)}__"
+        )
+        self.contextual_dynamic_output_families.add(nonterminal)
+        self.grammar.add(
+            self.expression_nonterminal(normalized_return),
+            Nonterminal(nonterminal),
+        )
+        return nonterminal
+
     def contextual_dynamic_call_nonterminal(
         self,
         return_type: str,
@@ -3279,22 +3919,10 @@ class GrammarBuilder:
         expression: str,
         layout: ArgumentLayout,
     ) -> str:
-        """Create one exact-callable, signature-layout dynamic result family.
-
-        The family remains usable through its displayed ``Any``/``Unknown``
-        expression type, but output assignments root it only after a complete
-        call from this exact family passes in the ablated downstream context.
-        """
-
-        normalized_return = normalize_type(return_type)
-        identity = repr((detail, expression, layout))
-        nonterminal = f"C:__contextual_dynamic_{stable_digest(identity, 16)}__"
-        self.contextual_dynamic_call_layouts.add(nonterminal)
-        self.grammar.add(
-            self.expression_nonterminal(normalized_return),
-            Nonterminal(nonterminal),
+        return self.contextual_dynamic_output_nonterminal(
+            return_type,
+            ("call", detail, expression, layout),
         )
-        return nonterminal
 
     def call_result_nonterminal(
         self,
@@ -3452,6 +4080,10 @@ class GrammarBuilder:
                 )
                 self.representatives.setdefault(detail, completion.label)
                 self.dynamic_representatives[detail].add(completion.label)
+                if completion.label in self.source_ids:
+                    self.dynamic_scope_representatives[detail].add(
+                        completion.label
+                    )
                 self.stats.dynamic_types += 1
             else:
                 self.add_expression(
@@ -3732,6 +4364,7 @@ class GrammarBuilder:
                     continue
                 member_type = normalize_type(completion.detail)
                 member_expression = f"{expression}.{completion.label}"
+                member_rhs: tuple[Symbol, ...]
                 if receiver_type in {"Any", "Unknown"}:
                     receiver_tokens = canonical_expression_tokens(expression)
                     if receiver_tokens is None:
@@ -3857,8 +4490,13 @@ class GrammarBuilder:
                 )
 
     def add_calls(self) -> None:
-        callable_entries = self.callable_entries()
-        self.stats.callables = len(callable_entries)
+        callable_entries = tuple(
+            entry
+            for entry in self.callable_entries()
+            if entry not in self.processed_callable_entries
+        )
+        self.processed_callable_entries.update(callable_entries)
+        self.stats.callables = len(self.processed_callable_entries)
         for callable_type, expression in callable_entries:
             signatures = self.signatures_for(callable_type, expression)
             if (
@@ -4020,16 +4658,16 @@ class GrammarBuilder:
             for actual in comparable_types:
                 result_nonterminal = self.expression_nonterminal(actual)
                 for arity in range(2, self.options.max_call_arity + 1):
-                    rhs: list[Symbol] = [
+                    variadic_rhs: list[Symbol] = [
                         *callable_symbols,
                         Terminal("("),
                     ]
                     for index in range(arity):
                         if index:
-                            rhs.append(Terminal(","))
-                        rhs.append(Nonterminal(type_nonterminal(actual)))
-                    rhs.append(Terminal(")"))
-                    self.grammar.add(result_nonterminal, *rhs)
+                            variadic_rhs.append(Terminal(","))
+                        variadic_rhs.append(Nonterminal(type_nonterminal(actual)))
+                    variadic_rhs.append(Terminal(")"))
+                    self.grammar.add(result_nonterminal, *variadic_rhs)
 
             # Ground the single-iterable overload's result to the iterable's
             # concrete element type.  LSP signature help otherwise leaves the
@@ -4346,6 +4984,251 @@ class GrammarBuilder:
                     Nonterminal(operand_nonterminal),
                 )
 
+    def current_expression_types(self) -> set[str]:
+        return {
+            production.lhs[2:]
+            for production in self.grammar.productions
+            if production.lhs.startswith("E:")
+        }
+
+    def subscript_receiver_representative(
+        self,
+        receiver_type: str,
+        expected_index: str,
+    ) -> str | None:
+        """Return one bounded, statically typed index expression for probing.
+
+        Member completion needs a concrete spelling even though the resulting
+        grammar row remains type-indexed.  Prefer an exact index type, then a
+        shortest conservative assignability witness.  Dynamic witnesses are
+        deliberately excluded: using one to reopen a concrete result family
+        would make its provenance depend on gradual typing rather than the
+        typed subscript row being closed here.
+        """
+
+        receiver = self.representatives.get(normalize_type(receiver_type))
+        if receiver is None:
+            return None
+        expected = normalize_type(expected_index)
+        candidates: list[
+            tuple[int, int, tuple[str, ...], str]
+        ] = []
+        for actual, expression in self.representatives.items():
+            normalized_actual = normalize_type(actual)
+            if normalized_actual in {"Any", "Unknown"} or not is_assignable(
+                normalized_actual, expected
+            ):
+                continue
+            tokens = canonical_expression_tokens(expression)
+            if tokens is None:
+                continue
+            candidates.append(
+                (
+                    normalized_actual != expected,
+                    len(tokens),
+                    tokens,
+                    expression,
+                )
+            )
+        if not candidates:
+            return None
+        index = min(candidates)[-1]
+        expression = f"{receiver}[{index}]"
+        try:
+            parsed = ast.parse(expression, mode="eval").body
+        except SyntaxError:
+            parsed = None
+        if not isinstance(parsed, ast.Subscript):
+            expression = f"({receiver})[{index}]"
+        tokens = canonical_expression_tokens(expression)
+        if tokens is None:
+            return None
+        expression_budget = self.options.max_tokens - (
+            2 if self.required_assignment is not None else 0
+        )
+        # A closure is useful only if at least one following ``.member`` can
+        # still fit the grammar's expression budget.
+        return expression if len(tokens) + 2 <= expression_budget else None
+
+    def queue_typed_subscript_receiver(
+        self,
+        receiver_type: str,
+        expected_index: str,
+        result_type: str,
+    ) -> None:
+        """Seed one concrete indexed result for a single member/call closure."""
+
+        result_type = normalize_type(result_type)
+        if result_type in {"Any", "Unknown", "Never", "NoReturn", "None"}:
+            return
+        expression = self.subscript_receiver_representative(
+            receiver_type, expected_index
+        )
+        if expression is None:
+            return
+        self.representatives.setdefault(result_type, expression)
+        if is_callable_type(result_type):
+            self.callables.setdefault(result_type, expression)
+        else:
+            self.queue_receiver(result_type, expression, 0)
+
+    def add_typed_subscript_receiver_closure(self) -> None:
+        """Expand indexed result members once, under the ordinary query caps.
+
+        ``add_members`` may follow ordinary attributes up to ``member_depth``,
+        but this method is invoked only once and does not rerun subscript
+        synthesis.  Repeating ``add_calls`` is safe because it consumes only
+        callable identities not processed by the first call pass.
+        """
+
+        self.add_members()
+        self.add_calls()
+
+    def add_typed_subscripts(self) -> None:
+        """Add index and ordinary-slice trailers justified by container types."""
+
+        expression_types = self.current_expression_types()
+        slice_receivers = {
+            receiver_type: result_type
+            for receiver_type in expression_types
+            if (result_type := sliced_access_type(receiver_type)) is not None
+        }
+        if slice_receivers:
+            self.add_slice_syntax()
+
+        for receiver_type in sorted(expression_types):
+            receiver = Nonterminal(type_nonterminal(receiver_type))
+            indexed = indexed_access_types(receiver_type)
+            if indexed is not None:
+                expected, result_type = indexed
+                self.expected_types.add(expected)
+                normalized_result = normalize_type(result_type)
+                if normalized_result in {"Any", "Unknown"}:
+                    result_nonterminal = (
+                        self.contextual_dynamic_output_nonterminal(
+                            normalized_result,
+                            ("subscript", receiver_type, expected),
+                        )
+                    )
+                else:
+                    result_nonterminal = self.expression_nonterminal(
+                        normalized_result
+                    )
+                before = len(self.grammar.productions)
+                self.grammar.add(
+                    result_nonterminal,
+                    receiver,
+                    Terminal("["),
+                    Nonterminal(argument_nonterminal(expected)),
+                    Terminal("]"),
+                )
+                self.stats.subscript_productions += (
+                    len(self.grammar.productions) - before
+                )
+                if normalized_result not in {"Any", "Unknown"}:
+                    self.queue_typed_subscript_receiver(
+                        receiver_type,
+                        expected,
+                        normalized_result,
+                    )
+
+            result_type = slice_receivers.get(receiver_type)
+            if result_type is None:
+                continue
+            before = len(self.grammar.productions)
+            self.grammar.add(
+                self.expression_nonterminal(result_type),
+                receiver,
+                Terminal("["),
+                Nonterminal(SLICE_NONTERMINAL),
+                Terminal("]"),
+            )
+            self.stats.slice_productions += (
+                len(self.grammar.productions) - before
+            )
+
+    def add_slice_syntax(self) -> None:
+        """Materialize the twelve ordinary one- and two-colon slice forms."""
+
+        if any(
+            production.lhs == SLICE_NONTERMINAL
+            for production in self.grammar.productions
+        ):
+            return
+        # This is deliberately not ``A:SupportsIndex``.  That broad argument
+        # family includes E:Any/E:Unknown, whose contextual postfix results
+        # could then recurse through slice bounds and evade the explicit
+        # dynamic-composition depth.  ``finish`` links only non-gradual
+        # SupportsIndex expressions and exact lexical gradual names here.
+        bound = Nonterminal(SLICE_BOUND_NONTERMINAL)
+        for include_step in (False, True):
+            for lower_present, upper_present, step_present in itertools.product(
+                (False, True), repeat=3
+            ):
+                if not include_step and step_present:
+                    continue
+                rhs: list[Symbol] = []
+                if lower_present:
+                    rhs.append(bound)
+                rhs.append(Terminal(":"))
+                if upper_present:
+                    rhs.append(bound)
+                if include_step:
+                    rhs.append(Terminal(":"))
+                    if step_present:
+                        rhs.append(bound)
+                before = len(self.grammar.productions)
+                self.grammar.add(SLICE_NONTERMINAL, *rhs)
+                self.stats.slice_productions += (
+                    len(self.grammar.productions) - before
+                )
+
+    def add_typed_binary_operations(self) -> None:
+        """Add the common arithmetic rows supported by concrete built-in types."""
+
+        expression_types = self.current_expression_types()
+        numeric_types: list[str] = []
+        sequence_types: list[str] = []
+        index_types: list[str] = []
+        for actual in sorted(expression_types):
+            concrete = strip_negative_flow_refinements(actual)
+            if concrete is None or len(split_union(concrete)) != 1:
+                continue
+            base, _arguments = generic_parts(concrete)
+            base = base.split(".")[-1]
+            if base in BUILTIN_NUMERIC_RANK:
+                numeric_types.append(actual)
+                if is_assignable(concrete, "SupportsIndex"):
+                    index_types.append(actual)
+            if base in ARITHMETIC_SEQUENCE_BASES:
+                sequence_types.append(actual)
+
+        candidates: set[tuple[str, str, str]] = set()
+        for left, right in itertools.product(numeric_types, repeat=2):
+            for operator in BINARY_OPERATOR_SYMBOLS.values():
+                candidates.add((left, operator, right))
+        for left, right in itertools.product(sequence_types, repeat=2):
+            candidates.add((left, "+", right))
+        for sequence_type in sequence_types:
+            for index_type in index_types:
+                candidates.add((sequence_type, "*", index_type))
+                candidates.add((index_type, "*", sequence_type))
+
+        for left, operator, right in sorted(candidates):
+            result_type = arithmetic_binary_result(left, operator, right)
+            if result_type is None:
+                continue
+            before = len(self.grammar.productions)
+            self.grammar.add(
+                self.expression_nonterminal(result_type),
+                Nonterminal(type_nonterminal(left)),
+                Terminal(operator),
+                Nonterminal(type_nonterminal(right)),
+            )
+            self.stats.binary_operation_productions += (
+                len(self.grammar.productions) - before
+            )
+
     def add_dynamic_operations(self) -> None:
         if not any(
             production.lhs == DYNAMIC_NONTERMINAL
@@ -4360,6 +5243,25 @@ class GrammarBuilder:
         expression_budget = self.options.max_tokens - (
             2 if self.required_assignment is not None else 0
         )
+        dynamic_spines: list[tuple[str, str, tuple[str, ...], str]] = []
+        if representatives:
+            self.expected_types.add("object")
+            self.add_slice_syntax()
+            self.add_dynamic_composition_operands()
+        for dynamic_type, type_representatives in sorted(
+            self.dynamic_representatives.items()
+        ):
+            if dynamic_type not in {"Any", "Unknown"}:
+                continue
+            for representative in sorted(type_representatives):
+                dynamic_spines.extend(
+                    self.add_dynamic_postfix_compositions(
+                        dynamic_type,
+                        representative,
+                        expression_budget,
+                    )
+                )
+        self.add_dynamic_binary_operations(dynamic_spines)
         for representative in representatives:
             # Dynamic member rows come from an exact completion query in
             # add_members.  For the two syntactic operations that do not have
@@ -4417,6 +5319,210 @@ class GrammarBuilder:
                         self.expression_nonterminal("Unknown"), *rhs
                     )
 
+    def add_dynamic_composition_operands(self) -> None:
+        """Materialize a small finite operand language with no gradual values.
+
+        The language contains canonical literals and statically typed lexical
+        names.  Keeping it finite lets an origin-specific gradual spine
+        compose with an ordinary atom without introducing ``Any op Any`` or
+        recursively importing the complete expression grammar.
+        """
+
+        atom_type = DYNAMIC_COMPOSITION_ATOM_NONTERMINAL.removeprefix("E:")
+        operand_type = DYNAMIC_BINARY_OPERAND_NONTERMINAL.removeprefix("E:")
+        self.internal_expression_types.update({atom_type, operand_type})
+        canonical_atoms: set[tuple[Symbol, ...]] = {
+            (Terminal(token),)
+            for token in (
+                "None",
+                "False",
+                "True",
+                "0",
+                "0.0",
+                "0j",
+                '""',
+                'b""',
+            )
+        }
+        canonical_atoms.update(
+            production.rhs
+            for production in self.grammar.productions
+            if production.lhs.startswith("E:")
+            and production.lhs != DYNAMIC_NONTERMINAL
+            and production.lhs[2:] not in {
+                "Any",
+                "Unknown",
+                *self.internal_expression_types,
+            }
+            and len(production.rhs) == 1
+            and isinstance(production.rhs[0], Terminal)
+            and production.rhs[0].value in self.source_ids
+        )
+        ordered_atoms = sorted(
+            canonical_atoms,
+            key=lambda rhs: tuple(symbol.value for symbol in rhs),
+        )
+        for rhs in ordered_atoms:
+            self.grammar.add(DYNAMIC_COMPOSITION_ATOM_NONTERMINAL, *rhs)
+            self.grammar.add(DYNAMIC_BINARY_OPERAND_NONTERMINAL, *rhs)
+            if rhs in {
+                (Terminal("0"),),
+                (Terminal("0.0"),),
+                (Terminal("0j"),),
+            }:
+                for operator in ("+", "-"):
+                    unary_rhs = (Terminal(operator), *rhs)
+                    self.grammar.add(
+                        DYNAMIC_COMPOSITION_ATOM_NONTERMINAL, *unary_rhs
+                    )
+                    self.grammar.add(
+                        DYNAMIC_BINARY_OPERAND_NONTERMINAL, *unary_rhs
+                    )
+
+    def add_dynamic_postfix_compositions(
+        self,
+        dynamic_type: str,
+        representative: str,
+        expression_budget: int,
+    ) -> list[tuple[str, str, tuple[str, ...], str]]:
+        """Unroll origin-specific index/slice spines to the configured depth."""
+
+        tokens = canonical_expression_tokens(representative)
+        if tokens is None or len(tokens) > expression_budget:
+            return []
+        base_identity = ("dynamic-origin", dynamic_type, representative)
+        base_type = (
+            "__contextual_dynamic_value_"
+            f"{stable_digest(repr(base_identity), 16)}__"
+        )
+        self.internal_expression_types.add(base_type)
+        base = self.expression_nonterminal(base_type)
+        self.grammar.add(base, *(Terminal(token) for token in tokens))
+        result: list[tuple[str, str, tuple[str, ...], str]] = [
+            (dynamic_type, representative, (), base)
+        ]
+        frontier: list[tuple[tuple[str, ...], str]] = [((), base)]
+        token_depth = max(0, (expression_budget - len(tokens)) // 3)
+        maximum_depth = max(
+            0,
+            min(
+                self.options.max_dynamic_composition_depth,
+                token_depth,
+            ),
+        )
+        for _depth in range(1, maximum_depth + 1):
+            next_frontier: list[tuple[tuple[str, ...], str]] = []
+            for path, parent in frontier:
+                for trailer, body in (
+                    (
+                        "index",
+                        (
+                            Terminal("["),
+                            Nonterminal(DYNAMIC_BINARY_OPERAND_NONTERMINAL),
+                            Terminal("]"),
+                        ),
+                    ),
+                    (
+                        "slice",
+                        (
+                            Terminal("["),
+                            Nonterminal(SLICE_NONTERMINAL),
+                            Terminal("]"),
+                        ),
+                    ),
+                ):
+                    child_path = (*path, trailer)
+                    identity = (
+                        "dynamic-postfix",
+                        dynamic_type,
+                        representative,
+                        child_path,
+                    )
+                    child_type = (
+                        "__contextual_dynamic_value_"
+                        f"{stable_digest(repr(identity), 16)}__"
+                    )
+                    self.internal_expression_types.add(child_type)
+                    child = self.expression_nonterminal(child_type)
+                    before = len(self.grammar.productions)
+                    self.grammar.add(child, Nonterminal(parent), *body)
+                    family = self.contextual_dynamic_output_nonterminal(
+                        dynamic_type, identity
+                    )
+                    self.grammar.add(family, Nonterminal(child))
+                    added = len(self.grammar.productions) - before
+                    if trailer == "index":
+                        self.stats.subscript_productions += added
+                    else:
+                        self.stats.slice_productions += added
+                    next_frontier.append((child_path, child))
+                    result.append(
+                        (
+                            dynamic_type,
+                            representative,
+                            child_path,
+                            child,
+                        )
+                    )
+            frontier = next_frontier
+        return result
+
+    def add_dynamic_binary_operations(
+        self,
+        spines: Sequence[tuple[str, str, tuple[str, ...], str]],
+    ) -> None:
+        """Add one arithmetic step tied to each gradual producer and spine.
+
+        Under the pinned checker, ``Any`` and ``Unknown`` support the common
+        arithmetic operators on either side.  Each result retains its exact
+        visible origin and postfix path while the other operand comes from the
+        finite non-gradual language above.  Internal expression types are never
+        rooted or exported as assignability facts; assignment outputs instead
+        pass through their producer-specific contextual family.
+        """
+
+        for dynamic_type, representative, path, value in spines:
+            for operator in BINARY_OPERATOR_SYMBOLS.values():
+                for dynamic_on_left in (True, False):
+                    identity = (
+                        "dynamic-binary",
+                        dynamic_type,
+                        representative,
+                        path,
+                        operator,
+                        dynamic_on_left,
+                    )
+                    result_type = (
+                        "__contextual_dynamic_binary_"
+                        f"{stable_digest(repr(identity), 16)}__"
+                    )
+                    self.internal_expression_types.add(result_type)
+                    result = self.expression_nonterminal(result_type)
+                    left = (
+                        value
+                        if dynamic_on_left
+                        else DYNAMIC_BINARY_OPERAND_NONTERMINAL
+                    )
+                    right = (
+                        DYNAMIC_BINARY_OPERAND_NONTERMINAL
+                        if dynamic_on_left
+                        else value
+                    )
+                    before = len(self.grammar.productions)
+                    self.grammar.add(
+                        result,
+                        Nonterminal(left),
+                        Terminal(operator),
+                        Nonterminal(right),
+                    )
+                    family = self.contextual_dynamic_output_nonterminal(
+                        dynamic_type, identity
+                    )
+                    self.grammar.add(family, Nonterminal(result))
+                    self.stats.binary_operation_productions += (
+                        len(self.grammar.productions) - before
+                    )
+
     def add_redundant_grouping(self) -> None:
         """Permit Python's type-preserving parenthesized expression form."""
 
@@ -4430,8 +5536,28 @@ class GrammarBuilder:
             for production in self.grammar.productions
             if production.lhs.startswith("E:")
             and production.lhs not in dynamic_aliases
+            and production.lhs[2:] not in self.internal_expression_types
         }
         for nonterminal in expression_nonterminals:
+            self.grammar.add(
+                nonterminal,
+                Terminal("("),
+                Nonterminal(nonterminal),
+                Terminal(")"),
+            )
+        # Shared E:Any/E:Unknown grouping remains disabled: it would merge all
+        # gradual producers before later composition.  Group the exact
+        # producer families themselves instead, preserving both provenance and
+        # the surface rule `(e)` for contextual binary/subscript/call results.
+        exact_dynamic_families = {
+            *self.contextual_dynamic_output_families,
+            DYNAMIC_NONTERMINAL,
+            TRUSTED_DYNAMIC_CALL_NONTERMINAL,
+        }
+        productive_lhs = {
+            production.lhs for production in self.grammar.productions
+        }
+        for nonterminal in sorted(exact_dynamic_families & productive_lhs):
             self.grammar.add(
                 nonterminal,
                 Terminal("("),
@@ -4520,7 +5646,7 @@ class GrammarBuilder:
         if not typed_roots:
             return
 
-        # Unit productions between E:/P: layers carry no independently
+        # Unit productions between precedence layers carry no independently
         # testable syntax.  Traverse them until a concrete producer RHS is
         # reached, while breaking the harmless cycles introduced by aliases.
         producer_rhs: set[tuple[Symbol, ...]] = set()
@@ -4535,7 +5661,9 @@ class GrammarBuilder:
                 if (
                     len(production.rhs) == 1
                     and isinstance(production.rhs[0], Nonterminal)
-                    and production.rhs[0].value.startswith(("E:", "P:"))
+                    and production.rhs[0].value.startswith(
+                        ("E:", "S:", "M:", "F:", "W:", "P:")
+                    )
                 ):
                     pending.append(production.rhs[0].value)
                 else:
@@ -4594,6 +5722,51 @@ class GrammarBuilder:
             time.perf_counter() - started
         )
 
+    def add_slice_bound_links(
+        self,
+        public_expression_types: Iterable[str],
+    ) -> None:
+        """Populate slice bounds without importing gradual expression graphs.
+
+        Ordinary statically typed SupportsIndex expressions remain fully
+        compositional.  A source-visible Any/Unknown name is admitted only as
+        its exact lexical token; linking E:Any or E:Unknown would also import
+        every derived contextual family beneath that shared type.
+        """
+
+        if not any(
+            production.lhs == SLICE_NONTERMINAL
+            for production in self.grammar.productions
+        ):
+            return
+        for actual in sorted(public_expression_types):
+            if actual in {"Divergent", "Never", "NoReturn"}:
+                continue
+            if has_gradual_value_branch(actual):
+                continue
+            self.stats.assignability_pairs_checked += 1
+            if is_assignable(actual, "SupportsIndex"):
+                self.grammar.add(
+                    SLICE_BOUND_NONTERMINAL,
+                    Nonterminal(type_nonterminal(actual)),
+                )
+
+        lexical_gradual_representatives: set[str] = set()
+        for representatives in self.dynamic_scope_representatives.values():
+            lexical_gradual_representatives.update(representatives)
+        for representative in sorted(lexical_gradual_representatives):
+            tokens = canonical_expression_tokens(representative)
+            if (
+                tokens is None
+                or len(tokens) != 1
+                or tokens[0] not in self.source_ids
+            ):
+                continue
+            self.grammar.add(
+                SLICE_BOUND_NONTERMINAL,
+                Terminal(tokens[0]),
+            )
+
     def finish(self) -> tuple[Grammar, BuildStats]:
         # Activate only the precomputed compatibility rows whose A: slot is
         # actually referenced by a bounded library or contextual call.  This
@@ -4609,12 +5782,16 @@ class GrammarBuilder:
                 self.stats.library_productions += (
                     len(self.grammar.productions) - before
                 )
-        self.grammar = enforce_postfix_precedence(self.grammar)
+        self.grammar = enforce_expression_precedence(self.grammar)
         expression_types = {
             production.lhs[2:]
             for production in self.grammar.productions
             if production.lhs.startswith("E:")
         }
+        public_expression_types = (
+            expression_types - self.internal_expression_types
+        )
+        self.add_slice_bound_links(public_expression_types)
         cached_actuals_by_expected: dict[str, set[str]] = defaultdict(set)
         for artifact in self.active_library_artifacts:
             if not artifact.local_assignability_complete:
@@ -4626,7 +5803,7 @@ class GrammarBuilder:
         for expected in sorted(self.expected_types):
             argument = argument_nonterminal(expected)
             cached_actuals = cached_actuals_by_expected.get(expected, set())
-            for actual in sorted(expression_types):
+            for actual in sorted(public_expression_types):
                 if actual in cached_actuals:
                     self.stats.assignability_pairs_cached += 1
                     continue
@@ -4635,7 +5812,7 @@ class GrammarBuilder:
                     self.grammar.add(argument, Nonterminal(type_nonterminal(actual)))
         if self.required_assignment is not None:
             shortest = self.shortest_terminal_words()
-            for actual in sorted(expression_types):
+            for actual in sorted(public_expression_types):
                 if actual in {
                     "Any",
                     "Unknown",
@@ -4656,7 +5833,7 @@ class GrammarBuilder:
                     self.stats.derived_representatives += 1
                 else:
                     self.stats.invalid_representatives += 1
-        for actual in expression_types:
+        for actual in public_expression_types:
             expression = type_nonterminal(actual)
             if self.required_assignment is None:
                 self.grammar.add(self.grammar.start, Nonterminal(expression))
@@ -4701,10 +5878,12 @@ class GrammarBuilder:
                                 *(Terminal(token) for token in tokens),
                             )
                     continue
-                representative = self.representatives.get(actual)
-                if representative is not None:
+                assignment_representative = self.representatives.get(actual)
+                if assignment_representative is not None:
                     self.stats.assignment_types_checked += 1
-                    if not self.probe.accepts_assignment(representative):
+                    if not self.probe.accepts_assignment(
+                        assignment_representative
+                    ):
                         self.stats.assignment_types_rejected += 1
                         continue
                 self.grammar.add(
@@ -4715,7 +5894,7 @@ class GrammarBuilder:
                 )
         if self.required_assignment is not None:
             for call_family in sorted(
-                self.contextual_dynamic_call_layouts
+                self.contextual_dynamic_output_families
             ):
                 tokens = shortest.get(call_family)
                 if not tokens:
@@ -4746,7 +5925,7 @@ class GrammarBuilder:
         if self.required_assignment is not None:
             self.refine_output_producer_roots(shortest)
         self.grammar = prune_grammar(self.grammar)
-        self.stats.expression_types = len(expression_types)
+        self.stats.expression_types = len(public_expression_types)
         return self.grammar, self.stats
 
     def build(self) -> tuple[Grammar, BuildStats]:
@@ -4756,14 +5935,17 @@ class GrammarBuilder:
         self.add_members()
         self.add_calls()
         self.add_grounded_generic_calls()
+        self.add_typed_subscripts()
+        self.add_typed_subscript_receiver_closure()
+        self.add_typed_binary_operations()
         self.add_typed_unary_operations()
         self.add_dynamic_operations()
         self.add_redundant_grouping()
         return self.finish()
 
 
-def enforce_postfix_precedence(grammar: Grammar) -> Grammar:
-    """Separate Python primary expressions from prefix-unary expressions.
+def enforce_expression_precedence(grammar: Grammar) -> Grammar:
+    """Lower typed expressions into Python's postfix and arithmetic layers.
 
     The semantic grammar indexes expressions by type, but a single ``E:T``
     symbol is not quite enough to encode Python's precedence.  In particular,
@@ -4772,14 +5954,16 @@ def enforce_postfix_precedence(grammar: Grammar) -> Grammar:
     ``~(0.member)`` because attribute access binds more tightly than unary
     operators, so the derivation can disagree with the expression ty checks.
 
-    ``P:T`` denotes primary/postfix expressions of type T.  Every non-unary
-    ``E:T`` producer moves to ``P:T`` and ``E:T -> P:T`` supplies the ordinary
-    expression view.  A leading expression child of another primary producer
-    is likewise changed from ``E:U`` to ``P:U``; this covers member access,
-    calls, and type-preserving unit aliases without changing argument slots.
-    Prefix unary rules stay in E.  Parentheses have a leading terminal, so
-    their inner E remains unrestricted and explicitly parenthesized unary
-    expressions become safe postfix receivers.
+    ``P:T`` denotes primary/postfix expressions, ``W:T`` power, ``F:T``
+    prefix factor, ``M:T`` multiplicative term, and ``S:T`` additive sum.
+    ``E:T`` is the unrestricted expression view.  Typed binary rows are moved
+    to their Python layer: sums and terms associate left, while power takes a
+    primary on the left and a factor on the right.  Prefix unary rules move to
+    F.  Every remaining E producer moves to P, and a leading expression child
+    of a primary producer becomes P as well.  This covers attributes, calls,
+    subscripts, and type-preserving unit aliases without changing argument
+    slots.  Parentheses begin with a terminal, so their inner E remains
+    unrestricted and explicitly grouped expressions become safe receivers.
 
     Non-expression call-result symbols (notably the trusted dynamic-call
     root) retain their LHS, but their callable receiver is changed to P too.
@@ -4790,8 +5974,85 @@ def enforce_postfix_precedence(grammar: Grammar) -> Grammar:
     rewritten: set[Production] = set()
     expression_aliases: set[str] = set()
     unary_operators = {"+", "-", "~"}
+    sum_operators = {"+", "-"}
+    term_operators = {"*", "/", "//", "%"}
+    power_operators = {"**"}
     for production in grammar.productions:
         rhs = production.rhs
+        if (
+            (
+                production.lhs == DYNAMIC_BINARY_OPERAND_NONTERMINAL
+                or production.lhs.startswith(
+                    "E:__contextual_dynamic_binary_value_"
+                )
+            )
+            and len(rhs) == 1
+            and isinstance(rhs[0], Nonterminal)
+            and rhs[0].value.startswith("E:")
+        ):
+            # This internal symbol is a union of complete expressions.  Keep
+            # the union at every layer; lowering it as an ordinary primary
+            # alias would permit only postfix operands in binary rows.
+            for layer in ("S", "M", "F", "W", "P"):
+                rewritten.add(
+                    Production(
+                        expression_layer_nonterminal(
+                            production.lhs, layer
+                        ),
+                        (
+                            Nonterminal(
+                                expression_layer_nonterminal(
+                                    rhs[0].value, layer
+                                )
+                            ),
+                        ),
+                    )
+                )
+            expression_aliases.add(production.lhs)
+            continue
+        binary_operator = (
+            rhs[1].value
+            if (
+                production.lhs.startswith("E:")
+                and len(rhs) == 3
+                and isinstance(rhs[0], Nonterminal)
+                and rhs[0].value.startswith("E:")
+                and isinstance(rhs[1], Terminal)
+                and rhs[1].value
+                in sum_operators | term_operators | power_operators
+                and isinstance(rhs[2], Nonterminal)
+                and rhs[2].value.startswith("E:")
+            )
+            else None
+        )
+        if binary_operator is not None:
+            left = rhs[0].value
+            right = rhs[2].value
+            if binary_operator in sum_operators:
+                lhs = sum_nonterminal(production.lhs)
+                rewritten_rhs = (
+                    Nonterminal(sum_nonterminal(left)),
+                    rhs[1],
+                    Nonterminal(term_nonterminal(right)),
+                )
+            elif binary_operator in term_operators:
+                lhs = term_nonterminal(production.lhs)
+                rewritten_rhs = (
+                    Nonterminal(term_nonterminal(left)),
+                    rhs[1],
+                    Nonterminal(factor_nonterminal(right)),
+                )
+            else:
+                lhs = power_nonterminal(production.lhs)
+                rewritten_rhs = (
+                    Nonterminal(postfix_nonterminal(left)),
+                    rhs[1],
+                    Nonterminal(factor_nonterminal(right)),
+                )
+            rewritten.add(Production(lhs, rewritten_rhs))
+            expression_aliases.add(production.lhs)
+            continue
+
         prefix_unary = (
             production.lhs.startswith("E:")
             and bool(rhs)
@@ -4799,16 +6060,32 @@ def enforce_postfix_precedence(grammar: Grammar) -> Grammar:
             and rhs[0].value in unary_operators
         )
         if prefix_unary:
-            rewritten.add(production)
+            unary_rhs: tuple[Symbol, ...] = rhs
+            if (
+                len(rhs) >= 2
+                and isinstance(rhs[1], Nonterminal)
+                and rhs[1].value.startswith("E:")
+            ):
+                unary_rhs = (
+                    rhs[0],
+                    Nonterminal(factor_nonterminal(rhs[1].value)),
+                    *rhs[2:],
+                )
+            rewritten.add(
+                Production(
+                    factor_nonterminal(production.lhs), unary_rhs
+                )
+            )
+            expression_aliases.add(production.lhs)
             continue
 
-        rewritten_rhs = rhs
+        primary_rhs: tuple[Symbol, ...] = rhs
         leading_expression_is_postfix = (
             production.lhs.startswith("E:")
             or (
                 len(rhs) >= 2
                 and isinstance(rhs[1], Terminal)
-                and rhs[1].value in {".", "("}
+                and rhs[1].value in {".", "(", "["}
             )
         )
         if (
@@ -4817,22 +6094,46 @@ def enforce_postfix_precedence(grammar: Grammar) -> Grammar:
             and isinstance(rhs[0], Nonterminal)
             and rhs[0].value.startswith("E:")
         ):
-            rewritten_rhs = (
+            primary_rhs = (
                 Nonterminal(postfix_nonterminal(rhs[0].value)),
                 *rhs[1:],
             )
 
         if production.lhs.startswith("E:"):
             postfix_lhs = postfix_nonterminal(production.lhs)
-            rewritten.add(Production(postfix_lhs, rewritten_rhs))
+            rewritten.add(Production(postfix_lhs, primary_rhs))
             expression_aliases.add(production.lhs)
         else:
-            rewritten.add(Production(production.lhs, rewritten_rhs))
+            rewritten.add(Production(production.lhs, primary_rhs))
 
     for expression in expression_aliases:
         rewritten.add(
             Production(
                 expression,
+                (Nonterminal(sum_nonterminal(expression)),),
+            )
+        )
+        rewritten.add(
+            Production(
+                sum_nonterminal(expression),
+                (Nonterminal(term_nonterminal(expression)),),
+            )
+        )
+        rewritten.add(
+            Production(
+                term_nonterminal(expression),
+                (Nonterminal(factor_nonterminal(expression)),),
+            )
+        )
+        rewritten.add(
+            Production(
+                factor_nonterminal(expression),
+                (Nonterminal(power_nonterminal(expression)),),
+            )
+        )
+        rewritten.add(
+            Production(
+                power_nonterminal(expression),
                 (Nonterminal(postfix_nonterminal(expression)),),
             )
         )
@@ -4841,6 +6142,12 @@ def enforce_postfix_precedence(grammar: Grammar) -> Grammar:
         productions=rewritten,
         type_labels=dict(grammar.type_labels),
     )
+
+
+def enforce_postfix_precedence(grammar: Grammar) -> Grammar:
+    """Backward-compatible name for the full expression transformation."""
+
+    return enforce_expression_precedence(grammar)
 
 
 def prune_grammar(grammar: Grammar) -> Grammar:
@@ -5022,7 +6329,7 @@ def binarize_with_units(grammar: Grammar) -> Grammar:
     implementation below.  It is a poor fit for contextual API grammars,
     though: copying every non-unit production to every unit ancestor can turn
     a modest type hierarchy into tens of thousands of Python objects.  The
-    online recognizer and sampler use this representation instead and process
+    online recognizer and DFA index use this representation instead and process
     the unit graph directly.
     """
 
@@ -5115,8 +6422,8 @@ class UnitAwareBinaryGrammar:
     Strongly connected unit components denote the same language, so they are
     represented by one integer.  Unit edges between components remain explicit
     rather than being expanded into copied terminal/binary productions.  A
-    diamond therefore contributes two finite proposal derivations; parse-count
-    correction in ``UniformWordSampler`` removes that ambiguity exactly.
+    diamond therefore remains visible to diagnostic parse counts.  The exact
+    DFA views merge those derivations before counting distinct words.
     """
 
     def __init__(self, grammar: Grammar):
@@ -5162,9 +6469,9 @@ class UnitAwareBinaryGrammar:
                 (root, iter(sorted(unit_children_by_name[root])))
             ]
             while stack:
-                node, children = stack[-1]
+                node, child_iterator = stack[-1]
                 try:
-                    child = next(children)
+                    child = next(child_iterator)
                 except StopIteration:
                     finish_order.append(node)
                     stack.pop()
@@ -5176,8 +6483,8 @@ class UnitAwareBinaryGrammar:
                     )
 
         reverse_edges: list[set[int]] = [set() for _ in names]
-        for parent, children in enumerate(unit_children_by_name):
-            for child in children:
+        for parent, reverse_children in enumerate(unit_children_by_name):
+            for child in reverse_children:
                 reverse_edges[child].add(parent)
         name_component = [-1] * len(names)
         components: list[list[int]] = []
@@ -5231,8 +6538,8 @@ class UnitAwareBinaryGrammar:
             tuple(sorted(children)) for children in unit_children
         )
         unit_parents: list[set[int]] = [set() for _ in components]
-        for parent, children in enumerate(self.unit_children):
-            for child in children:
+        for parent, component_children in enumerate(self.unit_children):
+            for child in component_children:
                 unit_parents[child].add(parent)
         self.unit_parents = tuple(
             tuple(sorted(parents)) for parents in unit_parents
@@ -5240,8 +6547,8 @@ class UnitAwareBinaryGrammar:
         self.start = name_component[name_ids[self.grammar.start]]
 
         indegree = [0] * component_count
-        for children in self.unit_children:
-            for child in children:
+        for component_children in self.unit_children:
+            for child in component_children:
                 indegree[child] += 1
         ready = deque(index for index, degree in enumerate(indegree) if degree == 0)
         topological: list[int] = []
@@ -5496,6 +6803,31 @@ class BoundedLanguage:
             raise EvaluationError("unrank produced the wrong token length")
         return tuple(result)
 
+    def rank(self, tokens: Sequence[str]) -> int:
+        state = self.root(len(tokens))
+        if state == self.EMPTY:
+            raise ValueError("word is outside the bounded DFA")
+        rank = 0
+        for token in tokens:
+            token_id = self.token_ids.get(token)
+            if token_id is None or state == self.FINAL:
+                raise ValueError(f"word is outside the bounded DFA at {token!r}")
+            selected = False
+            for edge, child in self.rows[state]:
+                if edge < token_id:
+                    rank += self.counts[child]
+                elif edge == token_id:
+                    state = child
+                    selected = True
+                    break
+                else:
+                    break
+            if not selected:
+                raise ValueError(f"word is outside the bounded DFA at {token!r}")
+        if state != self.FINAL:
+            raise ValueError("word ended outside the bounded DFA final state")
+        return rank
+
     def sample(self, length: int, random_source: random.Random) -> tuple[str, ...]:
         size = self.language_size(length)
         if size == 0:
@@ -5503,16 +6835,217 @@ class BoundedLanguage:
         return self.unrank(length, random_source.randrange(size))
 
 
-class UniformWordSampler:
-    """Exact distinct-word sampler over an inclusive token-length range.
+class UnitAwareBoundedLanguage(BoundedLanguage):
+    """Exact bounded DAFSAs without materializing the grammar's unit closure."""
 
-    A derivation is first sampled uniformly from all derivations at all
-    permitted lengths using exact inside counts.  If its terminal word has
-    ``d`` parses in the compact unit-aware grammar, it is retained with
-    probability ``1 / d``.  Every
-    distinct word in the union is therefore returned with the same
-    probability, independent of both its length and grammar ambiguity.
-    """
+    def __init__(
+        self,
+        grammar: Grammar | UnitAwareBinaryGrammar,
+        max_length: int,
+        max_states: int,
+    ) -> None:
+        if max_length < 0:
+            raise ValueError("maximum token length must be nonnegative")
+        if max_states < 1:
+            raise ValueError("maximum DFA states must be positive")
+        self.compiled = (
+            grammar
+            if isinstance(grammar, UnitAwareBinaryGrammar)
+            else UnitAwareBinaryGrammar(grammar)
+        )
+        self.grammar = self.compiled.grammar
+        self.max_length = 0
+        self.max_states = max_states
+        terminals = sorted(self.grammar.terminals)
+        self.token_ids = {token: index for index, token in enumerate(terminals)}
+        self.tokens = terminals
+        self.rows: list[tuple[tuple[int, int], ...]] = [()]
+        self.counts: list[int] = [1]
+        self.interned: dict[tuple[tuple[int, int], ...], int] = {
+            (): self.FINAL
+        }
+        self.union_cache: dict[tuple[int, ...], int] = {}
+        self.product_union_cache: dict[tuple[tuple[int, int], ...], int] = {}
+        self.singletons = {
+            token: self._intern(((token_id, self.FINAL),))
+            for token, token_id in self.token_ids.items()
+        }
+        self.component_roots: dict[tuple[int, int], int] = {}
+        self.ensure_length(max_length)
+
+    def _append_length(self) -> None:
+        length = self.max_length + 1
+        base: dict[int, int] = {}
+        if length == 1:
+            for component, terminals in enumerate(self.compiled.terminal_rules):
+                root = self._union(
+                    self.singletons[token] for token in terminals
+                )
+                if root != self.EMPTY:
+                    base[component] = root
+        else:
+            for component, rules in enumerate(self.compiled.binary_rules):
+                products: list[tuple[int, int]] = []
+                for left, right in rules:
+                    for split in range(1, length):
+                        left_root = self.component_roots.get(
+                            (left, split), self.EMPTY
+                        )
+                        right_root = self.component_roots.get(
+                            (right, length - split), self.EMPTY
+                        )
+                        if left_root != self.EMPTY and right_root != self.EMPTY:
+                            products.append((left_root, right_root))
+                root = self._union_products(products)
+                if root != self.EMPTY:
+                    base[component] = root
+        # Unit SCCs are condensed into a DAG by UnitAwareBinaryGrammar.
+        # Unioning child roots in child-before-parent order merges ambiguity
+        # before suffix counts are computed.
+        for component in self.compiled.bottom_up:
+            root = self._union(
+                (
+                    base.get(component, self.EMPTY),
+                    *(
+                        self.component_roots.get((child, length), self.EMPTY)
+                        for child in self.compiled.unit_children[component]
+                    ),
+                )
+            )
+            if root != self.EMPTY:
+                self.component_roots[(component, length)] = root
+        self.max_length = length
+
+    def ensure_length(self, length: int) -> None:
+        if length < 0:
+            raise ValueError("token length must be nonnegative")
+        while self.max_length < length:
+            self._append_length()
+
+    def root(self, length: int) -> int:
+        return self.component_roots.get(
+            (self.compiled.start, length), self.EMPTY
+        )
+
+
+class ShortlexDFAIndex:
+    """Lazy zero-based bijection for a CFG's nonempty global shortlex language."""
+
+    def __init__(
+        self,
+        grammar: Grammar | UnitAwareBinaryGrammar,
+        max_states: int = DEFAULT_MAX_DFA_STATES,
+    ) -> None:
+        self.language = UnitAwareBoundedLanguage(grammar, 0, max_states)
+        self.slice_ends: list[int] = []
+        self.finite_max_length = self._finite_maximum_length()
+
+    def _finite_maximum_length(self) -> int | None:
+        """Return the language's maximum length, or None when it is infinite."""
+
+        compiled = self.language.compiled
+
+        def dependencies(component: int) -> tuple[int, ...]:
+            return (
+                *compiled.unit_children[component],
+                *(
+                    child
+                    for left, right in compiled.binary_rules[component]
+                    for child in (left, right)
+                ),
+            )
+
+        colors = [0] * compiled.component_count
+        postorder: list[int] = []
+        start = compiled.start
+        colors[start] = 1
+        stack: list[tuple[int, Iterator[int]]] = [
+            (start, iter(dependencies(start)))
+        ]
+        while stack:
+            component, children = stack[-1]
+            try:
+                child = next(children)
+            except StopIteration:
+                colors[component] = 2
+                postorder.append(component)
+                stack.pop()
+                continue
+            if colors[child] == 1:
+                return None
+            if colors[child] == 0:
+                colors[child] = 1
+                stack.append((child, iter(dependencies(child))))
+
+        longest = [0] * compiled.component_count
+        for component in postorder:
+            maximum = 1 if compiled.terminal_rules[component] else 0
+            for child in compiled.unit_children[component]:
+                maximum = max(maximum, longest[child])
+            for left, right in compiled.binary_rules[component]:
+                maximum = max(maximum, longest[left] + longest[right])
+            longest[component] = maximum
+        return longest[start]
+
+    @property
+    def indexed_size(self) -> int:
+        return self.slice_ends[-1] if self.slice_ends else 0
+
+    @property
+    def indexed_lengths(self) -> int:
+        return len(self.slice_ends)
+
+    @property
+    def state_count(self) -> int:
+        return len(self.language.rows)
+
+    @property
+    def transition_count(self) -> int:
+        return sum(len(row) for row in self.language.rows)
+
+    def _append_slice(self) -> None:
+        length = self.indexed_lengths + 1
+        self.language.ensure_length(length)
+        self.slice_ends.append(
+            self.indexed_size + self.language.language_size(length)
+        )
+
+    def ensure_rank(self, rank: int) -> None:
+        if rank < 0:
+            raise ValueError(f"rank must be nonnegative: {rank}")
+        while rank >= self.indexed_size:
+            if (
+                self.finite_max_length is not None
+                and self.indexed_lengths >= self.finite_max_length
+            ):
+                raise IndexError(
+                    f"rank {rank} outside finite DFA language of size "
+                    f"{self.indexed_size}"
+                )
+            self._append_slice()
+
+    def unrank(self, rank: int) -> tuple[str, ...]:
+        self.ensure_rank(rank)
+        slice_index = bisect.bisect_right(self.slice_ends, rank)
+        slice_start = self.slice_ends[slice_index - 1] if slice_index else 0
+        return self.language.unrank(slice_index + 1, rank - slice_start)
+
+    def rank(self, tokens: Sequence[str]) -> int:
+        if not tokens:
+            raise ValueError("the global DFA index excludes the empty word")
+        if (
+            self.finite_max_length is not None
+            and len(tokens) > self.finite_max_length
+        ):
+            raise ValueError("word is longer than the finite DFA language")
+        while self.indexed_lengths < len(tokens):
+            self._append_slice()
+        slice_start = self.slice_ends[len(tokens) - 2] if len(tokens) > 1 else 0
+        return slice_start + self.language.rank(tokens)
+
+
+class DerivationCounter:
+    """Exact inside and parse counts used by grammar regression tests."""
 
     def __init__(
         self,
@@ -5545,14 +7078,14 @@ class UniformWordSampler:
 
     def _compute_inside_counts(self) -> None:
         terminals = self.counts[1]
-        for parent, rules in enumerate(self.compiled.terminal_rules):
-            terminals[parent] = len(rules)
+        for parent, terminal_rules in enumerate(self.compiled.terminal_rules):
+            terminals[parent] = len(terminal_rules)
         self._close_unit_counts(terminals)
         for length in range(2, self.maximum_length + 1):
             counts = self.counts[length]
-            for parent, rules in enumerate(self.compiled.binary_rules):
+            for parent, binary_rules in enumerate(self.compiled.binary_rules):
                 count = 0
-                for left, right in rules:
+                for left, right in binary_rules:
                     for split in range(1, length):
                         count += (
                             self.counts[split][left]
@@ -5669,43 +7202,6 @@ class UniformWordSampler:
                 close_units(cell)
         return chart[0][length].get(self.compiled.start, 0)
 
-    def sample(
-        self,
-        random_source: random.Random,
-        *,
-        max_attempts: int,
-    ) -> tuple[tuple[str, ...], int, int]:
-        total = self.derivation_count
-        if total == 0:
-            raise EvaluationError(
-                "grammar has no words at lengths "
-                f"{self.minimum_length} through {self.maximum_length}"
-            )
-        for attempt in range(1, max_attempts + 1):
-            rank = random_source.randrange(total)
-            sampled_length: int | None = None
-            for length, count in self.derivation_counts.items():
-                if rank < count:
-                    sampled_length = length
-                    break
-                rank -= count
-            if sampled_length is None:
-                raise EvaluationError("inside count and length unranking disagree")
-            tokens = self._unrank_derivation(
-                self.compiled.start,
-                sampled_length,
-                rank,
-            )
-            ambiguity = self.parse_count(tokens)
-            if ambiguity <= 0:
-                raise EvaluationError("sampled derivation produced an unrecognized word")
-            if random_source.randrange(ambiguity) == 0:
-                return tokens, ambiguity, attempt
-        raise LanguageTooLarge(
-            f"uniform rejection sampler accepted no word in {max_attempts:,} attempts"
-        )
-
-
 def recognizes(
     grammar: Grammar | UnitAwareBinaryGrammar,
     tokens: Sequence[str],
@@ -5731,27 +7227,8 @@ def render_tokens(tokens: Sequence[str], occupied: frozenset[str]) -> str:
     return " ".join(instantiate_tokens(tokens, occupied))
 
 
-def compact_cardinality(value: int) -> str:
-    text = str(value)
-    if len(text) <= 12:
-        return text
-    return f"{text[0]}.{text[1:4]}e{len(text) - 1}"
-
-
-def sampling_length_bounds(original_length: int) -> tuple[int, int]:
-    if original_length < 1:
-        raise ValueError("statement token length must be positive")
-    return max(1, original_length - 2), original_length + 2
-
-
 def maximum_call_arity(maximum_tokens: int, *, assignment: bool) -> int:
-    """Exact upper bound on arguments in a word of ``maximum_tokens``.
-
-    A shortest nonempty call with ``r`` arguments uses ``2r + 2`` tokens
-    (callee, parentheses, arguments, and commas).  A live output assignment
-    consumes two additional root tokens.  Keyword arguments only cost more,
-    so this remains a safe bound for every layout.
-    """
+    """Upper-bound call arity within a fixed grammar-construction budget."""
 
     root_tokens = 2 if assignment else 0
     expression_tokens = maximum_tokens - root_tokens
@@ -5767,7 +7244,6 @@ class RunningMetrics:
     precision_checked: int = 0
     precision_requested: int = 0
     sampleable_statements: int = 0
-    empty_slices: int = 0
     sampler_failures: int = 0
     total_cfg_intersection_seconds: float = 0.0
     failure_reasons: Counter[str] = field(default_factory=Counter)
@@ -5796,6 +7272,76 @@ class RunningMetrics:
         if not self.evaluated:
             return math.nan
         return self.total_cfg_intersection_seconds / self.evaluated
+
+
+def copy_running_metrics(metrics: RunningMetrics) -> RunningMetrics:
+    """Return an independent checkpoint of all per-run evaluator metrics."""
+
+    return replace(
+        metrics,
+        failure_reasons=metrics.failure_reasons.copy(),
+        diagnostic_codes=metrics.diagnostic_codes.copy(),
+        sampled_lengths=metrics.sampled_lengths.copy(),
+        sampled_length_offsets=metrics.sampled_length_offsets.copy(),
+    )
+
+
+def commit_running_metrics(
+    destination: RunningMetrics,
+    source: RunningMetrics,
+) -> None:
+    """Commit one transactional statement attempt without changing identity."""
+
+    destination.files_evaluated = source.files_evaluated
+    destination.evaluated = source.evaluated
+    destination.recognized = source.recognized
+    destination.precision_accepted = source.precision_accepted
+    destination.precision_checked = source.precision_checked
+    destination.precision_requested = source.precision_requested
+    destination.sampleable_statements = source.sampleable_statements
+    destination.sampler_failures = source.sampler_failures
+    destination.total_cfg_intersection_seconds = (
+        source.total_cfg_intersection_seconds
+    )
+    destination.failure_reasons.clear()
+    destination.failure_reasons.update(source.failure_reasons)
+    destination.diagnostic_codes.clear()
+    destination.diagnostic_codes.update(source.diagnostic_codes)
+    destination.sampled_lengths.clear()
+    destination.sampled_lengths.update(source.sampled_lengths)
+    destination.sampled_length_offsets.clear()
+    destination.sampled_length_offsets.update(source.sampled_length_offsets)
+
+
+def retry_ty_transport_once(
+    semantics: TyLspClient,
+    metrics: RunningMetrics,
+    funnel: dict[str, int],
+    evaluate_once: Callable[[RunningMetrics, dict[str, int]], None],
+) -> TyTransportError | None:
+    """Retry once, returning a terminal transport error after recovery."""
+
+    metrics_checkpoint = copy_running_metrics(metrics)
+    funnel_checkpoint = funnel.copy()
+    restarted = False
+    for attempt in range(2):
+        try:
+            evaluate_once(metrics, funnel)
+        except TyTransportError as error:
+            commit_running_metrics(metrics, metrics_checkpoint)
+            funnel.clear()
+            funnel.update(funnel_checkpoint)
+            semantics.restart()
+            if attempt == 0:
+                restarted = True
+                continue
+            return error
+        if restarted:
+            funnel["ty_transport_restarts"] = (
+                funnel.get("ty_transport_restarts", 0) + 1
+            )
+        return None
+    raise AssertionError("transport retry loop did not return or raise")
 
 
 def percentage(value: float) -> str:
@@ -5881,9 +7427,11 @@ def diagnostic_identifier(
     end_line = end.get("line")
     start_offset = start.get("character")
     end_offset = end.get("character")
-    if not all(
-        isinstance(value, int)
-        for value in (start_line, end_line, start_offset, end_offset)
+    if not (
+        isinstance(start_line, int)
+        and isinstance(end_line, int)
+        and isinstance(start_offset, int)
+        and isinstance(end_offset, int)
     ):
         return None
     if start_line != end_line:
@@ -5930,15 +7478,17 @@ def diagnostic_range(
     end = value.get("end")
     if not isinstance(start, dict) or not isinstance(end, dict):
         return None
-    coordinates = (
-        start.get("line"),
-        start.get("character"),
-        end.get("line"),
-        end.get("character"),
-    )
-    if not all(isinstance(item, int) for item in coordinates):
+    start_line = start.get("line")
+    start_character = start.get("character")
+    end_line = end.get("line")
+    end_character = end.get("character")
+    if not (
+        isinstance(start_line, int)
+        and isinstance(start_character, int)
+        and isinstance(end_line, int)
+        and isinstance(end_character, int)
+    ):
         return None
-    start_line, start_character, end_line, end_character = coordinates
     return start_line, start_character, end_line, end_character
 
 
@@ -6151,7 +7701,8 @@ class EvaluationOptions:
     ty: str
     allow_ignores: bool
     builder: BuilderOptions
-    max_rejection_attempts: int
+    max_dfa_states: int
+    statement_timeout: float
     json_lines: bool
     show_samples: bool
     library_directory: Path = DEFAULT_LIBRARY_DIRECTORY
@@ -6169,6 +7720,7 @@ def emit_record(record: Mapping[str, object], *, json_lines: bool) -> None:
     seconds = record["seconds"]
     cfg_intersection_seconds = record["cfg_intersection_seconds"]
     original_statement = record["original_statement"]
+    sampled_ranks = record["sampled_ranks"]
     sampled_words = record["sampled_words"]
     if not isinstance(sample_checked, int) or not isinstance(sample_accepted, int):
         raise EvaluationError("sample counts must be integers")
@@ -6177,6 +7729,8 @@ def emit_record(record: Mapping[str, object], *, json_lines: bool) -> None:
         or not isinstance(seconds, (int, float))
         or not isinstance(cfg_intersection_seconds, (int, float))
         or not isinstance(original_statement, str)
+        or not isinstance(sampled_ranks, list)
+        or not all(isinstance(rank, int) for rank in sampled_ranks)
         or not isinstance(sampled_words, list)
         or not all(isinstance(word, str) for word in sampled_words)
     ):
@@ -6195,8 +7749,9 @@ def emit_record(record: Mapping[str, object], *, json_lines: bool) -> None:
         f"|G|={record['grammar_symbols']} "
         f"assignability={record['assignability_pairs_cached']}cached/"
         f"{record['assignability_pairs_checked']}checked "
-        f"D[{record['sample_min_tokens']}..{record['sample_max_tokens']}]="
-        f"{record['derivation_count']} "
+        f"DFA[0..{record['sample_rank_limit']})="
+        f"{record['dfa_indexed_words']}words/"
+        f"{record['dfa_states']}states "
         f"cfg+intersection={cfg_intersection_seconds:.3f}s "
         f"total={seconds:.3f}s",
         flush=True,
@@ -6204,13 +7759,126 @@ def emit_record(record: Mapping[str, object], *, json_lines: bool) -> None:
     print(f"  original: {original_statement}", flush=True)
     if sampled_words:
         print("  sampled:", flush=True)
-        for sample_index, word in enumerate(sampled_words[:3], start=1):
-            print(f"    {sample_index}. {word}", flush=True)
+        for sample_index, (rank, word) in enumerate(
+            zip(sampled_ranks[:3], sampled_words[:3]), start=1
+        ):
+            print(f"    {sample_index}. rank {rank}: {word}", flush=True)
     else:
         print("  sampled: <none>", flush=True)
 
 
-def evaluate_prepared_statement(
+def statement_common_record(
+    metrics: RunningMetrics,
+    dataset_source: DatasetSource,
+    file_index: int,
+    statement_index: int,
+    candidate_index: int,
+    prepared: PreparedTarget,
+    truth: Sequence[str],
+) -> dict[str, object]:
+    """Return metadata shared by every terminal statement record."""
+
+    selected = prepared.target
+    inference_matches: bool | None = None
+    if (
+        prepared.required_assignment is not None
+        and selected.assigned_name is not None
+    ):
+        inference_matches = prepared.required_assignment == selected.assigned_name
+    return {
+        "event": "statement",
+        "dataset": dataset_source.dataset,
+        "split": dataset_source.split,
+        "problem_id": dataset_source.problem_id,
+        "solution_index": dataset_source.solution_index,
+        "difficulty": dataset_source.difficulty,
+        "url": dataset_source.url,
+        "index": metrics.evaluated,
+        "file_index": file_index,
+        "statement_index": statement_index,
+        "candidate_index": candidate_index,
+        "member": dataset_source.member,
+        "line": selected.node.lineno,
+        "column": selected.node.col_offset,
+        "kind": selected.kind,
+        "assigned_name": selected.assigned_name,
+        "required_assignment": prepared.required_assignment,
+        "assignment_inference_matches": inference_matches,
+        "tokens": len(truth),
+        "original_statement": selected.text,
+        "ground_truth": list(truth),
+    }
+
+
+def failed_statement_fields(
+    metrics: RunningMetrics,
+    *,
+    sample_quota: int,
+    sample_tokens: int,
+    builder_max_tokens: int,
+    message: str,
+    elapsed: float,
+) -> dict[str, object]:
+    """Return the schema-complete zero-sample fields for a terminal failure."""
+
+    return {
+        "recognized": False,
+        "running_recall": percentage(metrics.recall),
+        "sample_accepted": 0,
+        "sample_checked": 0,
+        "sample_requested": sample_quota,
+        "sampled_ranks": [],
+        "sampled_words": [],
+        "sample_failures": [],
+        "running_precision": percentage(metrics.precision),
+        "running_precision_coverage": percentage(metrics.precision_coverage),
+        "sample_tokens": sample_tokens,
+        "sample_rank_limit": SAMPLE_RANK_LIMIT,
+        "builder_max_tokens": builder_max_tokens,
+        "dfa_indexed_words": 0,
+        "dfa_indexed_lengths": 0,
+        "dfa_states": 0,
+        "dfa_transitions": 0,
+        "productions": 0,
+        "nonterminals": 0,
+        "terminals": 0,
+        "grammar_symbols": 0,
+        "sampler_error": message,
+        "scope_names": 0,
+        "expression_types": 0,
+        "callables": 0,
+        "signatures": 0,
+        "receiver_types": 0,
+        "member_completions": 0,
+        "incomplete_completion_queries": 0,
+        "completion_queries_at_cap": 0,
+        "dynamic_types": 0,
+        "assignment_types_checked": 0,
+        "assignment_types_rejected": 0,
+        "output_producer_families": 0,
+        "output_producers_checked": 0,
+        "output_producers_rejected": 0,
+        "output_producers_local_fallback": 0,
+        "output_producers_unchecked": 0,
+        "output_producer_validation_seconds": 0.0,
+        "module_member_fallbacks": 0,
+        "derived_representatives": 0,
+        "invalid_representatives": 0,
+        "library_artifacts": 0,
+        "library_productions": 0,
+        "library_live_fallbacks": 0,
+        "library_incomplete_artifacts": 0,
+        "assignability_pairs_cached": 0,
+        "assignability_pairs_checked": 0,
+        "binary_operation_productions": 0,
+        "subscript_productions": 0,
+        "slice_productions": 0,
+        "cfg_intersection_seconds": elapsed,
+        "seconds": elapsed,
+    }
+
+
+def _evaluate_prepared_statement_once(
     options: EvaluationOptions,
     sample_quota: int,
     metrics: RunningMetrics,
@@ -6229,7 +7897,15 @@ def evaluate_prepared_statement(
     started = time.perf_counter()
     truth = canonical_tokens(selected)
     sample_tokens = len(truth)
-    sample_min_tokens, sample_max_tokens = sampling_length_bounds(sample_tokens)
+    builder_max_tokens = sample_tokens + 2
+    builder_options = replace(
+        options.builder,
+        max_call_arity=maximum_call_arity(
+            builder_max_tokens,
+            assignment=prepared.required_assignment is not None,
+        ),
+        max_tokens=builder_max_tokens,
+    )
     target_identity = (
         f"{member_name}\0{selected.node.lineno}\0{selected.node.col_offset}"
         f"\0{selected.node.end_lineno}\0{selected.node.end_col_offset}"
@@ -6240,37 +7916,15 @@ def evaluate_prepared_statement(
     semantics.open(semantic_uri, prepared.semantic_source)
 
     def common_record() -> dict[str, object]:
-        inference_matches: bool | None = None
-        if (
-            prepared.required_assignment is not None
-            and selected.assigned_name is not None
-        ):
-            inference_matches = (
-                prepared.required_assignment == selected.assigned_name
-            )
-        return {
-            "event": "statement",
-            "dataset": dataset_source.dataset,
-            "split": dataset_source.split,
-            "problem_id": dataset_source.problem_id,
-            "solution_index": dataset_source.solution_index,
-            "difficulty": dataset_source.difficulty,
-            "url": dataset_source.url,
-            "index": metrics.evaluated,
-            "file_index": file_index,
-            "statement_index": statement_index,
-            "candidate_index": candidate_index,
-            "member": member_name,
-            "line": selected.node.lineno,
-            "column": selected.node.col_offset,
-            "kind": selected.kind,
-            "assigned_name": selected.assigned_name,
-            "required_assignment": prepared.required_assignment,
-            "assignment_inference_matches": inference_matches,
-            "tokens": len(truth),
-            "original_statement": selected.text,
-            "ground_truth": list(truth),
-        }
+        return statement_common_record(
+            metrics,
+            dataset_source,
+            file_index,
+            statement_index,
+            candidate_index,
+            prepared,
+            truth,
+        )
 
     def emit_construction_failure(message: str) -> None:
         metrics.evaluated += 1
@@ -6280,56 +7934,14 @@ def evaluate_prepared_statement(
         metrics.total_cfg_intersection_seconds += elapsed
         record = common_record()
         record.update(
-            {
-                "recognized": False,
-                "running_recall": percentage(metrics.recall),
-                "sample_accepted": 0,
-                "sample_checked": 0,
-                "sample_requested": sample_quota,
-                "sampled_words": [],
-                "sample_failures": [],
-                "running_precision": percentage(metrics.precision),
-                "running_precision_coverage": percentage(metrics.precision_coverage),
-                "sample_tokens": sample_tokens,
-                "sample_min_tokens": sample_min_tokens,
-                "sample_max_tokens": sample_max_tokens,
-                "derivation_count": "0",
-                "sampled_ambiguity": "0",
-                "rejection_attempts": 0,
-                "productions": 0,
-                "nonterminals": 0,
-                "terminals": 0,
-                "grammar_symbols": 0,
-                "sampler_error": message,
-                "scope_names": 0,
-                "expression_types": 0,
-                "callables": 0,
-                "signatures": 0,
-                "receiver_types": 0,
-                "member_completions": 0,
-                "incomplete_completion_queries": 0,
-                "completion_queries_at_cap": 0,
-                "dynamic_types": 0,
-                "assignment_types_checked": 0,
-                "assignment_types_rejected": 0,
-                "output_producer_families": 0,
-                "output_producers_checked": 0,
-                "output_producers_rejected": 0,
-                "output_producers_local_fallback": 0,
-                "output_producers_unchecked": 0,
-                "output_producer_validation_seconds": 0.0,
-                "module_member_fallbacks": 0,
-                "derived_representatives": 0,
-                "invalid_representatives": 0,
-                "library_artifacts": 0,
-                "library_productions": 0,
-                "library_live_fallbacks": 0,
-                "library_incomplete_artifacts": 0,
-                "assignability_pairs_cached": 0,
-                "assignability_pairs_checked": 0,
-                "cfg_intersection_seconds": elapsed,
-                "seconds": elapsed,
-            }
+            failed_statement_fields(
+                metrics,
+                sample_quota=sample_quota,
+                sample_tokens=sample_tokens,
+                builder_max_tokens=builder_options.max_tokens,
+                message=message,
+                elapsed=elapsed,
+            )
         )
         emit_record(record, json_lines=options.json_lines)
 
@@ -6349,14 +7961,6 @@ def evaluate_prepared_statement(
         excluded_names=prepared.excluded_names,
     )
     ablated_ids = source_identifiers(prepared.ablated)
-    builder_options = replace(
-        options.builder,
-        max_call_arity=maximum_call_arity(
-            sample_max_tokens,
-            assignment=prepared.required_assignment is not None,
-        ),
-        max_tokens=sample_max_tokens,
-    )
     library_artifacts: list[LibraryArtifact] = []
     for module in visible_imported_library_modules(
         prepared.ablated, selected.hole.line
@@ -6384,6 +7988,8 @@ def evaluate_prepared_statement(
     )
     try:
         grammar, build_stats = builder.build()
+    except TyTransportError:
+        raise
     except EvaluationError as error:
         funnel["grammar_failures"] += 1
         if not options.json_lines:
@@ -6401,92 +8007,85 @@ def evaluate_prepared_statement(
     recognized = compiled_grammar.recognizes(truth)
     sample_accepted = 0
     sample_checked = 0
-    derivation_count = 0
-    rejection_attempts = 0
-    sampled_ambiguity = 0
+    sampled_ranks: list[int] = []
     sampled_words: list[str] = []
     sample_failures: list[dict[str, object]] = []
-    rejected_samples_printed = 0
     sampler_error: str | None = None
     intersection_seconds: float | None = None
+    dfa_index: ShortlexDFAIndex | None = None
     random_source = random.Random(
         int(stable_digest(f"{options.seed}\0{target_identity}", 16), 16)
     )
     try:
-        sampler = UniformWordSampler(
+        sampled_ranks = [
+            random_source.randrange(SAMPLE_RANK_LIMIT)
+            for _ in range(max(sample_quota, 1))
+        ]
+        dfa_index = ShortlexDFAIndex(
             compiled_grammar,
-            sample_min_tokens,
-            sample_max_tokens,
+            max_states=options.max_dfa_states,
         )
-        derivation_count = sampler.derivation_count
+        # Sampling is defined over the complete fixed rank domain, not merely
+        # the ranks we happened to draw for this statement.  Requiring its last
+        # rank makes eligibility independent of the seed and sample quota.
+        dfa_index.ensure_rank(SAMPLE_RANK_LIMIT - 1)
         intersection_seconds = time.perf_counter() - intersection_started
-        if derivation_count:
-            metrics.sampleable_statements += 1
-            occupied = ablated_ids
-            for sample_index in range(max(sample_quota, 3)):
-                sampled, ambiguity, attempts = sampler.sample(
-                    random_source,
-                    max_attempts=options.max_rejection_attempts,
+        metrics.sampleable_statements += 1
+        occupied = ablated_ids
+        for sample_index, rank in enumerate(sampled_ranks):
+            sampled = dfa_index.unrank(rank)
+            statement = render_tokens(sampled, occupied)
+            if len(sampled_words) < 3:
+                sampled_words.append(statement)
+            if sample_index >= sample_quota:
+                continue
+            sample_checked += 1
+            diagnostics = error_diagnostics(probe.diagnostics(statement))
+            if not diagnostics:
+                sample_accepted += 1
+            metrics.sampled_lengths[len(sampled)] += 1
+            metrics.sampled_length_offsets[len(sampled) - sample_tokens] += 1
+            if diagnostics:
+                reason, local_codes, downstream_codes = classify_sample_failure(
+                    selected.kind,
+                    selected.hole,
+                    statement,
+                    diagnostics,
+                    semantics.position_encoding,
                 )
-                sampled_ambiguity += ambiguity
-                rejection_attempts += attempts
-                statement = render_tokens(sampled, occupied)
-                if len(sampled_words) < 3:
-                    sampled_words.append(statement)
-                if sample_index >= sample_quota:
-                    continue
-                sample_checked += 1
-                diagnostics = error_diagnostics(probe.diagnostics(statement))
-                if not diagnostics:
-                    sample_accepted += 1
-                metrics.sampled_lengths[len(sampled)] += 1
-                metrics.sampled_length_offsets[len(sampled) - sample_tokens] += 1
-                if diagnostics:
-                    reason, local_codes, downstream_codes = classify_sample_failure(
-                        selected.kind,
-                        selected.hole,
-                        statement,
-                        diagnostics,
-                        semantics.position_encoding,
-                    )
-                    metrics.failure_reasons[reason] += 1
-                    codes = {
-                        diagnostic_code(item) or "unknown"
-                        for item in diagnostics
+                metrics.failure_reasons[reason] += 1
+                codes = {
+                    diagnostic_code(item) or "unknown"
+                    for item in diagnostics
+                }
+                metrics.diagnostic_codes.update(codes)
+                sample_failures.append(
+                    {
+                        "ordinal": metrics.precision_checked + sample_checked,
+                        "sample_index": sample_index + 1,
+                        "rank0": rank,
+                        "canonical_tokens": list(sampled),
+                        "statement": statement,
+                        "tokens": len(sampled),
+                        "reason": reason,
+                        "local_codes": list(local_codes),
+                        "downstream_codes": list(downstream_codes),
+                        "diagnostics": [
+                            simplified_diagnostic(item)
+                            for item in sorted(
+                                diagnostics,
+                                key=lambda diagnostic: (
+                                    diagnostic_range(diagnostic)
+                                    or (-1, -1, -1, -1),
+                                    diagnostic_code(diagnostic) or "unknown",
+                                ),
+                            )
+                        ],
                     }
-                    metrics.diagnostic_codes.update(codes)
-                    sample_failures.append(
-                        {
-                            "ordinal": metrics.precision_checked + sample_checked,
-                            "sample_index": sample_index + 1,
-                            "canonical_tokens": list(sampled),
-                            "statement": statement,
-                            "tokens": len(sampled),
-                            "ambiguity": compact_cardinality(ambiguity),
-                            "attempts": attempts,
-                            "reason": reason,
-                            "local_codes": list(local_codes),
-                            "downstream_codes": list(downstream_codes),
-                            "diagnostics": [
-                                simplified_diagnostic(item)
-                                for item in sorted(
-                                    diagnostics,
-                                    key=lambda diagnostic: (
-                                        diagnostic_range(diagnostic)
-                                        or (-1, -1, -1, -1),
-                                        diagnostic_code(diagnostic) or "unknown",
-                                    ),
-                                )
-                            ],
-                        }
-                    )
-        else:
-            sampler_error = (
-                "grammar has no words at lengths "
-                f"{sample_min_tokens} through {sample_max_tokens}"
-            )
-            metrics.empty_slices += 1
-    except (LanguageTooLarge, EvaluationError) as error:
+                )
+    except TyTransportError:
+        raise
+    except (LanguageTooLarge, EvaluationError, IndexError) as error:
         if intersection_seconds is None:
             intersection_seconds = time.perf_counter() - intersection_started
         sampler_error = str(error)
@@ -6511,16 +8110,24 @@ def evaluate_prepared_statement(
             "sample_accepted": sample_accepted,
             "sample_checked": sample_checked,
             "sample_requested": sample_quota,
+            "sampled_ranks": sampled_ranks,
             "sampled_words": sampled_words,
             "sample_failures": sample_failures,
             "running_precision": percentage(metrics.precision),
             "running_precision_coverage": percentage(metrics.precision_coverage),
             "sample_tokens": sample_tokens,
-            "sample_min_tokens": sample_min_tokens,
-            "sample_max_tokens": sample_max_tokens,
-            "derivation_count": compact_cardinality(derivation_count),
-            "sampled_ambiguity": compact_cardinality(sampled_ambiguity),
-            "rejection_attempts": rejection_attempts,
+            "sample_rank_limit": SAMPLE_RANK_LIMIT,
+            "builder_max_tokens": builder_options.max_tokens,
+            "dfa_indexed_words": (
+                0 if dfa_index is None else dfa_index.indexed_size
+            ),
+            "dfa_indexed_lengths": (
+                0 if dfa_index is None else dfa_index.indexed_lengths
+            ),
+            "dfa_states": 0 if dfa_index is None else dfa_index.state_count,
+            "dfa_transitions": (
+                0 if dfa_index is None else dfa_index.transition_count
+            ),
             "productions": len(grammar.productions),
             "nonterminals": len(grammar.nonterminals),
             "terminals": len(grammar.terminals),
@@ -6556,11 +8163,146 @@ def evaluate_prepared_statement(
             "library_incomplete_artifacts": build_stats.library_incomplete_artifacts,
             "assignability_pairs_cached": build_stats.assignability_pairs_cached,
             "assignability_pairs_checked": build_stats.assignability_pairs_checked,
+            "binary_operation_productions": (
+                build_stats.binary_operation_productions
+            ),
+            "subscript_productions": build_stats.subscript_productions,
+            "slice_productions": build_stats.slice_productions,
             "cfg_intersection_seconds": cfg_intersection_seconds,
             "seconds": elapsed,
         }
     )
     emit_record(record, json_lines=options.json_lines)
+
+
+def emit_terminal_statement_failure_record(
+    options: EvaluationOptions,
+    sample_quota: int,
+    metrics: RunningMetrics,
+    funnel: dict[str, int],
+    dataset_source: DatasetSource,
+    file_index: int,
+    statement_index: int,
+    candidate_index: int,
+    prepared: PreparedTarget,
+    message: str,
+    funnel_key: str,
+    started: float,
+) -> None:
+    """Record one schema-complete, denominator-bearing target failure."""
+
+    truth = canonical_tokens(prepared.target)
+    sample_tokens = len(truth)
+    metrics.evaluated += 1
+    metrics.precision_requested += sample_quota
+    funnel["evaluated_statements"] = funnel.get("evaluated_statements", 0) + 1
+    funnel[funnel_key] = funnel.get(funnel_key, 0) + 1
+    elapsed = time.perf_counter() - started
+    metrics.total_cfg_intersection_seconds += elapsed
+    record = statement_common_record(
+        metrics,
+        dataset_source,
+        file_index,
+        statement_index,
+        candidate_index,
+        prepared,
+        truth,
+    )
+    record.update(
+        failed_statement_fields(
+            metrics,
+            sample_quota=sample_quota,
+            sample_tokens=sample_tokens,
+            builder_max_tokens=sample_tokens + 2,
+            message=message,
+            elapsed=elapsed,
+        )
+    )
+    emit_record(record, json_lines=options.json_lines)
+
+
+def evaluate_prepared_statement(
+    options: EvaluationOptions,
+    sample_quota: int,
+    metrics: RunningMetrics,
+    funnel: dict[str, int],
+    semantics: TyLspClient,
+    workspace: Path,
+    dataset_source: DatasetSource,
+    file_index: int,
+    statement_index: int,
+    candidate_index: int,
+    prepared: PreparedTarget,
+    library_catalog: LibraryCatalog,
+) -> None:
+    """Evaluate one target, recovering once from a lost semantics transport."""
+
+    started = time.perf_counter()
+    metrics_checkpoint = copy_running_metrics(metrics)
+    funnel_checkpoint = funnel.copy()
+
+    def evaluate_once(
+        attempt_metrics: RunningMetrics,
+        attempt_funnel: dict[str, int],
+    ) -> None:
+        _evaluate_prepared_statement_once(
+            options,
+            sample_quota,
+            attempt_metrics,
+            attempt_funnel,
+            semantics,
+            workspace,
+            dataset_source,
+            file_index,
+            statement_index,
+            candidate_index,
+            prepared,
+            library_catalog,
+        )
+
+    try:
+        with statement_deadline(options.statement_timeout):
+            transport_error = retry_ty_transport_once(
+                semantics,
+                metrics,
+                funnel,
+                evaluate_once,
+            )
+    except StatementTimeout as error:
+        commit_running_metrics(metrics, metrics_checkpoint)
+        funnel.clear()
+        funnel.update(funnel_checkpoint)
+        semantics.restart()
+        emit_terminal_statement_failure_record(
+            options,
+            sample_quota,
+            metrics,
+            funnel,
+            dataset_source,
+            file_index,
+            statement_index,
+            candidate_index,
+            prepared,
+            str(error),
+            "statement_timeouts",
+            started,
+        )
+        return
+    if transport_error is not None:
+        emit_terminal_statement_failure_record(
+            options,
+            sample_quota,
+            metrics,
+            funnel,
+            dataset_source,
+            file_index,
+            statement_index,
+            candidate_index,
+            prepared,
+            f"ty transport failed after retry: {transport_error}",
+            "ty_transport_failures",
+            started,
+        )
 
 
 def evaluate(options: EvaluationOptions) -> int:
@@ -6607,7 +8349,8 @@ def evaluate(options: EvaluationOptions) -> int:
                     "source_bytes": source_stat.st_size,
                     "source_mtime_ns": source_stat.st_mtime_ns,
                     "files": options.files,
-                    "sample_lengths": "max(1, ground_truth_tokens-2)..ground_truth_tokens+2",
+                    "sample_rank_interval": f"[0, {SAMPLE_RANK_LIMIT})",
+                    "sample_order": "global token shortlex DFA bijection",
                     "precision_samples": options.precision_samples,
                     "max_samples": options.max_samples,
                     "shard_count": options.shard_count,
@@ -6617,9 +8360,16 @@ def evaluate(options: EvaluationOptions) -> int:
                     "platform": platform.platform(),
                     "library_directory": str(options.library_directory),
                     "allow_ignores": options.allow_ignores,
-                    "max_rejection_attempts": options.max_rejection_attempts,
+                    "max_dfa_states": options.max_dfa_states,
+                    "statement_timeout": options.statement_timeout,
+                    "surface_fragment": surface_fragment_metadata(),
                     "builder": {
-                        "max_call_arity": "floor((sample_max_tokens-root_tokens-2)/2)",
+                        "max_call_arity": (
+                            "floor((ground_truth_tokens-root_tokens)/2)"
+                        ),
+                        "max_dynamic_composition_depth": (
+                            options.builder.max_dynamic_composition_depth
+                        ),
                         "max_tokens": "ground_truth_tokens+2",
                         "max_layouts_per_signature": options.builder.max_layouts_per_signature,
                         "member_depth": options.builder.member_depth,
@@ -6640,9 +8390,10 @@ def evaluate(options: EvaluationOptions) -> int:
             f"source={source_path}; target_files={options.files}; "
             f"precision_samples={options.precision_samples}; "
             f"max_samples={options.max_samples or 'unlimited'}; "
+            f"statement_timeout={options.statement_timeout:g}s; "
             f"shard={options.shard_index}/{options.shard_count}; "
             "targets=all eligible statements; "
-            "uniform_slice=union of lengths max(1, k-2)..k+2",
+            f"sample_ranks=uniform [0, {SAMPLE_RANK_LIMIT}) via global shortlex DFA",
             flush=True,
         )
 
@@ -6790,7 +8541,6 @@ def evaluate(options: EvaluationOptions) -> int:
         "precision": percentage(metrics.precision),
         "precision_coverage": percentage(metrics.precision_coverage),
         "sampleable_statements": metrics.sampleable_statements,
-        "empty_slices": metrics.empty_slices,
         "sampler_failures": metrics.sampler_failures,
         "failure_reasons": dict(sorted(metrics.failure_reasons.items())),
         "diagnostic_codes": dict(sorted(metrics.diagnostic_codes.items())),
@@ -6832,6 +8582,519 @@ def evaluate(options: EvaluationOptions) -> int:
 
 
 def run_self_tests() -> None:
+    assert compact_cardinality(0) == "0"
+    assert compact_cardinality(123_456) == "123456"
+    assert "e+" in compact_cardinality(1 << 20_000)
+    assert maximum_call_arity(3, assignment=False) == 0
+    assert maximum_call_arity(4, assignment=False) == 1
+
+    if hasattr(signal, "SIGALRM"):
+        class OuterFixtureTimeout(Exception):
+            pass
+
+        original_alarm_handler = signal.getsignal(signal.SIGALRM)
+        with wall_deadline(
+            0.20,
+            lambda: OuterFixtureTimeout("outer fixture deadline"),
+        ):
+            outer_before = signal.getitimer(signal.ITIMER_REAL)[0]
+            with statement_deadline(0.08):
+                time.sleep(0.01)
+            outer_after = signal.getitimer(signal.ITIMER_REAL)[0]
+            assert 0 < outer_after < outer_before
+        assert signal.getsignal(signal.SIGALRM) == original_alarm_handler
+        assert signal.getitimer(signal.ITIMER_REAL)[0] == 0
+
+        try:
+            with wall_deadline(
+                0.04,
+                lambda: OuterFixtureTimeout("outer fixture deadline"),
+            ):
+                with statement_deadline(0.20):
+                    time.sleep(0.08)
+        except OuterFixtureTimeout:
+            pass
+        else:
+            raise AssertionError("a nested deadline paused its outer timer")
+        assert signal.getsignal(signal.SIGALRM) == original_alarm_handler
+        assert signal.getitimer(signal.ITIMER_REAL)[0] == 0
+
+        try:
+            with wall_deadline(
+                0.20,
+                lambda: OuterFixtureTimeout("outer fixture deadline"),
+            ):
+                with statement_deadline(0.03):
+                    time.sleep(0.06)
+        except StatementTimeout as error:
+            assert "0.03s end-to-end deadline" in str(error)
+        else:
+            raise AssertionError("the inner statement deadline did not fire")
+        assert signal.getsignal(signal.SIGALRM) == original_alarm_handler
+        assert signal.getitimer(signal.ITIMER_REAL)[0] == 0
+
+    restart_events: list[str] = []
+
+    class RestartFixtureClient(TyLspClient):
+        def __init__(
+            self,
+            executable: str,
+            workspace: Path,
+            *,
+            quiet: bool = True,
+        ) -> None:
+            self.executable = executable
+            self.workspace = workspace
+            self.quiet = quiet
+            self.process = cast(Any, object())
+            self.stdin = cast(Any, object())
+            self.stdout = cast(Any, object())
+            self.next_id = 0
+            self.document_uri = None
+            self.document_version = 0
+            self.position_encoding = "utf-8"
+
+        def _terminate_process(self) -> None:
+            restart_events.append("terminate")
+
+        def _close_pipes(self) -> None:
+            restart_events.append("close-pipes")
+
+        def close(self) -> None:
+            restart_events.append("graceful-close")
+
+    restart_fixture = RestartFixtureClient("ty", Path.cwd())
+    restart_fixture.restart()
+    assert restart_events == ["terminate", "close-pipes"]
+
+    class BrokenTyInput:
+        def write(self, _value: bytes) -> int:
+            raise BrokenPipeError("fixture pipe closed")
+
+        def flush(self) -> None:
+            raise AssertionError("a failed write must not be flushed")
+
+    broken_input_client = object.__new__(TyLspClient)
+    setattr(broken_input_client, "stdin", BrokenTyInput())
+    try:
+        broken_input_client._write({"fixture": True})
+    except TyTransportError as error:
+        assert isinstance(error.__cause__, BrokenPipeError)
+        assert "closed its input" in str(error)
+    else:
+        raise AssertionError("BrokenPipeError was not classified as transport")
+
+    class ClosedTyOutput:
+        def readline(self) -> bytes:
+            return b""
+
+    class ExitedTyProcess:
+        def poll(self) -> int:
+            return 101
+
+    closed_output_client = object.__new__(TyLspClient)
+    setattr(closed_output_client, "stdout", ClosedTyOutput())
+    setattr(closed_output_client, "process", ExitedTyProcess())
+    try:
+        closed_output_client._read_message()
+    except TyTransportError as error:
+        assert "closed its output (exit 101)" in str(error)
+    else:
+        raise AssertionError("server-output EOF was not classified as transport")
+
+    retry_client = object.__new__(TyLspClient)
+    restart_count = 0
+
+    def restart_fixture_client() -> None:
+        nonlocal restart_count
+        restart_count += 1
+
+    setattr(retry_client, "restart", restart_fixture_client)
+    retry_metrics = RunningMetrics(
+        evaluated=2,
+        sampleable_statements=3,
+        failure_reasons=Counter({"prior": 4}),
+        sampled_lengths=Counter({7: 5}),
+    )
+    retry_funnel = {"evaluated_statements": 2, "prior": 6}
+    retry_calls = 0
+    emitted_records: list[int] = []
+
+    def flaky_statement_attempt(
+        attempt_metrics: RunningMetrics,
+        attempt_funnel: dict[str, int],
+    ) -> None:
+        nonlocal retry_calls
+        retry_calls += 1
+        attempt_metrics.sampleable_statements += 1
+        attempt_metrics.failure_reasons["attempt"] += 1
+        attempt_metrics.sampled_lengths[9] += 1
+        attempt_funnel["attempt"] = attempt_funnel.get("attempt", 0) + 1
+        if retry_calls == 1:
+            raise TyTransportError("fixture transport loss")
+        attempt_metrics.evaluated += 1
+        attempt_funnel["evaluated_statements"] += 1
+        emitted_records.append(attempt_metrics.evaluated)
+
+    retry_error = retry_ty_transport_once(
+        retry_client,
+        retry_metrics,
+        retry_funnel,
+        flaky_statement_attempt,
+    )
+    assert retry_error is None
+    assert retry_calls == 2
+    assert restart_count == 1
+    assert emitted_records == [3]
+    assert retry_metrics.evaluated == 3
+    assert retry_metrics.sampleable_statements == 4
+    assert retry_metrics.failure_reasons == Counter({"prior": 4, "attempt": 1})
+    assert retry_metrics.sampled_lengths == Counter({7: 5, 9: 1})
+    assert retry_funnel == {
+        "evaluated_statements": 3,
+        "prior": 6,
+        "attempt": 1,
+        "ty_transport_restarts": 1,
+    }
+
+    ordinary_client = object.__new__(TyLspClient)
+    ordinary_restart_count = 0
+
+    def restart_ordinary_client() -> None:
+        nonlocal ordinary_restart_count
+        ordinary_restart_count += 1
+
+    setattr(ordinary_client, "restart", restart_ordinary_client)
+    ordinary_calls = 0
+
+    def ordinary_failure(
+        _metrics: RunningMetrics,
+        _funnel: dict[str, int],
+    ) -> None:
+        nonlocal ordinary_calls
+        ordinary_calls += 1
+        raise EvaluationError("ordinary evaluator failure")
+
+    try:
+        retry_ty_transport_once(
+            ordinary_client,
+            RunningMetrics(),
+            {},
+            ordinary_failure,
+        )
+    except EvaluationError as error:
+        assert type(error) is EvaluationError
+    else:
+        raise AssertionError("ordinary EvaluationError was swallowed")
+    assert ordinary_calls == 1
+    assert ordinary_restart_count == 0
+
+    initialization_failure_client = object.__new__(TyLspClient)
+
+    def fail_restart_initialization() -> None:
+        raise TyTransportError("fixture restart initialization failed")
+
+    def trigger_initial_transport(
+        attempt_metrics: RunningMetrics,
+        attempt_funnel: dict[str, int],
+    ) -> None:
+        attempt_metrics.evaluated += 1
+        attempt_funnel["evaluated_statements"] += 1
+        raise TyTransportError("fixture initial transport loss")
+
+    setattr(
+        initialization_failure_client,
+        "restart",
+        fail_restart_initialization,
+    )
+    initialization_failure_metrics = RunningMetrics(evaluated=4)
+    initialization_failure_funnel = {"evaluated_statements": 4}
+    try:
+        retry_ty_transport_once(
+            initialization_failure_client,
+            initialization_failure_metrics,
+            initialization_failure_funnel,
+            trigger_initial_transport,
+        )
+    except TyTransportError as error:
+        assert str(error) == "fixture restart initialization failed"
+    else:
+        raise AssertionError("restart initialization failure was swallowed")
+    assert initialization_failure_metrics.evaluated == 4
+    assert initialization_failure_funnel == {"evaluated_statements": 4}
+
+    repeated_client = object.__new__(TyLspClient)
+    repeated_restart_count = 0
+
+    def restart_repeated_client() -> None:
+        nonlocal repeated_restart_count
+        repeated_restart_count += 1
+
+    setattr(repeated_client, "restart", restart_repeated_client)
+    repeated_metrics = RunningMetrics(evaluated=8)
+    repeated_funnel = {"evaluated_statements": 8}
+    repeated_calls = 0
+
+    def repeated_transport_failure(
+        attempt_metrics: RunningMetrics,
+        attempt_funnel: dict[str, int],
+    ) -> None:
+        nonlocal repeated_calls
+        repeated_calls += 1
+        attempt_metrics.evaluated += 1
+        attempt_funnel["evaluated_statements"] += 1
+        raise TyTransportError("fixture repeated transport loss")
+
+    repeated_error = retry_ty_transport_once(
+        repeated_client,
+        repeated_metrics,
+        repeated_funnel,
+        repeated_transport_failure,
+    )
+    assert isinstance(repeated_error, TyTransportError)
+    assert repeated_calls == 2
+    assert repeated_restart_count == 2
+    assert repeated_metrics.evaluated == 8
+    assert repeated_funnel == {"evaluated_statements": 8}
+
+    transport_source = "value\n"
+    transport_targets = candidate_targets(
+        transport_source,
+        ast.parse(transport_source),
+    )
+    assert len(transport_targets) == 1
+    transport_target = transport_targets[0]
+    transport_scaffold = transport_target.hole.render("()")
+    transport_prepared = PreparedTarget(
+        transport_target,
+        transport_scaffold,
+        transport_scaffold,
+    )
+    transport_options = EvaluationOptions(
+        dataset="apps",
+        source=Path("unused.jsonl"),
+        split="train",
+        files=1,
+        precision_samples=2,
+        max_samples=None,
+        seed=0,
+        ty="ty",
+        allow_ignores=False,
+        builder=BuilderOptions(),
+        max_dfa_states=100,
+        statement_timeout=60.0,
+        json_lines=True,
+        show_samples=False,
+    )
+    transport_dataset_source = DatasetSource(
+        member="APPS/train/fixture/solution_0000.py",
+        data=transport_source.encode(),
+        dataset="apps",
+        split="train",
+        problem_id="fixture",
+        solution_index=0,
+    )
+    terminal_client = object.__new__(TyLspClient)
+    terminal_open_calls = 0
+    terminal_restart_count = 0
+
+    def terminal_open(document_uri: str, _text: str) -> None:
+        nonlocal terminal_open_calls
+        terminal_open_calls += 1
+        if terminal_open_calls <= 2:
+            raise TyTransportError(f"fixture loss {terminal_open_calls}")
+        setattr(terminal_client, "document_uri", document_uri)
+
+    def terminal_diagnostics() -> list[dict[str, object]]:
+        return [{"severity": 1, "message": "fixture semantic error"}]
+
+    def restart_terminal_client() -> None:
+        nonlocal terminal_restart_count
+        terminal_restart_count += 1
+        setattr(terminal_client, "document_uri", None)
+
+    setattr(terminal_client, "open", terminal_open)
+    setattr(terminal_client, "diagnostics", terminal_diagnostics)
+    setattr(terminal_client, "restart", restart_terminal_client)
+    terminal_metrics = RunningMetrics()
+    terminal_funnel: dict[str, int] = defaultdict(int)
+    terminal_output = io.StringIO()
+    original_stdout = sys.stdout
+    try:
+        sys.stdout = terminal_output
+        evaluate_prepared_statement(
+            transport_options,
+            2,
+            terminal_metrics,
+            terminal_funnel,
+            terminal_client,
+            Path.cwd(),
+            transport_dataset_source,
+            1,
+            1,
+            1,
+            transport_prepared,
+            object.__new__(LibraryCatalog),
+        )
+        # The second target reaches the fresh client created after the
+        # terminal failure and completes as an ordinary construction failure.
+        evaluate_prepared_statement(
+            transport_options,
+            1,
+            terminal_metrics,
+            terminal_funnel,
+            terminal_client,
+            Path.cwd(),
+            transport_dataset_source,
+            1,
+            2,
+            2,
+            transport_prepared,
+            object.__new__(LibraryCatalog),
+        )
+    finally:
+        sys.stdout = original_stdout
+    terminal_records = [
+        json.loads(line) for line in terminal_output.getvalue().splitlines()
+    ]
+    assert len(terminal_records) == 2
+    transport_record, continuation_record = terminal_records
+    assert sum(
+        str(record["sampler_error"]).startswith(
+            "ty transport failed after retry:"
+        )
+        for record in terminal_records
+    ) == 1
+    assert set(transport_record) == set(continuation_record)
+    assert transport_record["event"] == "statement"
+    assert transport_record["index"] == 1
+    assert transport_record["recognized"] is False
+    assert transport_record["sample_requested"] == 2
+    assert transport_record["sample_checked"] == 0
+    assert transport_record["sample_accepted"] == 0
+    assert transport_record["ground_truth"] == ["value"]
+    assert str(transport_record["sampler_error"]).startswith(
+        "ty transport failed after retry: fixture loss 2"
+    )
+    assert continuation_record["index"] == 2
+    assert continuation_record["sampler_error"] == (
+        "semantic scaffold contains ty errors"
+    )
+    assert terminal_open_calls == 3
+    assert terminal_restart_count == 2
+    assert terminal_metrics.evaluated == 2
+    assert terminal_metrics.recognized == 0
+    assert terminal_metrics.precision_accepted == 0
+    assert terminal_metrics.precision_requested == 3
+    assert terminal_metrics.precision_checked == 0
+    assert terminal_funnel["evaluated_statements"] == 2
+    assert terminal_funnel["ty_transport_failures"] == 1
+    assert terminal_funnel["semantic_ablation_disagreement"] == 1
+    assert terminal_funnel.get("ty_transport_restarts", 0) == 0
+
+    if hasattr(signal, "SIGALRM"):
+        deadline_options = replace(
+            transport_options,
+            statement_timeout=0.02,
+        )
+        deadline_client = object.__new__(TyLspClient)
+        deadline_metrics = RunningMetrics()
+        deadline_funnel: dict[str, int] = defaultdict(int)
+        deadline_open_calls = 0
+        deadline_restart_count = 0
+
+        def deadline_open(document_uri: str, _text: str) -> None:
+            nonlocal deadline_open_calls
+            deadline_open_calls += 1
+            if deadline_open_calls == 1:
+                raise TyTransportError("fixture transport before slow restart")
+            setattr(deadline_client, "document_uri", document_uri)
+
+        def deadline_diagnostics() -> list[dict[str, object]]:
+            return [{"severity": 1, "message": "fixture semantic error"}]
+
+        def restart_deadline_client() -> None:
+            nonlocal deadline_restart_count
+            deadline_restart_count += 1
+            setattr(deadline_client, "document_uri", None)
+            if deadline_restart_count == 1:
+                # Mutations made anywhere in a timed attempt, including its
+                # transport recovery, must not leak into the terminal row.
+                deadline_metrics.sampleable_statements += 1
+                deadline_funnel["attempt_only"] += 1
+                time.sleep(0.06)
+
+        setattr(deadline_client, "open", deadline_open)
+        setattr(deadline_client, "diagnostics", deadline_diagnostics)
+        setattr(deadline_client, "restart", restart_deadline_client)
+        deadline_output = io.StringIO()
+        original_stdout = sys.stdout
+        original_alarm_handler = signal.getsignal(signal.SIGALRM)
+        try:
+            sys.stdout = deadline_output
+            evaluate_prepared_statement(
+                deadline_options,
+                3,
+                deadline_metrics,
+                deadline_funnel,
+                deadline_client,
+                Path.cwd(),
+                transport_dataset_source,
+                1,
+                1,
+                1,
+                transport_prepared,
+                object.__new__(LibraryCatalog),
+            )
+            evaluate_prepared_statement(
+                deadline_options,
+                1,
+                deadline_metrics,
+                deadline_funnel,
+                deadline_client,
+                Path.cwd(),
+                transport_dataset_source,
+                1,
+                2,
+                2,
+                transport_prepared,
+                object.__new__(LibraryCatalog),
+            )
+        finally:
+            sys.stdout = original_stdout
+        deadline_records = [
+            json.loads(line) for line in deadline_output.getvalue().splitlines()
+        ]
+        assert len(deadline_records) == 2
+        timeout_record, post_timeout_record = deadline_records
+        assert set(timeout_record) == set(post_timeout_record)
+        assert timeout_record["index"] == 1
+        assert timeout_record["recognized"] is False
+        assert timeout_record["sample_requested"] == 3
+        assert timeout_record["sample_checked"] == 0
+        assert timeout_record["sample_accepted"] == 0
+        assert timeout_record["sampler_error"] == (
+            "statement evaluation exceeded 0.02s end-to-end deadline"
+        )
+        assert post_timeout_record["index"] == 2
+        assert post_timeout_record["sampler_error"] == (
+            "semantic scaffold contains ty errors"
+        )
+        assert deadline_open_calls == 2
+        assert deadline_restart_count == 2
+        assert deadline_metrics.evaluated == 2
+        assert deadline_metrics.precision_requested == 4
+        assert deadline_metrics.precision_checked == 0
+        assert deadline_metrics.sampleable_statements == 0
+        assert deadline_funnel["evaluated_statements"] == 2
+        assert deadline_funnel["statement_timeouts"] == 1
+        assert deadline_funnel["semantic_ablation_disagreement"] == 1
+        assert deadline_funnel.get("attempt_only", 0) == 0
+        assert deadline_funnel.get("ty_transport_restarts", 0) == 0
+        assert deadline_funnel.get("ty_transport_failures", 0) == 0
+        assert signal.getsignal(signal.SIGALRM) == original_alarm_handler
+        assert signal.getitimer(signal.ITIMER_REAL)[0] == 0
+
     assert default_dataset_source("apps", "test") == (
         DEFAULT_APPS_DIRECTORY / "test.jsonl"
     )
@@ -6930,6 +9193,7 @@ def run_self_tests() -> None:
     assert default_args.source is None
     default_options = evaluation_options(default_args)
     assert default_options.source == DEFAULT_APPS_DIRECTORY / "test.jsonl"
+    assert default_options.max_dfa_states == DEFAULT_MAX_DFA_STATES
 
     private_completion_items = simplify_completions(
         (
@@ -7056,6 +9320,219 @@ def run_self_tests() -> None:
     assert grouping_compiled.recognizes(("(", "(", "0", ")", ")"))
     assert not grouping_compiled.recognizes(("(", ")"))
     assert not grouping_compiled.recognizes(("(", "0"))
+
+    collection_builder = GrammarBuilder(
+        SemanticProbe.__new__(SemanticProbe),
+        frozenset(),
+        BuilderOptions(max_call_arity=3),
+        {},
+    )
+    collection_builder.add_expression("int", (Terminal("i"),))
+    collection_builder.add_expression("float", (Terminal("f"),))
+    collection_builder.add_expression("str", (Terminal("s"),))
+    collection_builder.add_expression("list[int]", (Terminal("items"),))
+    collection_builder.add_expression(
+        "tuple[int, str]", (Terminal("pair"),)
+    )
+    collection_builder.add_expression(
+        "dict[str, int]", (Terminal("mapping"),)
+    )
+    collection_builder.add_typed_subscripts()
+    collection_builder.add_typed_binary_operations()
+    collection_builder.add_typed_unary_operations()
+    collection_builder.add_redundant_grouping()
+    collection_grammar, collection_stats = collection_builder.finish()
+    collection_compiled = UnitAwareBinaryGrammar(collection_grammar)
+    bracket_productions = [
+        production
+        for production in collection_grammar.productions
+        if Terminal("[") in production.rhs
+    ]
+    assert bracket_productions
+    for production in bracket_productions:
+        # A bracket may follow a typed receiver as an index or slice trailer;
+        # no reachable production may open a list display.
+        assert production.rhs.index(Terminal("[")) == 1, production
+        assert isinstance(production.rhs[0], Nonterminal), production
+    for collection_word in (
+        ("items", "[", "i", "]"),
+        ("items", "[", ":", "]"),
+        ("items", "[", "i", ":", "i", ":", "i", "]"),
+        ("mapping", "[", "s", "]"),
+        ("items", "+", "items"),
+        ("pair", "[", ":", "]"),
+        ("i", "+", "i", "*", "i"),
+        ("(", "i", "+", "i", ")", "*", "i"),
+        ("i", "**", "i", "**", "i"),
+        ("-", "i", "**", "i"),
+        ("i", "**", "-", "i"),
+    ):
+        assert collection_compiled.recognizes(collection_word), collection_word
+    for rejected_collection_word in (
+        ("items", "[", "s", "]"),
+        ("items", "[", "f", "]"),
+        ("mapping", "[", "i", "]"),
+        ("mapping", "[", ":", "]"),
+        ("(", "-", "items", ")", "[", "i", "]"),
+        ("[", "]"),
+        ("[", "i", "]"),
+        ("[", "i", ",", "s", "]"),
+        (FRESH_TOKEN, "=", "[", "i", "]"),
+        ("[", "i", "]", "+", "[", "f", "]"),
+    ):
+        assert not collection_compiled.recognizes(
+            rejected_collection_word
+        ), rejected_collection_word
+    assert collection_stats.binary_operation_productions > 0
+    assert collection_stats.subscript_productions > 0
+    assert collection_stats.slice_productions > 0
+
+    class TypedSubscriptReceiverProbe(SemanticProbe):
+        """Minimal ty-shaped fixture for members reached through indexing."""
+
+        def __init__(self) -> None:
+            self.excluded_names = frozenset()
+            self.member_queries: list[str] = []
+            self.signature_queries: list[str] = []
+
+        def scope(self) -> tuple[list[Completion], bool]:
+            return [Completion("items", "list[Item]", None)], False
+
+        def accepts_expression(self, expression: str) -> bool:
+            return expression == "items"
+
+        def hover_expression(self, expression: str) -> str | None:
+            return "list[Item]" if expression == "items" else None
+
+        def members(self, expression: str) -> tuple[list[Completion], bool]:
+            self.member_queries.append(expression)
+            if expression == "items[0]":
+                return [
+                    Completion(
+                        "foo",
+                        "bound method Item.foo() -> int",
+                        LSP_METHOD,
+                    ),
+                    Completion("value", "int", None),
+                ], False
+            return [], False
+
+        def signatures(self, expression: str) -> list[str]:
+            self.signature_queries.append(expression)
+            return ["() -> int"] if expression == "items[0].foo" else []
+
+    indexed_receiver_probe = TypedSubscriptReceiverProbe()
+    indexed_receiver_builder = GrammarBuilder(
+        indexed_receiver_probe,
+        frozenset({"items"}),
+        BuilderOptions(
+            max_call_arity=0,
+            member_depth=0,
+            max_receiver_types=3,
+        ),
+        {},
+    )
+    indexed_receiver_grammar, indexed_receiver_stats = (
+        indexed_receiver_builder.build()
+    )
+    indexed_receiver_compiled = UnitAwareBinaryGrammar(
+        indexed_receiver_grammar
+    )
+    assert indexed_receiver_probe.member_queries == [
+        "items",
+        '""',
+        "items[0]",
+    ]
+    assert indexed_receiver_probe.signature_queries == ["items[0].foo"]
+    for indexed_member_word in (
+        ("items", "[", "0", "]", ".", "foo", "(", ")"),
+        ("items", "[", "0", "]", ".", "value", "+", "0"),
+    ):
+        assert indexed_receiver_compiled.recognizes(
+            indexed_member_word
+        ), indexed_member_word
+    assert not indexed_receiver_compiled.recognizes(
+        ("items", "[", '""', "]", ".", "foo", "(", ")")
+    )
+    assert indexed_receiver_stats.receiver_types == 3
+    assert indexed_receiver_stats.callables == 1
+
+    capped_indexed_probe = TypedSubscriptReceiverProbe()
+    capped_indexed_builder = GrammarBuilder(
+        capped_indexed_probe,
+        frozenset({"items"}),
+        BuilderOptions(
+            max_call_arity=0,
+            member_depth=0,
+            max_receiver_types=2,
+        ),
+        {},
+    )
+    capped_indexed_grammar, _capped_indexed_stats = (
+        capped_indexed_builder.build()
+    )
+    assert capped_indexed_probe.member_queries == ["items", '""']
+    assert "foo" not in capped_indexed_grammar.terminals
+
+    additive_left = Grammar(start="START")
+    additive_left.add("E:A", Terminal("a"))
+    additive_left.add("E:B", Terminal("b"))
+    additive_left.add("E:C", Terminal("c"))
+    additive_left.add(
+        "E:AB", Nonterminal("E:A"), Terminal("-"), Nonterminal("E:B")
+    )
+    additive_left.add(
+        "E:ABC", Nonterminal("E:AB"), Terminal("-"), Nonterminal("E:C")
+    )
+    additive_left.add("START", Nonterminal("E:ABC"))
+    assert UnitAwareBinaryGrammar(
+        enforce_expression_precedence(additive_left)
+    ).recognizes(("a", "-", "b", "-", "c"))
+
+    additive_right = Grammar(start="START")
+    additive_right.add("E:A", Terminal("a"))
+    additive_right.add("E:B", Terminal("b"))
+    additive_right.add("E:C", Terminal("c"))
+    additive_right.add(
+        "E:BC", Nonterminal("E:B"), Terminal("-"), Nonterminal("E:C")
+    )
+    additive_right.add(
+        "E:ABC", Nonterminal("E:A"), Terminal("-"), Nonterminal("E:BC")
+    )
+    additive_right.add("START", Nonterminal("E:ABC"))
+    assert not UnitAwareBinaryGrammar(
+        enforce_expression_precedence(additive_right)
+    ).recognizes(("a", "-", "b", "-", "c"))
+
+    power_right = Grammar(start="START")
+    power_right.add("E:A", Terminal("a"))
+    power_right.add("E:B", Terminal("b"))
+    power_right.add("E:C", Terminal("c"))
+    power_right.add(
+        "E:BC", Nonterminal("E:B"), Terminal("**"), Nonterminal("E:C")
+    )
+    power_right.add(
+        "E:ABC", Nonterminal("E:A"), Terminal("**"), Nonterminal("E:BC")
+    )
+    power_right.add("START", Nonterminal("E:ABC"))
+    assert UnitAwareBinaryGrammar(
+        enforce_expression_precedence(power_right)
+    ).recognizes(("a", "**", "b", "**", "c"))
+
+    power_left = Grammar(start="START")
+    power_left.add("E:A", Terminal("a"))
+    power_left.add("E:B", Terminal("b"))
+    power_left.add("E:C", Terminal("c"))
+    power_left.add(
+        "E:AB", Nonterminal("E:A"), Terminal("**"), Nonterminal("E:B")
+    )
+    power_left.add(
+        "E:ABC", Nonterminal("E:AB"), Terminal("**"), Nonterminal("E:C")
+    )
+    power_left.add("START", Nonterminal("E:ABC"))
+    assert not UnitAwareBinaryGrammar(
+        enforce_expression_precedence(power_left)
+    ).recognizes(("a", "**", "b", "**", "c"))
 
     # Python trailers bind more tightly than prefix unary operators.  Keep a
     # distinct primary layer so a typed member row cannot reinterpret ``~0``
@@ -7199,7 +9676,7 @@ def run_self_tests() -> None:
         enforce_postfix_precedence(precedence_grammar)
     )
     assert precedence_compiled.recognizes(("0",))
-    assert UniformWordSampler(precedence_compiled, 1).parse_count(("0",)) == 1
+    assert DerivationCounter(precedence_compiled, 1).parse_count(("0",)) == 1
     assert precedence_compiled.recognizes(("-", "x", ".", "real"))
     assert precedence_compiled.recognizes(
         ("(", "-", "x", ")", ".", "real")
@@ -7210,7 +9687,7 @@ def run_self_tests() -> None:
     assert precedence_compiled.recognizes(
         ("(", "~", "0", ")", ".", "to_bytes")
     )
-    assert UniformWordSampler(precedence_compiled, 6).parse_count(
+    assert DerivationCounter(precedence_compiled, 6).parse_count(
         ("(", "~", "0", ")", ".", "to_bytes")
     ) == 1
     assert not precedence_compiled.recognizes(
@@ -7245,6 +9722,7 @@ def run_self_tests() -> None:
                 Completion("any_value", "Any", None),
                 Completion("known_text", "str", None),
                 Completion("unknown_value", "Unknown", None),
+                Completion("value", "Any", None),
             ], False
 
         def accepts_expression(self, expression: str) -> bool:
@@ -7291,13 +9769,107 @@ def run_self_tests() -> None:
     assert not dynamic_member_compiled.recognizes(
         ("owner", ".", "any_value", ".", "known_text")
     )
-    dynamic_grouping_sampler = UniformWordSampler(
+    assert dynamic_member_compiled.recognizes(
+        ("owner", ".", "value", "+", "0")
+    )
+    dynamic_grouping_sampler = DerivationCounter(
         dynamic_member_compiled, 5
     )
     assert dynamic_grouping_sampler.parse_count(
         ("(", "owner", ".", "any_value", ")")
     ) == 1
     assert owner_nonterminal == type_nonterminal("Owner")
+
+    class GradualBinaryProbe(SemanticProbe):
+        def accepts_expression(self, expression: str) -> bool:
+            return True
+
+    gradual_binary_builder = GrammarBuilder(
+        GradualBinaryProbe.__new__(GradualBinaryProbe),
+        frozenset({"mystery", "other"}),
+        BuilderOptions(
+            max_call_arity=0,
+            max_dynamic_composition_depth=1,
+        ),
+        {},
+    )
+    gradual_binary_builder.add_literals()
+    gradual_binary_builder.add_expression(
+        "int & ~AlwaysFalsy", (Terminal("nonzero"),)
+    )
+    gradual_binary_builder.grammar.add(
+        DYNAMIC_NONTERMINAL, Terminal("mystery")
+    )
+    gradual_binary_builder.grammar.add(
+        DYNAMIC_NONTERMINAL, Terminal("other")
+    )
+    gradual_binary_builder.grammar.add(
+        type_nonterminal("Unknown"), Nonterminal(DYNAMIC_NONTERMINAL)
+    )
+    gradual_binary_builder.representatives["Unknown"] = "mystery"
+    gradual_binary_builder.dynamic_representatives["Unknown"].add("mystery")
+    gradual_binary_builder.dynamic_representatives["Unknown"].add("other")
+    gradual_binary_builder.dynamic_scope_representatives["Unknown"].add(
+        "mystery"
+    )
+    gradual_binary_builder.add_typed_binary_operations()
+    gradual_binary_builder.add_typed_unary_operations()
+    gradual_binary_builder.add_dynamic_operations()
+    gradual_binary_builder.add_redundant_grouping()
+    gradual_binary_grammar, gradual_binary_stats = (
+        gradual_binary_builder.finish()
+    )
+    gradual_binary_compiled = UnitAwareBinaryGrammar(
+        gradual_binary_grammar
+    )
+    for gradual_word in (
+        ("mystery", "+", "0"),
+        ("0", "+", "mystery"),
+        ("mystery", "**", "-", "0"),
+        ("mystery", "[", "0", "]"),
+        ("mystery", "[", ":", "]"),
+        ("mystery", "[", "nonzero", ":", "]"),
+        ("mystery", "[", "mystery", ":", "]"),
+        ("mystery", "[", "0", "]", "+", "0"),
+        ("(", "mystery", "+", "0", ")"),
+        ("(", "mystery", "[", "0", "]", ")"),
+    ):
+        assert gradual_binary_compiled.recognizes(gradual_word), gradual_word
+    assert not gradual_binary_compiled.recognizes(
+        ("mystery", "&", "0")
+    )
+    assert not gradual_binary_compiled.recognizes(
+        ("mystery", "+", "other")
+    )
+    assert not gradual_binary_compiled.recognizes(
+        ("mystery", "+", "[", "0", "]")
+    )
+    assert not gradual_binary_compiled.recognizes(
+        ("mystery", "[", "0", "]", "[", "0", "]")
+    )
+    nested_dynamic_slice_bound: tuple[str, ...] = (
+        "mystery",
+        "[",
+        ":",
+        "]",
+    )
+    for _nested_depth in range(2, 6):
+        nested_dynamic_slice_bound = (
+            "mystery",
+            "[",
+            *nested_dynamic_slice_bound,
+            ":",
+            "]",
+        )
+        assert not gradual_binary_compiled.recognizes(
+            nested_dynamic_slice_bound
+        )
+    assert gradual_binary_stats.binary_operation_productions > 0
+    gradual_binary_index = ShortlexDFAIndex(
+        gradual_binary_compiled, 20_000
+    )
+    gradual_binary_index.ensure_rank(SAMPLE_RANK_LIMIT - 1)
+    assert gradual_binary_index.state_count < 20_000
 
     class LocalUnderscoreProbe(SemanticProbe):
         """Minimal semantic fixture for source-local underscore bindings."""
@@ -7498,22 +10070,41 @@ def run_self_tests() -> None:
         pass
     else:
         raise AssertionError("library CFG START definitions must be rejected")
-
-    assert sampling_length_bounds(1) == (1, 3)
-    assert sampling_length_bounds(2) == (1, 4)
-    assert sampling_length_bounds(3) == (1, 5)
-    assert sampling_length_bounds(4) == (2, 6)
-    assert sampling_length_bounds(8) == (6, 10)
-    assert maximum_call_arity(3, assignment=False) == 0
-    assert maximum_call_arity(4, assignment=False) == 1
-    assert maximum_call_arity(10, assignment=False) == 4
-    assert maximum_call_arity(10, assignment=True) == 3
     try:
-        sampling_length_bounds(0)
-    except ValueError:
-        pass
+        parse_library_cfg_text(
+            "\n".join(
+                (
+                    "# api2cfg-python-library-cfg: 1",
+                    "# module: fixture_lib",
+                    f"# module-type: {module_type}",
+                    "E:list%5Bint%5D -> [ E:int ]",
+                )
+            ),
+            Path("list-display.cfg"),
+        )
+    except EvaluationError as error:
+        assert "must not contain bracket terminals" in str(error)
     else:
-        raise AssertionError("zero-length statements must be rejected")
+        raise AssertionError("library CFG list displays must be rejected")
+    for composite_terminal in ("[]", "[0]", "f([0])"):
+        try:
+            parse_library_cfg_text(
+                "\n".join(
+                    (
+                        "# api2cfg-python-library-cfg: 1",
+                        "# module: fixture_lib",
+                        f"# module-type: {module_type}",
+                        f"E:int -> {composite_terminal}",
+                    )
+                ),
+                Path("composite-terminal.cfg"),
+            )
+        except EvaluationError as error:
+            assert "must be one canonical Python token" in str(error)
+        else:
+            raise AssertionError(
+                f"composite cached terminal {composite_terminal!r} must be rejected"
+            )
 
     empty = Grammar("S")
     assert empty.nonterminals == frozenset({"S"})
@@ -7531,13 +10122,32 @@ def run_self_tests() -> None:
     assert bounded.language_size(1) == 1
     assert bounded.unrank(1, 0) == ("x",)
     assert bounded.recognizes(("x",))
+    ambiguous_index = ShortlexDFAIndex(ambiguous, 1_000)
+    assert ambiguous_index.unrank(0) == ("x",)
+    assert ambiguous_index.rank(("x",)) == 0
+    assert ambiguous_index.indexed_size == 1
+    try:
+        ambiguous_index.unrank(1)
+    except IndexError:
+        pass
+    else:
+        raise AssertionError("a finite DFA index must reject its end rank")
+
+    empty_index = ShortlexDFAIndex(empty, 1_000)
+    assert empty_index.finite_max_length == 0
+    try:
+        empty_index.unrank(0)
+    except IndexError:
+        pass
+    else:
+        raise AssertionError("an empty DFA index must reject every rank")
 
     unit_chain = Grammar("U0")
     for index in range(100):
         unit_chain.add(f"U{index}", Nonterminal(f"U{index + 1}"))
     unit_chain.add("U100", Terminal("tail"))
     compiled_chain = UnitAwareBinaryGrammar(unit_chain)
-    chain_sampler = UniformWordSampler(compiled_chain, 1)
+    chain_sampler = DerivationCounter(compiled_chain, 1)
     assert chain_sampler.compiled is compiled_chain
     assert chain_sampler.derivation_count == 1
     assert chain_sampler.parse_count(("tail",)) == 1
@@ -7549,7 +10159,7 @@ def run_self_tests() -> None:
     unit_diamond.add("A", Nonterminal("C"))
     unit_diamond.add("B", Nonterminal("C"))
     unit_diamond.add("C", Terminal("x"))
-    diamond_sampler = UniformWordSampler(unit_diamond, 1)
+    diamond_sampler = DerivationCounter(unit_diamond, 1)
     assert diamond_sampler.derivation_count == 2
     assert diamond_sampler.parse_count(("x",)) == 2
     assert {
@@ -7566,7 +10176,7 @@ def run_self_tests() -> None:
     unit_cycle.add("A", Nonterminal("B"))
     unit_cycle.add("B", Nonterminal("A"))
     unit_cycle.add("B", Terminal("cycle"))
-    cycle_sampler = UniformWordSampler(unit_cycle, 1)
+    cycle_sampler = DerivationCounter(unit_cycle, 1)
     assert cycle_sampler.derivation_count == 1
     assert cycle_sampler.parse_count(("cycle",)) == 1
     assert cycle_sampler.recognizes(("cycle",))
@@ -7591,7 +10201,9 @@ def run_self_tests() -> None:
                     (production.rhs[0].value, production.rhs[1].value)
                 ].add(production.lhs)
         length = len(tokens)
-        chart = [[set() for _ in range(length + 1)] for _ in range(length)]
+        chart: list[list[set[str]]] = [
+            [set() for _ in range(length + 1)] for _ in range(length)
+        ]
         for index, token in enumerate(tokens):
             chart[index][index + 1].update(terminal_parents.get(token, ()))
         for span in range(2, length + 1):
@@ -7633,7 +10245,7 @@ def run_self_tests() -> None:
                 assert compact.recognizes(word) == materialized_cnf_recognizes(
                     random_grammar, word
                 )
-        randomized_sampler = UniformWordSampler(random_grammar, 1, 3)
+        randomized_sampler = DerivationCounter(random_grammar, 1, 3)
         if randomized_sampler.derivation_count <= 5_000:
             proposal_multiplicities: Counter[tuple[str, ...]] = Counter()
             for length, count in randomized_sampler.derivation_counts.items():
@@ -7662,6 +10274,17 @@ def run_self_tests() -> None:
         ("b", "a"),
         ("b", "b"),
     }
+    binary_index = ShortlexDFAIndex(binary, 1_000)
+    assert [binary_index.unrank(rank) for rank in range(4)] == [
+        ("a", "a"),
+        ("a", "b"),
+        ("b", "a"),
+        ("b", "b"),
+    ]
+    assert [binary_index.rank(binary_index.unrank(rank)) for rank in range(4)] == list(
+        range(4)
+    )
+    assert binary_index.slice_ends == [0, 4]
 
     recursive = Grammar("S")
     recursive.add("S", Terminal("a"))
@@ -7669,6 +10292,18 @@ def run_self_tests() -> None:
     bounded = BoundedLanguage(recursive, 4, 10_000)
     assert bounded.language_size(4) == 1
     assert bounded.unrank(4, 0) == ("a", "a", "a", "a")
+
+    branching = Grammar("S")
+    branching.add("S", Nonterminal("C"))
+    branching.add("S", Nonterminal("S"), Nonterminal("C"))
+    branching.add("C", Terminal("a"))
+    branching.add("C", Terminal("b"))
+    branching_index = ShortlexDFAIndex(branching, 10_000)
+    assert branching_index.finite_max_length is None
+    millionth_prefix_word = branching_index.unrank(SAMPLE_RANK_LIMIT - 1)
+    assert len(millionth_prefix_word) == 19
+    assert branching_index.language.recognizes(millionth_prefix_word)
+    assert branching_index.rank(millionth_prefix_word) == SAMPLE_RANK_LIMIT - 1
 
     unequal_ambiguity = Grammar("S")
     unequal_ambiguity.add("S", Nonterminal("A"), Nonterminal("Z"))
@@ -7678,7 +10313,7 @@ def run_self_tests() -> None:
     unequal_ambiguity.add("B", Terminal("x"))
     unequal_ambiguity.add("C", Terminal("y"))
     unequal_ambiguity.add("Z", Terminal("z"))
-    sampler = UniformWordSampler(unequal_ambiguity, 2)
+    sampler = DerivationCounter(unequal_ambiguity, 2)
     assert sampler.derivation_count == 3
     assert sampler.derivation_counts == {2: 3}
     assert sampler.parse_count(("x", "z")) == 2
@@ -7693,7 +10328,7 @@ def run_self_tests() -> None:
     mixed_lengths.add("B", Terminal("x"))
     mixed_lengths.add("C", Terminal("y"))
     mixed_lengths.add("Z", Terminal("z"))
-    range_sampler = UniformWordSampler(mixed_lengths, 1, 2)
+    range_sampler = DerivationCounter(mixed_lengths, 1, 2)
     assert range_sampler.derivation_counts == {1: 1, 2: 3}
     assert range_sampler.derivation_count == 4
     proposal_counts: dict[tuple[str, ...], int] = defaultdict(int)
@@ -7714,6 +10349,190 @@ def run_self_tests() -> None:
         range_sampler.parse_count(word) == count
         for word, count in proposal_counts.items()
     )
+    range_index = ShortlexDFAIndex(mixed_lengths, 1_000)
+    assert [range_index.unrank(rank) for rank in range(3)] == [
+        ("x",),
+        ("x", "z"),
+        ("y", "z"),
+    ]
+    assert [range_index.rank(range_index.unrank(rank)) for rank in range(3)] == [
+        0,
+        1,
+        2,
+    ]
+    for supported_operator in ("+", "-", "*", "/", "//", "%", "**"):
+        parsed_operator_expression = ast.parse(
+            f"left {supported_operator} right", mode="eval"
+        ).body
+        assert isinstance(parsed_operator_expression, ast.expr)
+        assert supported_expression(parsed_operator_expression)
+    for unsupported_operator in ("&", "|", "^", "<<", ">>", "@"):
+        parsed_operator_expression = ast.parse(
+            f"left {unsupported_operator} right", mode="eval"
+        ).body
+        assert isinstance(parsed_operator_expression, ast.expr)
+        assert not supported_expression(parsed_operator_expression)
+    assert supported_expression(ast.parse("items[index]", mode="eval").body)
+    assert supported_expression(ast.parse("items[:stop]", mode="eval").body)
+    assert supported_expression(ast.parse("items[start::step]", mode="eval").body)
+    for list_display in ("[]", "[left, right]", "f([left])", "left + [right]"):
+        assert not supported_expression(ast.parse(list_display, mode="eval").body)
+    assert not supported_expression(ast.parse("items[i, j]", mode="eval").body)
+    assert not supported_expression(ast.parse("[*items]", mode="eval").body)
+    for unsupported_spelling in ('f(0,)', '"left" "right"'):
+        parsed_spelling = ast.parse(unsupported_spelling, mode="eval").body
+        assert isinstance(parsed_spelling, ast.expr)
+        assert supported_expression(parsed_spelling)
+        assert not surface_spelling_supported(
+            unsupported_spelling, parsed_spelling
+        )
+    for supported_spelling in ('f(0)', 'f("left", "right")'):
+        parsed_spelling = ast.parse(supported_spelling, mode="eval").body
+        assert isinstance(parsed_spelling, ast.expr)
+        assert surface_spelling_supported(supported_spelling, parsed_spelling)
+    f_string_spelling = 'f"{value} suffix"'
+    parsed_f_string = ast.parse(f_string_spelling, mode="eval").body
+    assert isinstance(parsed_f_string, ast.expr)
+    assert not unsupported_surface_spellings(
+        f_string_spelling, parsed_f_string
+    )
+    nested_f_string_spelling = 'f"{g(0,)}"'
+    parsed_nested_f_string = ast.parse(
+        nested_f_string_spelling, mode="eval"
+    ).body
+    assert isinstance(parsed_nested_f_string, ast.expr)
+    assert unsupported_surface_spelling_counts(
+        nested_f_string_spelling, parsed_nested_f_string
+    ) == Counter({"trailing_call_comma": 1})
+    repeated_spelling = '(f(0,), g(1,), "a" "b", "c" "d")'
+    parsed_repeated_spelling = ast.parse(repeated_spelling, mode="eval").body
+    assert isinstance(parsed_repeated_spelling, ast.expr)
+    assert unsupported_surface_spelling_counts(
+        repeated_spelling, parsed_repeated_spelling
+    ) == Counter({"trailing_call_comma": 2, "adjacent_literal": 2})
+    spelling_source = 'f(0,)\n"left" "right"\nf(0)\n'
+    spelling_targets = candidate_targets(
+        spelling_source,
+        ast.parse(spelling_source),
+    )
+    assert [target.text for target in spelling_targets] == ["f(0)"]
+    list_display_source = "[]\nf([x])\ny = [x]\nz = x + [x]\nitems[x]\n"
+    list_display_targets = candidate_targets(
+        list_display_source,
+        ast.parse(list_display_source),
+    )
+    assert [target.text for target in list_display_targets] == ["items[x]"]
+    deep_binary: ast.expr = ast.Name(id="x", ctx=ast.Load())
+    for _ in range(2_000):
+        deep_binary = ast.BinOp(
+            left=deep_binary,
+            op=ast.Add(),
+            right=ast.Name(id="x", ctx=ast.Load()),
+        )
+    assert supported_expression(deep_binary)
+    assert not any(isinstance(node, ast.List) for node in ast.walk(deep_binary))
+
+    assert arithmetic_binary_result("int", "+", "float") == "float"
+    assert arithmetic_binary_result("int", "/", "int") == "float"
+    assert arithmetic_binary_result("int", "//", "float") == "float"
+    assert arithmetic_binary_result("str", "+", "str") == "str"
+    assert (
+        arithmetic_binary_result("list[int]", "+", "list[int]")
+        == "list[int]"
+    )
+    assert (
+        arithmetic_binary_result("list[int]", "+", "list[float]")
+        == "list[float]"
+    )
+    assert arithmetic_binary_result("str", "*", "int") == "str"
+    assert arithmetic_binary_result("int", "*", "str") == "str"
+    assert (
+        arithmetic_binary_result(
+            "int & ~AlwaysFalsy", "+", "int & ~Literal[0]"
+        )
+        == "int"
+    )
+    assert (
+        arithmetic_binary_result(
+            "list[int] & ~AlwaysFalsy", "+", "list[int]"
+        )
+        == "list[int]"
+    )
+    assert (
+        arithmetic_binary_result(
+            "list[int] & ~AlwaysFalsy", "*", "int & ~AlwaysFalsy"
+        )
+        == "list[int]"
+    )
+    assert (
+        arithmetic_binary_result(
+            "tuple[int, ...] & ~AlwaysFalsy", "+", "tuple[int, ...]"
+        )
+        == "tuple[int, ...]"
+    )
+    assert (
+        arithmetic_binary_result(
+            "tuple[int, str]", "+", "tuple[int, str]"
+        )
+        is None
+    )
+    assert arithmetic_binary_result("tuple[int, str]", "*", "int") is None
+    assert arithmetic_binary_result("int", "*", "tuple[int, str]") is None
+    assert arithmetic_binary_result("str", "-", "str") is None
+    assert arithmetic_binary_result("complex", "//", "int") is None
+    assert strip_negative_flow_refinements(
+        "list[int] & ~AlwaysFalsy"
+    ) == "list[int]"
+    assert strip_negative_flow_refinements("int & SupportsAbs[int]") is None
+    assert numeric_unary_kinds("int & ~AlwaysFalsy") == (True, True)
+    assert numeric_unary_result("int & ~AlwaysFalsy") == "int"
+    assert indexed_access_types("list[int]") == ("SupportsIndex", "int")
+    assert indexed_access_types("dict[str, int]") == ("str", "int")
+    assert indexed_access_types("tuple[int, ...]") == (
+        "SupportsIndex",
+        "int",
+    )
+    assert indexed_access_types("tuple[()]") is None
+    assert indexed_access_types("list[int] & ~AlwaysFalsy") == (
+        "SupportsIndex",
+        "int",
+    )
+    assert sliced_access_type("tuple[int, ...]") == "tuple[int, ...]"
+    assert (
+        sliced_access_type("tuple[int, str]")
+        == "tuple[int | str, ...]"
+    )
+    assert (
+        sliced_access_type("list[int] & ~AlwaysFalsy") == "list[int]"
+    )
+
+    refined_arithmetic_builder = GrammarBuilder(
+        SemanticProbe.__new__(SemanticProbe),
+        frozenset(),
+        BuilderOptions(),
+        {},
+    )
+    refined_arithmetic_builder.add_expression(
+        "int & ~AlwaysFalsy", (Terminal("nonzero"),)
+    )
+    refined_arithmetic_builder.add_expression(
+        "list[int] & ~AlwaysFalsy", (Terminal("nonempty"),)
+    )
+    refined_arithmetic_builder.add_typed_binary_operations()
+    refined_arithmetic_builder.add_typed_unary_operations()
+    refined_arithmetic_grammar, _refined_arithmetic_stats = (
+        refined_arithmetic_builder.finish()
+    )
+    refined_arithmetic_compiled = UnitAwareBinaryGrammar(
+        refined_arithmetic_grammar
+    )
+    assert refined_arithmetic_compiled.recognizes(
+        ("nonzero", "+", "nonzero")
+    )
+    assert refined_arithmetic_compiled.recognizes(
+        ("nonempty", "*", "nonzero")
+    )
+    assert refined_arithmetic_compiled.recognizes(("-", "nonzero"))
     many_argument_call = ast.parse("f(a, b, c, d)", mode="eval").body
     assert supported_expression(many_argument_call)
 
@@ -8261,10 +11080,10 @@ def run_self_tests() -> None:
     assert generic_compiled.recognizes(
         ("tuple", "(", "tuple", "(", ")", ")")
     )
-    assert UniformWordSampler(generic_compiled, 4).parse_count(
+    assert DerivationCounter(generic_compiled, 4).parse_count(
         ("tuple", "(", "numbers", ")")
     ) == 1
-    assert UniformWordSampler(generic_compiled, 6).parse_count(
+    assert DerivationCounter(generic_compiled, 6).parse_count(
         ("tuple", "(", "tuple", "(", ")", ")")
     ) == 1
     assert not any(
@@ -8748,10 +11567,16 @@ def parse_arguments(arguments: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--max-module-members", type=int, default=128)
     parser.add_argument("--max-output-producers", type=int, default=2048)
     parser.add_argument(
-        "--max-rejection-attempts",
+        "--max-dfa-states",
         type=int,
-        default=10_000,
-        help="maximum ambiguity-correction attempts per uniform word",
+        default=DEFAULT_MAX_DFA_STATES,
+        help="maximum hash-consed states in each sampling DFA index",
+    )
+    parser.add_argument(
+        "--statement-timeout",
+        type=float,
+        default=60.0,
+        help="end-to-end wall deadline in seconds per prepared target",
     )
     parser.add_argument("--jsonl", action="store_true")
     parser.add_argument("--show-samples", action="store_true")
@@ -8763,6 +11588,11 @@ def parse_arguments(arguments: Sequence[str]) -> argparse.Namespace:
         parser.error("--max-samples must be at least 1")
     if parsed.max_samples is not None and parsed.precision_samples < 1:
         parser.error("--precision-samples must be positive with --max-samples")
+    if (
+        not math.isfinite(parsed.statement_timeout)
+        or parsed.statement_timeout <= 0
+    ):
+        parser.error("--statement-timeout must be a positive finite number")
     for name in (
         "files",
         "precision_samples",
@@ -8771,7 +11601,7 @@ def parse_arguments(arguments: Sequence[str]) -> argparse.Namespace:
         "max_receiver_types",
         "max_module_members",
         "max_output_producers",
-        "max_rejection_attempts",
+        "max_dfa_states",
     ):
         value = getattr(parsed, name)
         minimum = (
@@ -8815,7 +11645,8 @@ def evaluation_options(args: argparse.Namespace) -> EvaluationOptions:
             max_module_members=args.max_module_members,
             max_output_producers=args.max_output_producers,
         ),
-        max_rejection_attempts=args.max_rejection_attempts,
+        max_dfa_states=args.max_dfa_states,
+        statement_timeout=args.statement_timeout,
         json_lines=args.jsonl,
         show_samples=args.show_samples,
         library_directory=args.library_dir,

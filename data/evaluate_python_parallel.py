@@ -25,7 +25,7 @@ from collections import Counter
 from concurrent.futures import Future, ProcessPoolExecutor
 from dataclasses import dataclass, field, replace
 from multiprocessing import Manager
-from typing import Mapping, Protocol, Sequence
+from typing import Mapping, Protocol, Sequence, TextIO, cast
 
 import evaluate_python as evaluator
 
@@ -84,7 +84,9 @@ def run_worker(
     stderr = QueueWriter(output, worker, "stderr")
     return_code = 1
     try:
-        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+        with contextlib.redirect_stdout(
+            cast(TextIO, stdout)
+        ), contextlib.redirect_stderr(cast(TextIO, stderr)):
             try:
                 return_code = evaluator.evaluate(options)
             except (evaluator.EvaluationError, FileNotFoundError) as error:
@@ -232,7 +234,6 @@ class Aggregate:
             "precision": evaluator.percentage(precision),
             "precision_coverage": evaluator.percentage(coverage),
             "sampleable_statements": self.summed_int("sampleable_statements"),
-            "empty_slices": self.summed_int("empty_slices"),
             "sampler_failures": self.summed_int("sampler_failures"),
             "failure_reasons": self.summed_counter("failure_reasons"),
             "diagnostic_codes": self.summed_counter("diagnostic_codes"),
@@ -273,14 +274,25 @@ def run_self_tests() -> None:
     assert parallel.workers == 2
     assert defaults.dataset == "apps"
     assert defaults.split == "test"
+    assert defaults.statement_timeout == 60.0
     assert defaults.source == evaluator.default_dataset_source("apps", "test")
 
     _parallel, serial = parse_parallel_arguments(
-        ["--dataset", "codenet", "--split", "train", "--files", "0"]
+        [
+            "--dataset",
+            "codenet",
+            "--split",
+            "train",
+            "--files",
+            "0",
+            "--statement-timeout",
+            "0.25",
+        ]
     )
     codenet = evaluator.evaluation_options(serial)
     assert codenet.dataset == "codenet"
     assert codenet.split == "train"
+    assert codenet.statement_timeout == 0.25
     assert codenet.source == evaluator.default_dataset_source(
         "codenet", "train"
     )
@@ -300,11 +312,11 @@ def _main(arguments: Sequence[str] | None = None) -> int:
     if serial.max_samples is not None:
         worker_count = min(worker_count, serial.max_samples)
     file_quotas = split_quota(serial.files, worker_count)
-    sample_quotas = (
-        [None] * worker_count
-        if serial.max_samples is None
-        else split_quota(serial.max_samples, worker_count)
-    )
+    sample_quotas: Sequence[int | None]
+    if serial.max_samples is None:
+        sample_quotas = [None] * worker_count
+    else:
+        sample_quotas = split_quota(serial.max_samples, worker_count)
     base_options = evaluator.evaluation_options(serial)
     source_path = evaluator.resolved_dataset_source(
         base_options.dataset,
@@ -344,14 +356,24 @@ def _main(arguments: Sequence[str] | None = None) -> int:
         "platform": platform.platform(),
         "library_directory": str(base_options.library_directory),
         "allow_ignores": base_options.allow_ignores,
-        "max_rejection_attempts": base_options.max_rejection_attempts,
+        "sample_rank_interval": f"[0, {evaluator.SAMPLE_RANK_LIMIT})",
+        "sample_order": "global token shortlex DFA bijection",
+        "max_dfa_states": base_options.max_dfa_states,
+        "statement_timeout": base_options.statement_timeout,
+        "surface_fragment": evaluator.surface_fragment_metadata(),
         "builder": {
+            "max_call_arity": "floor((ground_truth_tokens-root_tokens)/2)",
+            "max_dynamic_composition_depth": (
+                base_options.builder.max_dynamic_composition_depth
+            ),
+            "max_tokens": "ground_truth_tokens+2",
             "max_layouts_per_signature": (
                 base_options.builder.max_layouts_per_signature
             ),
             "member_depth": base_options.builder.member_depth,
             "max_receiver_types": base_options.builder.max_receiver_types,
             "max_module_members": base_options.builder.max_module_members,
+            "max_output_producers": base_options.builder.max_output_producers,
         },
         "partition": "source-index modulo workers",
         "shard_count": worker_count,
@@ -364,6 +386,7 @@ def _main(arguments: Sequence[str] | None = None) -> int:
             f"dataset={base_options.dataset}; "
             f"split={display_split or 'n/a'}; "
             f"source={source_path}; target_files={serial.files}; "
+            f"statement_timeout={base_options.statement_timeout:g}s; "
             "partition=source-index-modulo",
             flush=True,
         )

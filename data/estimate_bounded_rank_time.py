@@ -50,7 +50,7 @@ from collections import Counter, defaultdict
 from concurrent.futures import Future, ProcessPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Callable, Iterator, Mapping, Sequence, TextIO
+from typing import Any, Callable, Iterator, Mapping, Sequence, TextIO, TypeAlias
 
 import evaluate_python as evaluator
 from python_wdfa import PythonWDFA, WDFAFormatError, WDFA_INF
@@ -304,82 +304,7 @@ class CombinedRerankResult:
     wdfa: WDFARerankResult
 
 
-class UnitAwareBoundedLanguage(evaluator.BoundedLanguage):
-    """Exact bounded DAFSAs without materializing the grammar's unit closure."""
-
-    def __init__(
-        self,
-        grammar: evaluator.Grammar,
-        max_length: int,
-        max_states: int,
-    ) -> None:
-        self.grammar = grammar
-        self.compiled = evaluator.UnitAwareBinaryGrammar(grammar)
-        self.max_length = max_length
-        self.max_states = max_states
-        terminals = sorted(grammar.terminals)
-        self.token_ids = {token: index for index, token in enumerate(terminals)}
-        self.tokens = terminals
-        self.rows: list[tuple[tuple[int, int], ...]] = [()]
-        self.counts: list[int] = [1]
-        self.interned: dict[tuple[tuple[int, int], ...], int] = {
-            (): self.FINAL
-        }
-        self.union_cache: dict[tuple[int, ...], int] = {}
-        self.product_union_cache: dict[tuple[tuple[int, int], ...], int] = {}
-        self.singletons = {
-            token: self._intern(((token_id, self.FINAL),))
-            for token, token_id in self.token_ids.items()
-        }
-        self.roots: dict[tuple[int, int], int] = {}
-        self._build_unit_aware()
-
-    def _build_unit_aware(self) -> None:
-        for length in range(1, self.max_length + 1):
-            base: dict[int, int] = {}
-            if length == 1:
-                for component, terminals in enumerate(
-                    self.compiled.terminal_rules
-                ):
-                    root = self._union(
-                        self.singletons[token] for token in terminals
-                    )
-                    if root != self.EMPTY:
-                        base[component] = root
-            if length >= 2:
-                for component, rules in enumerate(self.compiled.binary_rules):
-                    products: list[tuple[int, int]] = []
-                    for left, right in rules:
-                        for split in range(1, length):
-                            left_root = self.roots.get(
-                                (left, split), self.EMPTY
-                            )
-                            right_root = self.roots.get(
-                                (right, length - split), self.EMPTY
-                            )
-                            if left_root != self.EMPTY and right_root != self.EMPTY:
-                                products.append((left_root, right_root))
-                    root = self._union_products(products)
-                    if root != self.EMPTY:
-                        base[component] = root
-            # Unit SCCs are already condensed into a DAG.  Children precede
-            # parents in bottom_up, so this unions distinct child languages
-            # exactly once without expanding every A ->* B production.
-            for component in self.compiled.bottom_up:
-                root = self._union(
-                    (
-                        base.get(component, self.EMPTY),
-                        *(
-                            self.roots.get((child, length), self.EMPTY)
-                            for child in self.compiled.unit_children[component]
-                        ),
-                    )
-                )
-                if root != self.EMPTY:
-                    self.roots[(component, length)] = root
-
-    def root(self, length: int) -> int:
-        return self.roots.get((self.compiled.start, length), self.EMPTY)
+UnitAwareBoundedLanguage: TypeAlias = evaluator.UnitAwareBoundedLanguage
 
 
 def sample_hash(seed: int, value: str) -> int:
@@ -857,41 +782,71 @@ def contextual_grammar(
 
 
 @contextlib.contextmanager
-def rank_deadline(seconds: float) -> Iterator[None]:
+def wall_deadline(
+    seconds: float,
+    exception: Callable[[], Exception],
+) -> Iterator[None]:
+    """Compose a wall deadline with any earlier active ``ITIMER_REAL``.
+
+    A nested timer must not pause its caller's timer.  We arm whichever
+    deadline expires first and, if the nested scope returns early, restore the
+    caller with the time actually remaining rather than its original value.
+    """
+
     if seconds <= 0 or not hasattr(signal, "SIGALRM"):
         yield
         return
 
     def expired(_signum: int, _frame: object) -> None:
-        raise RankTimeout(f"rank construction exceeded {seconds:g}s")
+        raise exception()
 
-    old_handler = signal.signal(signal.SIGALRM, expired)
-    old_timer = signal.setitimer(signal.ITIMER_REAL, seconds)
+    old_handler = signal.getsignal(signal.SIGALRM)
+    old_remaining, old_interval = signal.getitimer(signal.ITIMER_REAL)
+    started = time.monotonic()
+    outer_expires_first = 0 < old_remaining <= seconds
+    if outer_expires_first:
+        active_handler = old_handler
+        active_seconds = old_remaining
+    else:
+        active_handler = expired
+        active_seconds = seconds
+    signal.signal(signal.SIGALRM, active_handler)
+    signal.setitimer(signal.ITIMER_REAL, active_seconds)
     try:
         yield
     finally:
-        signal.setitimer(signal.ITIMER_REAL, *old_timer)
+        elapsed = time.monotonic() - started
+        signal.setitimer(signal.ITIMER_REAL, 0)
         signal.signal(signal.SIGALRM, old_handler)
+        restored_remaining = (
+            max(0.0, old_remaining - elapsed) if old_remaining > 0 else 0.0
+        )
+        if restored_remaining > 0 or old_interval > 0:
+            signal.setitimer(
+                signal.ITIMER_REAL,
+                restored_remaining,
+                old_interval,
+            )
+
+
+@contextlib.contextmanager
+def rank_deadline(seconds: float) -> Iterator[None]:
+    with wall_deadline(
+        seconds,
+        lambda: RankTimeout(f"rank construction exceeded {seconds:g}s"),
+    ):
+        yield
 
 
 @contextlib.contextmanager
 def sample_deadline(seconds: float) -> Iterator[None]:
     """Bound an entire worker attempt, including ty semantic queries."""
 
-    if seconds <= 0 or not hasattr(signal, "SIGALRM"):
+    with wall_deadline(
+        seconds,
+        lambda: SampleTimeout(f"sample evaluation exceeded {seconds:g}s"),
+    ):
         yield
-        return
-
-    def expired(_signum: int, _frame: object) -> None:
-        raise SampleTimeout(f"sample evaluation exceeded {seconds:g}s")
-
-    old_handler = signal.signal(signal.SIGALRM, expired)
-    old_timer = signal.setitimer(signal.ITIMER_REAL, seconds)
-    try:
-        yield
-    finally:
-        signal.setitimer(signal.ITIMER_REAL, *old_timer)
-        signal.signal(signal.SIGALRM, old_handler)
 
 
 def shortlex_rank(
@@ -1852,6 +1807,37 @@ if __debug__:
     _assert_rank_worker_recovery_contract()
 
 
+def run_self_tests() -> None:
+    """Exercise deadline composition without starting ty or scanning data."""
+
+    assert UnitAwareBoundedLanguage is evaluator.UnitAwareBoundedLanguage
+    if hasattr(signal, "SIGALRM"):
+        original_handler = signal.getsignal(signal.SIGALRM)
+        try:
+            with sample_deadline(0.12):
+                time.sleep(0.06)
+                with rank_deadline(0.20):
+                    time.sleep(0.10)
+        except SampleTimeout:
+            pass
+        else:
+            raise AssertionError("outer deadline was paused by nested rank timer")
+        assert signal.getsignal(signal.SIGALRM) == original_handler
+        assert signal.getitimer(signal.ITIMER_REAL)[0] == 0
+
+        try:
+            with sample_deadline(0.30):
+                with rank_deadline(0.05):
+                    time.sleep(0.08)
+        except RankTimeout:
+            pass
+        else:
+            raise AssertionError("inner rank deadline did not fire first")
+        assert signal.getsignal(signal.SIGALRM) == original_handler
+        assert signal.getitimer(signal.ITIMER_REAL)[0] == 0
+    print("bounded-rank self-test passed")
+
+
 def logarithmic_edges(
     minimum: float, maximum: float, bins: int
 ) -> list[float]:
@@ -2352,6 +2338,7 @@ def emit(
 
 def parse_arguments(arguments: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--self-test", action="store_true")
     parser.add_argument(
         "--dataset",
         choices=("apps", "codenet"),
@@ -2609,13 +2596,22 @@ def evaluate(arguments: argparse.Namespace) -> int:
         "platform": platform.platform(),
         "library_directory": str(arguments.library_dir),
         "allow_ignores": arguments.allow_ignores,
+        "surface_fragment": evaluator.surface_fragment_metadata(),
         "builder": {
+            "max_call_arity": (
+                "floor((ground_truth_tokens-root_tokens-2)/2)"
+            ),
+            "max_dynamic_composition_depth": (
+                builder_options.max_dynamic_composition_depth
+            ),
+            "max_tokens": "ground_truth_tokens",
             "max_layouts_per_signature": (
                 builder_options.max_layouts_per_signature
             ),
             "member_depth": builder_options.member_depth,
             "max_receiver_types": builder_options.max_receiver_types,
             "max_module_members": builder_options.max_module_members,
+            "max_output_producers": builder_options.max_output_producers,
         },
         "requested_statements": arguments.statements,
         "pool_files": len(samples),
@@ -2840,6 +2836,11 @@ def evaluate(arguments: argparse.Namespace) -> int:
                     ranked += 1
                     record = outcome.record
                     record["index"] = ranked
+                    if not isinstance(outcome.elapsed_seconds, (int, float)):
+                        raise evaluator.EvaluationError(
+                            "worker omitted whole-attempt timing"
+                        )
+                    record["elapsed_seconds"] = outcome.elapsed_seconds
                     emit(record, arguments.jsonl, output)
                     rank_seconds_value = record.get("rank_seconds")
                     total_seconds_value = record.get("total_seconds")
@@ -3141,6 +3142,9 @@ def evaluate(arguments: argparse.Namespace) -> int:
 
 def main(arguments: Sequence[str] | None = None) -> int:
     parsed = parse_arguments(sys.argv[1:] if arguments is None else arguments)
+    if parsed.self_test:
+        run_self_tests()
+        return 0
     try:
         return evaluate(parsed)
     except (evaluator.EvaluationError, FileNotFoundError) as error:
